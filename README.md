@@ -61,6 +61,7 @@ docs/
   plan/m1.md          # M1 执行计划与进度日志
   prompts/ingestion-prompts.md  # 角色卡制作提示词套件 P0–P11
   theme_test/theme.css          # 主题预设来源（运行时解析，不进编译产物）
+  testdata/st-card-v2.png|json  # 真机验收第 6 项用的 SillyTavern 卡样本
 ```
 
 ## 界面与主题

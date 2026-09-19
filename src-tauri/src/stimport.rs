@@ -692,6 +692,41 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_samples_import_cleanly() {
+        // docs/testdata/ 下的 ST 样本是真机验收第 6 项要拖的素材：
+        // 它们必须始终能解析并落成可用的卡（样本腐烂 = 验收当天才发现问题）。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/testdata");
+        if !dir.is_dir() {
+            return;
+        }
+        for name in ["st-card-v2.png", "st-card-v2.json"] {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            // 每个样本用独立的临时 DataHub：否则前一个样本留下的同名卡会改变后缀
+            let root = tempfile::tempdir().unwrap();
+            let report = import_file_to(root.path(), &path, false)
+                .unwrap_or_else(|e| panic!("样本 {name} 导入失败：{e}"));
+            assert_eq!(report.dir_name, "苏眠", "{name}");
+            let loaded = card::load_card(root.path(), &report.dir_name).unwrap();
+            assert!(!loaded.degraded, "{name}：{:?}", loaded.degrade_reason);
+            assert!(loaded.card.first_mes.contains("雨这么大"), "{name} 多行开场白应完整");
+            assert!(
+                loaded.card.scenario.contains("苏眠是旧书店"),
+                "{name}：description 的 {{{{char}}}} 应替换为角色名（实际：{}）",
+                loaded.card.scenario
+            );
+            assert!(loaded.card.scenario.contains("梅雨季"), "{name}：scenario 应保留");
+            assert_eq!(loaded.card.example_dialogue.len(), 2, "{name}：示例对话应拆成两组");
+            assert_eq!(loaded.card.tags, vec!["日常", "治愈", "书店"], "{name}");
+            // 两次导入同名卡：自动加后缀，不覆盖
+            let again = import_file_to(root.path(), &path, false).unwrap();
+            assert_eq!(again.dir_name, "苏眠-2", "{name}");
+        }
+    }
+
+    #[test]
     fn sanitize_rejects_path_traversal() {
         let json = r#"{ "name": "../../逃逸", "first_mes": "x" }"#;
         let d = parse_st_json(json, None).unwrap();
