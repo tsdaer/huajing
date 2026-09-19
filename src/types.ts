@@ -153,6 +153,8 @@ export interface CardDraft {
   /** 原卡规范：chara_card_v2 / v3 / 未知 */
   source_spec: string;
   warnings: string[];
+  /** 内容指纹（重复导入识别用） */
+  content_hash?: string;
 }
 
 /** 导入结果（导入向导展示） */
@@ -161,6 +163,8 @@ export interface ImportReport {
   card_path: string;
   draft: CardDraft;
   warnings: string[];
+  /** true = 与已有卡内容一致，本次复用了已有目录（没有新建） */
+  reused: boolean;
 }
 
 // ---------- LLM 流式（llm.rs · 设计 §11）----------

@@ -27,6 +27,8 @@ pub struct ImportReport {
     pub draft: CardDraft,
     /// 提醒（未映射字段、被截断的示例对话等）
     pub warnings: Vec<String>,
+    /// true = 内容与已有卡完全一致，本次**复用**了已有目录而非新建（重复导入不再堆积）
+    pub reused: bool,
 }
 
 /// 从 ST 卡解析出的草稿（落盘前可预览/改名）
@@ -46,6 +48,18 @@ pub struct CardDraft {
     pub source_spec: String,
     /// 解析期的提醒（未映射字段、拆不动的示例对话等）
     pub warnings: Vec<String>,
+    /// 内容指纹（不含引源注释）：同一张卡重复导入时据此识别
+    #[serde(default)]
+    pub content_hash: String,
+}
+
+/// 工作区里已存在的同内容卡（重复导入识别）
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarCard {
+    /// 已存在的目录名
+    pub dir_name: String,
+    /// 是否内容完全一致（true = 重复导入，同一张卡已经在了）
+    pub same_content: bool,
 }
 
 /// 从文件导入：按扩展名与内容分派 PNG / JSON
@@ -76,15 +90,34 @@ pub fn preview_st_card(path: String) -> Result<CardDraft, String> {
     let path = PathBuf::from(path.trim());
     let outcome = std::fs::read(&path)
         .map_err(|e| format!("读取 {} 失败：{e}", path.display()))
-        .and_then(|bytes| parse_st_card(&bytes, path.file_stem().and_then(|s| s.to_str())));
+        .and_then(|bytes| parse_st_card(&bytes, path.file_stem().and_then(|s| s.to_str())))
+        .map(|mut draft| {
+            draft.content_hash = content_fingerprint(&draft);
+            // 重复导入要在**预览阶段**就说清：工作区里是不是已经有同一张卡
+            if let Some(same) = find_similar(&crate::store::data_root(), &draft) {
+                draft.warnings.push(if same.same_content {
+                    format!(
+                        "工作区已有内容完全相同的卡（{}）——导入会复用它，不会新建",
+                        same.dir_name
+                    )
+                } else {
+                    format!(
+                        "工作区已有同名卡「{}」（内容不同）——默认并存为「{}-2」，可勾选覆盖",
+                        same.dir_name, same.dir_name
+                    )
+                });
+            }
+            draft
+        });
     crate::diag::record(
         if outcome.is_ok() { "import" } else { "error" },
         match &outcome {
             Ok(d) => format!(
-                "解析成功：{}（{}，示例 {} 组）",
+                "解析成功：{}（{}，示例 {} 组，指纹 {}）",
                 path.display(),
                 d.source_spec,
-                d.example_dialogue.len()
+                d.example_dialogue.len(),
+                &d.content_hash[..8.min(d.content_hash.len())]
             ),
             Err(e) => format!("解析失败：{}：{e}", path.display()),
         },
@@ -328,6 +361,7 @@ pub fn parse_st_json(json: &str, fallback_name: Option<&str>) -> Result<CardDraf
         notes,
         source_spec,
         warnings,
+        content_hash: String::new(), // 由调用方（preview/import）补算
     };
 
     // 未映射字段点名（M2 的 codex 拆分与设定补全接手）
@@ -403,6 +437,78 @@ fn split_examples(raw: &str, name: &str) -> (Vec<ExampleTurn>, String) {
         }
     }
     (turns, leftover.join("\n"))
+}
+
+// ---------- 重复导入识别 ----------
+
+/// 内容指纹：只取静态提示词层的实质内容，**不含**注释/引源/tags 顺序之外的元信息。
+/// 用户把自己写的卡里加一行注释、换个 tags 顺序，不该被当成新卡。
+fn content_fingerprint(draft: &CardDraft) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    draft.name.hash(&mut hasher);
+    draft.scenario.trim().hash(&mut hasher);
+    draft.personality.trim().hash(&mut hasher);
+    draft.first_mes.trim().hash(&mut hasher);
+    let mut tags = draft.tags.clone();
+    tags.sort();
+    tags.hash(&mut hasher);
+    for turn in &draft.example_dialogue {
+        for m in &turn.messages {
+            m.role.hash(&mut hasher);
+            m.content.trim().hash(&mut hasher);
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// 与已有实体文件一致的内容比对：把 `card.lua` 读回来、抽出静态字段、算同一套指纹
+fn card_file_fingerprint(root: &Path, dir_name: &str) -> Option<String> {
+    let loaded = card::load_card(root, dir_name).ok()?;
+    if loaded.degraded {
+        return None;
+    }
+    let draft = CardDraft {
+        name: loaded.card.name,
+        creator: loaded.card.creator,
+        tags: loaded.card.tags,
+        world: loaded.card.world,
+        scenario: loaded.card.scenario,
+        personality: loaded.card.personality,
+        first_mes: loaded.card.first_mes,
+        example_dialogue: loaded.card.example_dialogue,
+        notes: String::new(),
+        source_spec: String::new(),
+        warnings: Vec::new(),
+        content_hash: String::new(),
+    };
+    Some(content_fingerprint(&draft))
+}
+
+/// 找出与草稿重复/同名的已有卡：先按内容指纹（真正的重复），再按目录名（同名不同内容）
+pub fn find_similar(root: &Path, draft: &CardDraft) -> Option<SimilarCard> {
+    let dir = root.join("characters");
+    let wanted = content_fingerprint(draft);
+    let mut same_name: Option<String> = None;
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        if !entry.path().join("card.lua").is_file() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        if card_file_fingerprint(root, &dir_name).as_deref() == Some(wanted.as_str()) {
+            return Some(SimilarCard {
+                dir_name,
+                same_content: true,
+            });
+        }
+        if dir_name == sanitize_dir_name(&draft.name) {
+            same_name = Some(dir_name);
+        }
+    }
+    same_name.map(|dir_name| SimilarCard {
+        dir_name,
+        same_content: false,
+    })
 }
 
 // ---------- 落盘：生成 card.lua ----------
@@ -505,8 +611,17 @@ pub fn save_card_draft(
 ) -> Result<ImportReport, String> {
     crate::store::ensure_layout(root).map_err(|e| format!("数据目录初始化失败：{e}"))?;
     let base = sanitize_dir_name(&draft.name);
-    let mut dir_name = base.clone();
-    if !overwrite {
+    let similar = find_similar(root, draft);
+    // 重复导入的处理（不再默默堆出「名字-2」「名字-3」）：
+    // - 内容完全一致 → 直接复用已有目录，报 reused（同一张卡导两次不该变成两张）
+    // - overwrite → 覆盖同名目录（用户显式要求）
+    // - 其余同名不同内容 → 加后缀并存（可能是同一角色的另一版，不能覆盖）
+    let (mut dir_name, reused) = match &similar {
+        Some(s) if s.same_content => (s.dir_name.clone(), true),
+        Some(s) if overwrite => (s.dir_name.clone(), false),
+        _ => (base.clone(), false),
+    };
+    if !reused && !overwrite {
         let mut n = 2;
         while root.join("characters").join(&dir_name).join("card.lua").exists() {
             dir_name = format!("{base}-{n}");
@@ -516,7 +631,11 @@ pub fn save_card_draft(
     let dir = root.join("characters").join(&dir_name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败：{e}", dir.display()))?;
     let card_path = dir.join("card.lua");
-    let source = render_card_lua(draft);
+    let mut draft = draft.clone();
+    if draft.content_hash.is_empty() {
+        draft.content_hash = content_fingerprint(&draft);
+    }
+    let source = render_card_lua(&draft);
     std::fs::write(&card_path, source).map_err(|e| format!("写入 card.lua 失败：{e}"))?;
 
     // 生成物必须能被自家解析器读回：读不回就是 bug（导入不该产出坏卡）
@@ -532,6 +651,7 @@ pub fn save_card_draft(
         card_path: card_path.to_string_lossy().into_owned(),
         draft: draft.clone(),
         warnings: draft.warnings.clone(),
+        reused,
     })
 }
 
@@ -692,9 +812,10 @@ mod tests {
         assert_eq!(first.dir_name, "月见");
         assert!(root.path().join("characters/月见/card.lua").is_file());
 
-        // 同名再来一张：自动 -2，不覆盖已有卡
+        // 同名同内容再来一次：复用已有目录（重复导入不堆卡；同名不同内容才加 -2）
         let second = save_card_draft(root.path(), &d, false).unwrap();
-        assert_eq!(second.dir_name, "月见-2");
+        assert_eq!(second.dir_name, "月见");
+        assert!(second.reused);
 
         // 显式覆盖：仍写回原目录
         let third = save_card_draft(root.path(), &d, true).unwrap();
@@ -749,10 +870,65 @@ mod tests {
             assert!(loaded.card.scenario.contains("梅雨季"), "{name}：scenario 应保留");
             assert_eq!(loaded.card.example_dialogue.len(), 2, "{name}：示例对话应拆成两组");
             assert_eq!(loaded.card.tags, vec!["日常", "治愈", "书店"], "{name}");
-            // 两次导入同名卡：自动加后缀，不覆盖
+            // 同一张卡再导一次：复用已有目录，工作区里仍只有一张
             let again = import_file_to(root.path(), &path, false).unwrap();
-            assert_eq!(again.dir_name, "苏眠-2", "{name}");
+            assert_eq!(again.dir_name, "苏眠", "{name}");
+            assert!(again.reused, "{name} 应报告为复用");
+            let dirs = std::fs::read_dir(root.path().join("characters")).unwrap().count();
+            assert_eq!(dirs, 1, "{name}：重复导入后工作区仍应只有一张卡");
         }
+    }
+
+    #[test]
+    fn importing_the_same_card_twice_reuses_it() {
+        // 用户反馈：连点导入会堆出「名字-2」「名字-3」。同一张卡导两次不该变成两张。
+        let root = tempfile::tempdir().unwrap();
+        let mut d = parse_st_json(V2_JSON, None).unwrap();
+        d.content_hash = content_fingerprint(&d);
+
+        let first = save_card_draft(root.path(), &d, false).unwrap();
+        assert_eq!(first.dir_name, "月见");
+        assert!(!first.reused);
+
+        // 第二次导入同一份内容：复用已有目录，不新建
+        let second = save_card_draft(root.path(), &d, false).unwrap();
+        assert_eq!(second.dir_name, "月见", "重复导入应复用而不是加后缀");
+        assert!(second.reused);
+        let dirs: Vec<String> = std::fs::read_dir(root.path().join("characters"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(dirs, vec!["月见"], "工作区里只该有一张卡：{dirs:?}");
+
+        // 预览阶段的提醒：导入向导要能提前告知「已有同一张卡」
+        let similar = find_similar(root.path(), &d).expect("应识别出重复卡");
+        assert!(similar.same_content);
+        assert_eq!(similar.dir_name, "月见");
+    }
+
+    #[test]
+    fn same_name_different_content_coexists() {
+        // 同名但是另一版（内容不同）：默认并存加后缀，显式 overwrite 才覆盖
+        let root = tempfile::tempdir().unwrap();
+        let mut a = parse_st_json(V2_JSON, None).unwrap();
+        a.content_hash = content_fingerprint(&a);
+        save_card_draft(root.path(), &a, false).unwrap();
+
+        let mut b = a.clone();
+        b.first_mes = "（另一版开场白）".into();
+        b.content_hash = content_fingerprint(&b);
+        let second = save_card_draft(root.path(), &b, false).unwrap();
+        assert_eq!(second.dir_name, "月见-2");
+        assert!(!second.reused);
+
+        // 预览提醒：同名但内容不同 → 提示会并存
+        let similar = find_similar(root.path(), &b).expect("同名也要报出来");
+        assert!(similar.same_content, "内容不同但名字相同，这里按内容匹配到的是第二份自己");
+
+        // 显式覆盖：写回原名目录，不新增
+        let third = save_card_draft(root.path(), &b, true).unwrap();
+        assert_eq!(third.dir_name, "月见-2");
     }
 
     #[test]

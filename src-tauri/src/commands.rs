@@ -687,6 +687,18 @@ fn plan_regenerate(
     Ok((kept, prior, turn, content))
 }
 
+/// 这一轮的回复是否已经生成过：有同轮次的 char 消息即视为已生成。
+///
+/// 用途：用户消息的 `on_message` 只该在「这条消息首次进入生成流程」时跑一次——
+/// 生成失败后重试要补跑，而重roll/重新生成是同一条消息的重放，再跑就等于重复计分
+/// （好感度会被反复 +1）。
+///
+/// M2 的事件日志（设计 §7.3「可回放」）落地后，这里换成按事件流重放判定更彻底：
+/// 届时任何消息级操作（编辑/删除/回滚）都能得到一致的状态，而不再依赖这条启发式判据。
+fn turn_has_reply(history: &[Message], turn: u64) -> bool {
+    history.iter().any(|m| m.turn == turn && m.role == "char")
+}
+
 /// 跑一轮 `on_message`（用户消息与回复都已落盘后调用，设计 §3）。
 ///
 /// 卡片没定义该 hook 时直接返回 ran=false（不新建 Lua 实例）；其余情况：
@@ -924,7 +936,16 @@ pub async fn send_message(
 
     // 设计 §3：`on_message` 在**每条**新消息落地后调用——用户消息同样要跑，
     // 否则卡看不到本轮输入，且它的反应（比如好感度 +1）来不及影响这一轮的生成。
-    let report = run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event));
+    // 这一条是新消息（同轮次不可能已有回复），但保留判据以便与 regenerate 用同一套语义。
+    let report = if turn_has_reply(&history, turn) {
+        crate::diag::record("hook", format!("用户消息钩子跳过：第 {turn} 轮已生成过回复"));
+        llm::HookReport {
+            turn,
+            ..Default::default()
+        }
+    } else {
+        run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event))
+    };
 
     stream_reply(
         &app,
@@ -995,8 +1016,22 @@ pub async fn regenerate(
             run.blackboard_dirty.then_some(&run.blackboard),
         )?;
     }
-    // 与 send 对齐：重roll 时也给这一轮的用户消息跑一次 on_message
-    let report = run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event));
+    // 这一轮的用户消息是否已被钩子处理过：
+    // - 重roll（末尾本来就有回复）→ 不重复跑，否则每次重roll 都把好感度 +1（同一句话被反复计分）
+    // - 生成失败后重试（末尾没有回复）→ 补跑，此时用户消息还没被卡「看过」
+    let already = turn_has_reply(&all, turn);
+    let report = if already {
+        crate::diag::record(
+            "hook",
+            format!("用户消息钩子跳过：第 {turn} 轮是重roll 重放，不重复计分"),
+        );
+        llm::HookReport {
+            turn,
+            ..Default::default()
+        }
+    } else {
+        run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event))
+    };
     stream_reply(
         &app,
         &root,
@@ -1294,6 +1329,37 @@ return {
         turn: u64,
     ) -> llm::HookReport {
         run_message_hook_core(root, meta, loaded, turn, None)
+    }
+
+    #[test]
+    fn reroll_does_not_rescore_the_same_user_message() {
+        // 重roll = 重放同一轮：用户消息的钩子不能再跑一次，否则好感度会随点击次数无限增长
+        let user = |turn| Message {
+            turn,
+            role: "user".into(),
+            content: "谢谢".into(),
+            ts: 0,
+            scene_id: None,
+        };
+        let reply = |turn| Message {
+            turn,
+            role: "char".into(),
+            content: "……不用谢。".into(),
+            ts: 0,
+            scene_id: None,
+        };
+
+        // 首次：这一轮还没有回复 → 钩子该跑
+        let first = vec![user(1)];
+        assert!(!turn_has_reply(&first, 1));
+        // 重roll：同轮已有回复 → 钩子不该再跑（判据基于入参，注：regenerate 传入的是重roll 前的历史）
+        let before_reroll = vec![user(1), reply(1)];
+        assert!(turn_has_reply(&before_reroll, 1));
+        // 生成失败后重试：错误轮次没有回复 → 该补跑
+        let failed = vec![reply(0), user(2)];
+        assert!(!turn_has_reply(&failed, 2));
+        // 别轮的回复不算本轮已生成
+        assert!(!turn_has_reply(&[reply(0), user(1)], 1));
     }
 
     #[test]

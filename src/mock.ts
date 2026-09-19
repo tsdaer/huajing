@@ -351,7 +351,6 @@ export function setupMock() {
       case "unwatch_cards":
         return null;
       case "preview_st_card":
-        throw new Error("浏览器 mock 不支持导入：请用 pnpm tauri dev");
       case "import_st_card":
         throw new Error("浏览器 mock 不支持导入：请用 pnpm tauri dev");
       case "get_card_state":

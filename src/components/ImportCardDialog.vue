@@ -87,7 +87,8 @@ function done() {
       <h3 class="text-base font-semibold">导入 SillyTavern 角色卡</h3>
       <p class="mt-1 text-xs text-base-content/50">
         支持 PNG（内嵌 chara 数据）与 JSON（V2 / V3）。解析结果会生成
-        <code class="text-[11px]">characters/&lt;名字&gt;/card.lua</code>，同名卡自动加后缀，不覆盖。
+        <code class="text-[11px]">characters/&lt;名字&gt;/card.lua</code>；
+        同一张卡重复导入会复用已有目录（不新建），同名但内容不同则并存为「-2」，都不覆盖。
       </p>
 
       <div class="mt-4 flex flex-col gap-3">
@@ -166,8 +167,17 @@ function done() {
             </div>
           </div>
 
-          <div v-if="report" class="alert alert-success alert-soft py-2 text-xs">
-            已导入为「{{ report.dir_name }}」：{{ report.card_path }}
+          <div
+            v-if="report"
+            class="alert py-2 text-xs"
+            :class="report.reused ? 'alert-info alert-soft' : 'alert-success alert-soft'"
+          >
+            <template v-if="report.reused">
+              这张卡已经在了（内容完全一致）——已复用「{{ report.dir_name }}」，没有新建副本。
+            </template>
+            <template v-else>
+              已导入为「{{ report.dir_name }}」：{{ report.card_path }}
+            </template>
           </div>
         </template>
       </div>
