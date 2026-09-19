@@ -10,7 +10,7 @@
 | 层 | 选择 |
 |---|---|
 | 壳 | Tauri 2（Rust 核心，系统 WebView，~10MB 级安装包） |
-| 界面 | Vue 3 + Vite + TypeScript（IM 聊天风打底，CSS 变量主题层） |
+| 界面 | Vue 3 + Vite + TypeScript + daisyUI 5（IM 聊天风打底，主题即 daisyUI `data-theme` 变量层） |
 | 角色卡运行时 | mlua 沙箱（剥离 os/io、指令计数上限） |
 | 引擎 | 状态树 / 剧情线 / 记忆宫殿 / 设定集 —— 全部 Rust 宿主侧确定性实现 |
 | LLM | OpenAI 兼容协议 + SSE 流式（DeepSeek / GLM / Ollama 通吃） |
@@ -31,6 +31,16 @@ pnpm tauri build      # 产出安装包
 
 ```
 src/                  # Vue 前端
+  main.ts             # 入口：恢复主题偏好 → 挂载应用
+  style.css           # 唯一的全局样式：Tailwind + daisyUI 主题层
+  theme.ts            # 主题令牌定义 / 应用 / 导出
+  theme-presets.ts    # 解析 docs/theme_test/theme.css 的预设（随主题页按需加载）
+  sessions.ts         # 会话列表与选中态（侧栏子菜单与会话页共用）
+  window.ts           # 窗口控制（自定义标题栏用，浏览器下降级为空操作）
+  api.ts / types.ts   # Tauri 命令封装与数据类型
+  mock.ts             # 纯浏览器调试用的内存后端
+  components/         # Icon / TitleBar / ErrorToast
+  views/              # 概览 · 会话 · 主题 · 设置
 src-tauri/src/        # Rust 核心
   card.rs             # 角色卡与 Lua 沙箱（设计 §3）
   prompt.rs           # Prompt Builder 双槽位组装（设计 §4）
@@ -41,8 +51,21 @@ DataHub/              # 用户数据（明文，可随身拷贝）
   codex/default/      # 示例世界（设定集）
 docs/
   design.md           # 功能设计 v0.12（唯一权威设计文档）
+  plan/m1.md          # M1 执行计划与进度日志
   prompts/ingestion-prompts.md  # 角色卡制作提示词套件 P0–P11
+  theme_test/theme.css          # 主题预设来源（运行时解析，不进编译产物）
 ```
+
+## 界面与主题
+
+界面层是 **Tailwind 4 + daisyUI 5**，主题即 daisyUI 的 `data-theme` 变量层：默认 `light` / `dark`，深色跟随系统。
+
+- **无边框窗口 + 自绘标题栏**：窗口关掉原生装饰（`decorations: false`），标题栏的品牌、拖拽区与窗口按钮颜色全部走主题令牌，换肤时与内容一致；浏览器里调试时窗口按钮自动隐藏
+- **侧栏**：可收成 64px 图标栏（悬停显示名称）；「会话」是可折叠子菜单，直接列出最近几场，点选即切换右侧聊天
+- **主题页**：33 个预设（来自 `docs/theme_test/theme.css`）+ 28 个令牌逐项编辑，改动实时生效并持久化，可导出标准 `@plugin "daisyui/theme"` 块固化进 `src/style.css`
+- **聊天**：气泡流 + 流式打字机，底部按每页 20 条分页，黑板与记忆检查器收在右侧抽屉
+
+纯前端调试：`pnpm dev` 在浏览器里走 `src/mock.ts` 的内存 mock，只调界面时不必编译 Rust；`pnpm build` 做类型检查与产物构建。
 
 ## 路线图
 

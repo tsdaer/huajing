@@ -15,7 +15,9 @@
 ## 当前状态（更新于 2026-09-19）
 
 - ✅ 项目初始化：Tauri 2 + Vue 3 脚手架、Rust 核心模块桩、DataHub 示例、双端构建通过
-- 🔄 **M1 能聊** 进行中 —— 执行计划见 [docs/plan/m1.md](docs/plan/m1.md)
+- ✅ M1.1–M1.5 完成：配置与会话骨架 · Lua 沙箱与卡片加载 · LLM 流式通道 · Prompt Builder v0 与黑板 v0 · 会话与聊天 UI
+- ✅ 界面工程化：全面引入 daisyUI（主题变量层、无边框窗口 + 自绘标题栏、可收起侧栏、主题编辑器）
+- 🔄 **M1 能聊** 进行中 —— 剩余 M1.6 hooks 接入运行时 · M1.7 热加载 · M1.8 ST 卡导入 · M1.9 打磨与打包；执行计划与进度见 [docs/plan/m1.md](docs/plan/m1.md)
 
 ## 里程碑总览
 
@@ -50,7 +52,7 @@
 ## Backlog（v1 后候选，未排期）
 
 - WebDAV 同步（决策 §16-3 预留）
-- galgame 立绘主题（界面决策预留的 CSS 变量层消费方）
+- galgame 立绘主题（消费 daisyUI 主题变量层；预设套用与令牌编辑已随「主题」页落地）
 - TTS 语音与立绘表情差分资产规范
 - 系统密钥库（Windows 凭据管理器，design §11）
 - 状态树 Considerations 效用打分（v2，design §7.1）
