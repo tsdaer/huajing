@@ -144,6 +144,21 @@ pub struct ProposalEvent {
     pub ts: u64,
 }
 
+/// 一条记忆对象（M2.6 · 设计 §5.2：情景记忆 episode / 转述 hearsay 等）。
+///
+/// 与 api.memory.set 的键值事实不同，这是**结构化记忆对象**（带见证者、显著度、关联）。
+/// 与摘要/提案同理：它是模型产物，重放不重新生成，故永不丢弃。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryEvent {
+    pub turn: u64,
+    /// pipeline（总结管线）/ hook（卡内写入的情景记忆）/ manual
+    #[serde(default = "default_origin")]
+    pub origin: String,
+    /// MemObject 的 JSON 形态（palace::MemObject 可直接反序列化）
+    pub object: serde_json::Value,
+    pub ts: u64,
+}
+
 fn default_origin() -> String {
     "manual".into()
 }
@@ -159,6 +174,7 @@ pub enum LogBody {
     Codex(CodexEvent),
     Summary(SummaryEvent),
     Proposal(ProposalEvent),
+    Memory(MemoryEvent),
 }
 
 impl From<Message> for LogBody {
@@ -184,6 +200,7 @@ impl LogBody {
             LogBody::Codex(_) => "codex",
             LogBody::Summary(_) => "summary",
             LogBody::Proposal(_) => "proposal",
+            LogBody::Memory(_) => "memory",
         }
     }
 
@@ -198,6 +215,7 @@ impl LogBody {
             LogBody::Codex(c) => c.turn,
             LogBody::Summary(s) => s.turn,
             LogBody::Proposal(p) => p.turn,
+            LogBody::Memory(m) => m.turn,
         }
     }
 
@@ -212,6 +230,7 @@ impl LogBody {
             LogBody::Codex(c) => serde_json::to_value(c),
             LogBody::Summary(s) => serde_json::to_value(s),
             LogBody::Proposal(p) => serde_json::to_value(p),
+            LogBody::Memory(m) => serde_json::to_value(m),
         }
         .map_err(|e| format!("事件序列化失败：{e}"))?;
         if let Some(obj) = v.as_object_mut() {
@@ -241,6 +260,7 @@ impl LogBody {
             "codex" => serde_json::from_value(v).map(LogBody::Codex).map_err(bad),
             "summary" => serde_json::from_value(v).map(LogBody::Summary).map_err(bad),
             "proposal" => serde_json::from_value(v).map(LogBody::Proposal).map_err(bad),
+            "memory" => serde_json::from_value(v).map(LogBody::Memory).map_err(bad),
             other => Err(format!("未知事件类型：{other}")),
         }
     }
@@ -286,7 +306,7 @@ impl LogRecord {
             LogBody::Codex(c) => c.origin != "manual",
             // 摘要与提案是**模型产物**，不是确定性派生：重放不重新调用模型，
             // 所以它们永远保留（编辑历史只重算状态/转移/心理，设计 §7.3-5 的承诺范围）
-            LogBody::Summary(_) | LogBody::Proposal(_) => false,
+            LogBody::Summary(_) | LogBody::Proposal(_) | LogBody::Memory(_) => false,
         }
     }
 
@@ -400,6 +420,8 @@ pub struct Projection {
     pub summary: String,
     /// 设定收件箱：提案 id → 当前状态（propose/accept/reject 后写覆盖）
     pub proposals: BTreeMap<String, serde_json::Value>,
+    /// 结构化记忆对象（M2.6 管线写入的情景记忆；键值事实仍在 memory 里）
+    pub episodes: Vec<serde_json::Value>,
     pub last_seq: Seq,
 }
 
@@ -502,6 +524,7 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
                 p.summary.push_str(delta);
             }
         }
+        LogBody::Memory(m) => p.episodes.push(m.object.clone()),
         LogBody::Proposal(pr) => {
             // 提案是状态机：propose 落条目，accept/reject 改状态（payload 缺失时保留原提案正文）
             let entry = p

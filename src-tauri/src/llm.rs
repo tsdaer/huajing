@@ -293,6 +293,63 @@ pub async fn chat_once(
     Ok(truncate(&resp.text().await.unwrap_or_default(), 200))
 }
 
+/// 通用**非流式**补全：自动总结 / 设定捕获 / 补全 / 分类这类实用档调用走这里
+/// （设计 §11：不同用途可用不同档位；正式对话一律走 chat_stream）。
+///
+/// 与 chat_once（连通性自检）的区别：max_tokens 与 temperature 由调用方给，
+/// 返回值是模型正文而不是截断的原始响应。
+pub async fn chat_complete(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    temperature: f32,
+    extra_proxy: Option<&str>,
+) -> Result<String, String> {
+    let (client, _proxy) = build_client(extra_proxy).await?;
+    let url = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
+    let body = serde_json::json!({
+        "model": provider.model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    let resp = client
+        .post(&url)
+        .bearer_auth(&provider.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败（{}）：{}", provider.name, error_chain(&e)))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "{} 返回 {}：{}",
+            provider.name,
+            status,
+            truncate(&detail, 300)
+        ));
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("响应解析失败（{}）：{e}", provider.name))?;
+    value
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "响应里没有 choices[0].message.content：{}",
+                truncate(&value.to_string(), 300)
+            )
+        })
+}
+
 /// 环境变量里的代理（reqwest 的 system-proxy 也会读它们）
 fn proxy_from_env() -> Option<(String, String)> {
     for key in [

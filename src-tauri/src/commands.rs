@@ -859,24 +859,23 @@ fn memory_objects(
     character: &str,
     now_day: i64,
 ) -> Vec<palace::MemObject> {
-    proj.memory
+    // ① 结构化记忆对象（总结管线写入的情景记忆；自带见证者与显著度）
+    let mut out: Vec<palace::MemObject> = proj
+        .episodes
         .iter()
-        .enumerate()
-        .map(|(i, rec)| {
-            let mut obj = palace::from_legacy_fact(
-                &rec.key,
-                &rec.value,
-                &rec.source,
-                rec.turn,
-                rec.ts,
-            );
-            obj.id = palace::next_id(i + 1);
-            obj.actors = vec![character.to_string()];
-            obj.witnesses = vec![character.to_string()];
-            obj.story_day = now_day;
-            obj
-        })
-        .collect()
+        .filter_map(|v| serde_json::from_value::<palace::MemObject>(v.clone()).ok())
+        .collect();
+    let base = out.len();
+    // ② 卡内键值事实（api.memory.set）：补见证者与故事时刻，见下方注释
+    out.extend(proj.memory.iter().enumerate().map(|(i, rec)| {
+        let mut obj = palace::from_legacy_fact(&rec.key, &rec.value, &rec.source, rec.turn, rec.ts);
+        obj.id = palace::next_id(base + i + 1);
+        obj.actors = vec![character.to_string()];
+        obj.witnesses = vec![character.to_string()];
+        obj.story_day = now_day;
+        obj
+    }));
+    out
 }
 
 /// `api.memory.get` 的读侧：宫殿里的键值（同 key 后写覆盖；M1 里这一侧恒空）
