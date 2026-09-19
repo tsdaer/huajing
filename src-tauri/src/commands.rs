@@ -12,6 +12,7 @@ use crate::card;
 use crate::codex;
 use crate::event::{self, LogBody, LogRecord};
 use crate::palace;
+use crate::threads;
 use crate::llm::{self, Provider, StreamEvent};
 use crate::prompt;
 use crate::store::{self, Message, NewSessionRequest, Settings};
@@ -1088,11 +1089,37 @@ fn assemble_prompt_core(
 
     // ---- B4 记忆宫殿：视角过滤 → 召回打分 → top-K（设计 §5.4）----
     let memories = memory_objects(proj, &character, blackboard.day);
-    let mentions: Vec<String> = cx
+    // 话题窗口词表（召回与剧情线窗口共用，两处都按「包含」匹配）：
+    // ① 设定集别名扫描命中的实体 id；② 最近窗口的**消息原文片段**——
+    //    剧情线的 mention 窗口要的是「话题擦边」，真正的词在原文里，光有实体 id 不够。
+    let mut mentions: Vec<String> = cx
         .scan_mentions(&window_text)
         .into_iter()
         .map(|m| m.id)
         .collect();
+    let scan_start = history.len().saturating_sub(SCAN_WINDOW_MESSAGES);
+    mentions.extend(history[scan_start..].iter().map(|m| m.content.clone()));
+
+    // ---- B1 心里有事 / 了结未远 · C1 未决事项：剧情线（设计 §8.4/§8.5）----
+    // 线本身由事件流持有（thread 事件带全量快照），这里只做「此刻能不能提」的确定性求值。
+    let thread_list: Vec<threads::Thread> = proj
+        .threads
+        .values()
+        .filter_map(|v| threads::Thread::from_value(v).ok())
+        .collect();
+    let thread_query = threads::ThreadQuery {
+        turn,
+        story_day: blackboard.day,
+        story_clock: &blackboard.clock,
+        blackboard: &bb_map,
+        mentions: &mentions,
+        present: &blackboard.actors,
+        state_path: &[], // 状态树活跃路径在 M2.3 接入
+    };
+    let picks = threads::select_resurface(&thread_list, &thread_query, 3);
+    let concerns = threads::render_concerns(&picks);
+    let resolutions = threads::recent_resolutions(&thread_list, 20, turn);
+    let pending = threads::pending_lines(&thread_list);
     let query = palace::RecallQuery {
         viewer: character.clone(),
         now_day: blackboard.day,
@@ -1128,6 +1155,9 @@ fn assemble_prompt_core(
         hook_injections: &run.result.injections,
         entity_cards: &entity_cards,
         memory_cards: &memory_cards,
+        concerns: &concerns,
+        resolutions: &resolutions,
+        pending_threads: &pending,
         history,
         user_content,
     };
@@ -1995,16 +2025,23 @@ return {
         // 此前只有回复落盘后跑一次，于是卡看不到用户输入、它的反应也来不及影响本轮生成。
         // 诊断留痕是当时唯一能看见这件事的地方，故在此也断言它。
         let (assembly, report) = simulate_turn(&root, &meta, &loaded, &log, 1, "今天好冷。");
-        let traces: Vec<String> = crate::diag::recent(10).iter().map(|d| d.detail.clone()).collect();
+        // 诊断环形缓冲是全进程共享的：测试并发跑时别的用例也会写，所以**只在自己的标记文本上断言**，
+        // 不再依赖「最近 10 条」这个窗口（曾因此偶发变红，与代码无关）。
+        let traces: Vec<String> = crate::diag::recent(200)
+            .iter()
+            .map(|d| d.detail.clone())
+            .collect();
         assert!(
-            traces.iter().filter(|d| d.contains("入参")).count() >= 2,
-            "用户消息与回复各应留下一条入参记录：{traces:?}"
+            traces.iter().any(|d| d.contains("入参")
+                && d.contains("\"role\":\"user\"")
+                && d.contains("今天好冷")),
+            "钩子必须看到用户消息本身（而不是只看到角色回复）：{traces:?}"
         );
         assert!(
             traces
                 .iter()
-                .any(|d| d.contains("\"role\":\"user\"") && d.contains("今天好冷")),
-            "钩子必须看到用户消息本身（而不是只看到角色回复）：{traces:?}"
+                .any(|d| d.contains("入参") && d.contains("\"role\":\"char\"")),
+            "回复落盘后也应留下入参记录：{traces:?}"
         );
         assert!(
             assembly
@@ -2484,5 +2521,124 @@ return {
             checked += 1;
         }
         assert!(checked > 0, "仓库里应至少有一个世界");
+    }
+
+    /// M2.4 验收（设计 §8.4「克制是核心」）：线**只在可提及窗口内**进现状卡，
+    /// 窗口外只由 C1 的只读投影兜底——「每轮强行提起」在结构上被挡住。
+    #[test]
+    fn threads_only_surface_inside_their_window() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+
+        // 一条 natural 线（mention 窗口 + day>=5 窗口），一条 dormant 线（即使被提及也不该进 B1）
+        let mut due = threads::Thread::open(
+            "thread.周五还书",
+            "周五还书的约定",
+            "玩家忘带借书卡，约定周五来还。",
+            &["小雨".into(), "玩家".into()],
+            0.8,
+            threads::ThreadStamp {
+                turn: 1,
+                story_day: 1,
+                story_clock: "20:00".into(),
+            },
+        );
+        due.resurface.windows = vec![threads::ResurfaceWindow::Mention(vec!["还书".into()])];
+        due.resurface.framing = "她在意但不好意思催。".into();
+        let mut buried = threads::Thread::open(
+            "thread.旧伤",
+            "不提的旧伤",
+            "她从没说过的事。",
+            &["小雨".into()],
+            0.4,
+            threads::ThreadStamp {
+                turn: 1,
+                story_day: 1,
+                story_clock: "20:00".into(),
+            },
+        );
+        buried.resurface.grade = "dormant".into();
+        buried.resurface.windows = vec![threads::ResurfaceWindow::Mention(vec!["旧伤".into()])];
+        for t in [&due, &buried] {
+            log.append(
+                &root,
+                &meta.id,
+                LogBody::Thread(event::ThreadEvent {
+                    turn: 1,
+                    op: threads::OP_OPEN.into(),
+                    thread_id: t.id.clone(),
+                    thread: Some(t.to_value()),
+                    origin: threads::ORIGIN_MANUAL.into(),
+                    note: None,
+                    ts: store::unix_now(),
+                }),
+            )
+            .unwrap();
+        }
+
+        let layer = |a: &prompt::PromptAssembly, id: &str| {
+            a.layers
+                .iter()
+                .find(|l| l.id == id)
+                .map(|l| l.content.clone())
+                .unwrap_or_default()
+        };
+
+        // 第一轮：窗口未命中（day=1、无提及）→ B1 不得出现「心里有事」，C1 仍列得出这条欠账
+        let (a1, _) = simulate_turn(&root, &meta, &loaded, &log, 1, "今天天气不错。");
+        assert!(
+            !layer(&a1, "B1").contains("心里有事"),
+            "窗口未命中时线绝不进现状卡：{}",
+            layer(&a1, "B1")
+        );
+        assert!(
+            layer(&a1, "C1").contains("周五还书的约定"),
+            "全量欠账由 C1 兜底（六要素完备性不牺牲）：{}",
+            layer(&a1, "C1")
+        );
+
+        // 第二轮说了「还书」——它在本轮组装之后才落盘，故本轮仍不该进 B1
+        let (a2, _) = simulate_turn(&root, &meta, &loaded, &log, 2, "那本《夜航》我明天还书。");
+        assert!(!layer(&a2, "B1").contains("心里有事"), "提及落在本轮之后");
+
+        // 第三轮：窗口里已有「还书」→ 进 B1，且带 framing（不是任务清单，是情境脉冲）
+        let (a3, _) = simulate_turn(&root, &meta, &loaded, &log, 3, "嗯，怎么了？");
+        let b1 = layer(&a3, "B1");
+        assert!(b1.contains("心里有事"), "窗口命中后应进现状卡：{b1}");
+        assert!(b1.contains("周五还书的约定") && b1.contains("不好意思催"), "带 framing：{b1}");
+        assert!(
+            !b1.contains("不提的旧伤"),
+            "dormant 线即使被提及也不进 B1：{b1}"
+        );
+
+        // 收线 → 「了结未远」出现在 B1，且不再是未决事项
+        let mut resolved = due.clone();
+        resolved.resolve(3, 1, "20:40", "玩家如约还书，小雨送了张便签。");
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Thread(event::ThreadEvent {
+                turn: 3,
+                op: threads::OP_RESOLVE.into(),
+                thread_id: resolved.id.clone(),
+                thread: Some(resolved.to_value()),
+                origin: threads::ORIGIN_MANUAL.into(),
+                note: Some("如约还书".into()),
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        let (a4, _) = simulate_turn(&root, &meta, &loaded, &log, 4, "那就好。");
+        assert!(
+            layer(&a4, "B1").contains("了结未远"),
+            "近期收线应进「了结未远」：{}",
+            layer(&a4, "B1")
+        );
+        assert!(
+            !layer(&a4, "C1").contains("周五还书的约定"),
+            "收线后不该再列为未决事项：{}",
+            layer(&a4, "C1")
+        );
     }
 }

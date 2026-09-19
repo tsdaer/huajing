@@ -34,9 +34,12 @@ pub struct SceneSnapshot {
     pub actors: Vec<String>,
     #[serde(default)]
     pub weather: Option<String>,
-    /// 心里有事：仅在提及窗口内的活跃剧情线（设计 §8.4，M2 接入）
+    /// 心里有事：**仅在提及窗口内**的活跃剧情线，各附一句 framing（设计 §8.4）
     #[serde(default)]
     pub concerns: Vec<String>,
+    /// 了结未远：近期收线的重要结果（设计 §8.5）
+    #[serde(default)]
+    pub resolutions: Vec<String>,
 }
 
 impl SceneSnapshot {
@@ -60,7 +63,16 @@ impl SceneSnapshot {
             },
             weather: None,
             concerns: Vec::new(),
+            resolutions: Vec::new(),
         }
+    }
+
+    /// 挂上剧情线投影（设计 §8.5：B1 只收**窗口内**的活跃线 + 近期收线结果；
+    /// 全量欠账由 C1 的只读投影兜底，两者合起来才是六要素的「完备」）
+    pub fn with_threads(mut self, concerns: &[String], resolutions: &[String]) -> Self {
+        self.concerns = concerns.to_vec();
+        self.resolutions = resolutions.to_vec();
+        self
     }
 
     /// 紧凑单行渲染（预算 ≤80 token，六要素中"时间/地点/人物/起因"的投影）
@@ -71,7 +83,14 @@ impl SceneSnapshot {
             s.push_str(&format!(" · {}", w));
         }
         if !self.concerns.is_empty() {
-            s.push_str(&format!(" · 心里有事:{}", self.concerns.join("；")));
+            // 克制契约（A1）在这里落地：措辞明确「时机合适时可自然提起」，不是任务清单
+            s.push_str(&format!(
+                " · 心里有事(时机合适时可自然提起):{}",
+                self.concerns.join("；")
+            ));
+        }
+        if !self.resolutions.is_empty() {
+            s.push_str(&format!(" · 了结未远:{}", self.resolutions.join("；")));
         }
         s
     }
@@ -130,6 +149,12 @@ pub struct BuildInputs<'a> {
     pub entity_cards: &'a [SourceCard],
     /// B4 记忆宫殿召回（M2.1）
     pub memory_cards: &'a [SourceCard],
+    /// B1 心里有事：窗口内活跃线的「标题——framing」（M2.4）
+    pub concerns: &'a [String],
+    /// B1 了结未远：近期收线的重要结果（M2.4）
+    pub resolutions: &'a [String],
+    /// C1 未决事项清单：全部活跃线的只读投影（仅标题与状态，M2.4）
+    pub pending_threads: &'a [String],
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
@@ -170,8 +195,24 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
         layers.push(layer("C3", "消息窗口", &content));
     }
 
+    // ---- 槽位 C1：未决事项清单（历史区的低注意力位：全量欠账随时查得到，
+    //      但每轮只在 B1 的注意力位看到「此刻该提的」——设计 §8.4 的完备性不牺牲）----
+    let c1 = if inputs.pending_threads.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "<pending>\n{}\n</pending>",
+            inputs.pending_threads.join("\n")
+        ))
+    };
+    if let Some(c1) = &c1 {
+        layers.push(layer("C1", "未决事项", c1));
+    }
+
     // ---- 槽位 B：动态锚（紧邻最新用户消息之前）----
-    let b1 = format!("<scene>\n{}\n</scene>", SceneSnapshot::from_blackboard(inputs.blackboard).render());
+    let snapshot = SceneSnapshot::from_blackboard(inputs.blackboard)
+        .with_threads(inputs.concerns, inputs.resolutions);
+    let b1 = format!("<scene>\n{}\n</scene>", snapshot.render());
     layers.push(layer("B1", "场景快照", &b1));
     let mut b_messages = vec![ChatMessage { role: "system".into(), content: b1 }];
 
@@ -208,11 +249,17 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     }
 
     // ---- 最终消息序列：A(1) + C3(n) + B(n) + user(0..1) ----
-    let mut messages = Vec::with_capacity(2 + window_messages.len() + b_messages.len());
+    let mut messages = Vec::with_capacity(3 + window_messages.len() + b_messages.len());
     messages.push(ChatMessage {
         role: "system".into(),
         content: head_parts.join("\n\n"),
     });
+    if let Some(c1) = c1 {
+        messages.push(ChatMessage {
+            role: "system".into(),
+            content: c1,
+        });
+    }
     messages.extend(window_messages);
     messages.extend(b_messages);
     if let Some(u) = inputs.user_content {
@@ -462,6 +509,9 @@ mod tests {
             hook_injections,
             entity_cards: &[],
             memory_cards: &[],
+            concerns: &[],
+            resolutions: &[],
+            pending_threads: &[],
             history,
             user_content,
         }
