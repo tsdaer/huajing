@@ -1,5 +1,6 @@
 //! Tauri 命令层：前端可调用的入口。
 
+use crate::card;
 use crate::llm::Provider;
 use crate::store::{self, Message, NewSessionRequest, Settings};
 
@@ -53,6 +54,20 @@ pub fn save_settings(settings: Settings) -> Result<Settings, String> {
 #[tauri::command]
 pub fn list_personas() -> Result<Vec<store::Persona>, String> {
     store::list_personas(&root()).map_err(|e| e.to_string())
+}
+
+// ---------- cards（设计 §3）----------
+
+#[tauri::command]
+pub fn list_cards() -> Result<Vec<card::CardSummary>, String> {
+    Ok(card::list_cards(&root()))
+}
+
+#[tauri::command]
+pub fn get_card(dir_name: String) -> Result<card::CardDetail, String> {
+    card::load_card(&root(), &dir_name)
+        .map(card::CardDetail::from)
+        .map_err(|e| e.to_string())
 }
 
 // ---------- sessions（设计 §12）----------

@@ -19,6 +19,8 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::list_personas,
+            commands::list_cards,
+            commands::get_card,
             commands::new_session,
             commands::list_sessions,
             commands::read_messages,
