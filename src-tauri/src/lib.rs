@@ -3,6 +3,7 @@
 
 mod card;     // 角色卡与 Lua 沙箱（设计 §3）
 mod commands; // Tauri 命令层
+mod diag;     // 运行时诊断环形缓冲
 mod llm;      // OpenAI 兼容 SSE 客户端（设计 §11）
 mod prompt;   // Prompt Builder 双槽位组装（设计 §4）
 mod stimport; // SillyTavern 角色卡导入（M1.8 · 设计 §13）
@@ -20,6 +21,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
             commands::runtime_info,
+            commands::recent_diagnostics,
+            commands::record_diagnostic,
             commands::test_provider,
             commands::list_providers,
             commands::save_provider,

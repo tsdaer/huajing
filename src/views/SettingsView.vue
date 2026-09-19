@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { api } from "../api";
-import type { Persona, Provider, ProviderTest, RuntimeInfo, Settings } from "../types";
+import type { DiagRecord, Persona, Provider, ProviderTest, RuntimeInfo, Settings } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
 
@@ -38,6 +38,7 @@ async function refresh() {
     wizardDone.value = settings.value.wizard_done;
     proxyDraft.value = settings.value.proxy ?? "";
     runtime.value = await api.runtimeInfo();
+    await refreshDiagnostics();
     // 全新用户：直接落在「填 key」这一步，省掉找入口的时间
     if (needsSetup.value) startCreate();
   } catch (e) {
@@ -54,6 +55,20 @@ function startCreate() {
 
 // ---------- 运行环境 ----------
 const runtime = ref<RuntimeInfo | null>(null);
+const diagnostics = ref<DiagRecord[]>([]);
+
+function fmtClock(ts: number): string {
+  const d = new Date(ts * 1000);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+}
+
+async function refreshDiagnostics() {
+  try {
+    diagnostics.value = await api.recentDiagnostics(60);
+  } catch (e) {
+    error.value = String(e);
+  }
+}
 
 const buildStamp = computed(() => {
   const ts = runtime.value?.buildTs;
@@ -441,6 +456,30 @@ async function confirmRemove() {
           </dl>
           <p v-if="!runtime?.buildTs" class="m-0 text-[11px] text-warning">
             这个构建没有返回构建时间——说明它早于该功能，建议重新构建后再测。
+          </p>
+
+          <!-- 诊断：钩子跑没跑、卡从哪来，一眼可见（安装版没有控制台可看） -->
+          <div class="flex items-center justify-between gap-2 pt-1">
+            <span class="text-xs text-base-content/60">运行时诊断（新的在前）</span>
+            <button class="btn btn-ghost btn-xs" @click="refreshDiagnostics">
+              <Icon name="refresh" :size="12" />刷新
+            </button>
+          </div>
+          <ul v-if="diagnostics.length" class="m-0 flex max-h-56 list-none flex-col gap-1 overflow-y-auto p-0">
+            <li
+              v-for="(d, i) in diagnostics"
+              :key="`${d.ts}-${i}`"
+              class="flex items-start gap-2 rounded-box bg-base-200 px-2.5 py-1.5"
+            >
+              <span class="badge badge-xs badge-soft flex-none" :class="d.kind === 'error' ? 'badge-error' : 'badge-ghost'">
+                {{ d.kind }}
+              </span>
+              <span class="min-w-0 flex-1 font-mono text-[11px] break-all">{{ d.detail }}</span>
+              <span class="flex-none text-[10px] text-base-content/40">{{ fmtClock(d.ts) }}</span>
+            </li>
+          </ul>
+          <p v-else class="m-0 text-[11px] text-base-content/45">
+            暂无记录。发一条消息或导入一张卡后再刷新。
           </p>
         </div>
       </section>

@@ -763,6 +763,102 @@ mod tests {
         assert_eq!(list[0].model, "模型#\"引号\"\n带换行");
     }
 
+    /// 真机数据回归：若本机 `%APPDATA%\huajing\DataHub` 存在（安装版跑过），
+    /// 用它那份卡跑一遍钩子流水线——钩子探测、state 演进、记忆写入、诊断留痕。
+    /// 无该目录时跳过（开发机/CI 上不会因此变红）。
+    #[test]
+    fn installed_app_card_flows_through_hooks() {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let hub = std::path::Path::new(&appdata).join("huajing/DataHub");
+        if !hub.is_dir() {
+            println!("PROBE: 跳过（无 APPDATA DataHub）");
+            return;
+        }
+        let loaded = crate::card::load_card(&hub, "小雨").unwrap();
+        println!("PROBE hook_names={:?} degraded={}", loaded.hook_names, loaded.degraded);
+        println!("PROBE default_state={}", loaded.default_state);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        ensure_layout(&root).unwrap();
+        std::fs::create_dir_all(root.join("characters/小雨")).unwrap();
+        std::fs::copy(
+            hub.join("characters/小雨/card.lua"),
+            root.join("characters/小雨/card.lua"),
+        )
+        .unwrap();
+        let meta = new_session(
+            &root,
+            &NewSessionRequest {
+                character: "小雨".into(),
+                persona: None,
+                day: Some(1),
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = MessageLog::new();
+        let sink: crate::card::UiSink = std::sync::Arc::new(|_| {});
+
+        // on_load
+        let mut state = loaded.default_state.clone();
+        let run = crate::card::run_hook_full(
+            &loaded.source,
+            crate::card::HookCall::OnLoad,
+            &crate::card::HookEnv { state: state.clone(), ..Default::default() },
+            meta.seed,
+            &sink,
+        );
+        println!("PROBE on_load ran={} logs={:?}", run.ran(), run.result.logs);
+        save_state(&root, &meta.id, &state).unwrap();
+
+        for (turn, text) in [(1u64, "你好"), (2u64, "谢谢")] {
+            log.append(
+                &root,
+                &meta.id,
+                &Message { turn, role: "user".into(), content: text.into(), ts: 0, scene_id: None },
+            )
+            .unwrap();
+            let msgs = read_messages(&root, &meta.id).unwrap();
+            let mut st = load_state(&root, &meta.id).unwrap();
+            let bb = load_blackboard(&root, &meta.id).unwrap();
+            let mut env = std::collections::BTreeMap::new();
+            env.insert("place".to_string(), serde_json::json!(bb.place));
+            let r = crate::card::run_hook_full(
+                &loaded.source,
+                crate::card::HookCall::OnMessage { msg: msgs.last().unwrap() },
+                &crate::card::HookEnv { state: st.clone(), blackboard: env, memory: Default::default() },
+                meta.seed,
+                &sink,
+            );
+            println!(
+                "PROBE turn{turn} text={text:?} ran={} logs={:?} state_before={} state_after={} memory={:?}",
+                r.ran(),
+                r.result.logs,
+                st,
+                r.state.clone().unwrap_or(serde_json::Value::Null),
+                r.memory
+            );
+            // 诊断通道：钩子执行必须留痕（真机排查靠它）
+            crate::diag::record(
+                "hook",
+                format!("turn={turn} ran={} state={:?}", r.ran(), r.state),
+            );
+            if let Some(next) = r.state.clone() {
+                if next != st {
+                    save_state(&root, &meta.id, &next).unwrap();
+                }
+            }
+            st = load_state(&root, &meta.id).unwrap();
+            println!("PROBE turn{turn} state.json = {st}");
+        }
+        let diag = crate::diag::recent(5);
+        println!("PROBE 诊断条数={} 最新={:?}", diag.len(), diag.first().map(|d| &d.detail));
+        assert!(diag.iter().any(|d| d.detail.contains("turn=2")));
+    }
+
     #[test]
     fn new_session_layout_and_append() {
         let root = tempfile::tempdir().unwrap();

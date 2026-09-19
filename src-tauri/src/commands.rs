@@ -25,6 +25,18 @@ pub fn app_info() -> serde_json::Value {
     })
 }
 
+/// 前端记一条诊断（拖放被忽略等只有前端知道的事）
+#[tauri::command]
+pub fn record_diagnostic(kind: String, detail: String) {
+    crate::diag::record(&kind, detail);
+}
+
+/// 最近的运行时诊断（钩子/导入/错误的关键决策），新的在前
+#[tauri::command]
+pub fn recent_diagnostics(limit: Option<usize>) -> Vec<crate::diag::DiagRecord> {
+    crate::diag::recent(limit.unwrap_or(60).min(200))
+}
+
 /// 运行环境速览（设置页「运行环境」）：这是当前进程真正在用的路径与计数，
 /// 排查「我改了卡怎么没用」时第一眼看这里——很可能是应用读的不是你改的那份。
 #[tauri::command]
@@ -686,6 +698,14 @@ fn run_message_hook(
     on_event: &Channel<StreamEvent>,
 ) -> llm::HookReport {
     if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_message") {
+        // 诊断：这条最容易被误判成「钩子没生效」——其实是这张卡没写 on_message
+        crate::diag::record(
+            "hook",
+            format!(
+                "on_message 跳过：卡「{}」degraded={} 已探测钩子={:?}",
+                loaded.dir_name, loaded.degraded, loaded.hook_names
+            ),
+        );
         return llm::HookReport {
             turn,
             ..Default::default()
@@ -722,6 +742,16 @@ fn run_message_hook(
         &ui_sink(app),
     );
     let report = apply_message_hook(root, &meta.id, turn, &run, &mut state, &mut blackboard);
+    crate::diag::record(
+        "hook",
+        format!(
+            "on_message turn={turn} ran={} state={} 记忆写入={} 日志={:?}",
+            report.ran,
+            report.card_state,
+            report.memory.len(),
+            report.logs
+        ),
+    );
     for event in &report.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
             kind: event.kind.clone(),
@@ -802,6 +832,14 @@ pub async fn send_message(
 
     // 接入点（chat 档；先校验再落盘用户消息，配置错误不产生半截会话）
     let provider = pick_chat_provider(&root)?;
+
+    crate::diag::record(
+        "chat",
+        format!(
+            "send_message 会话={} 卡={}（{}，钩子={:?}）",
+            session_id, character, root.display(), loaded.hook_names
+        ),
+    );
 
     // 双槽位组装（设计 §4.1）：历史读取走增量缓存，高轮次只解析新增行
     let history = msg_log

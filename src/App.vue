@@ -92,8 +92,9 @@ async function startDropWatch() {
         importNotice.value = "";
         requestImport(hit);
       } else if (paths.length > 0) {
-        // 拖了别的文件：说清楚为什么不理会
+        // 拖了别的文件：说清楚为什么不理会（并留痕，便于事后排查）
         importNotice.value = `只支持 SillyTavern 的 PNG / JSON 角色卡，已忽略：${paths[0]}`;
+        void api.recordDiagnostic("import", `拖放被忽略（非 PNG/JSON）：${paths[0]}`);
       }
     });
   } catch {

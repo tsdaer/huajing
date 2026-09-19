@@ -240,6 +240,11 @@ export function setupMock() {
           buildTs: Math.floor(Date.now() / 1000),
           dataRoot: "DataHub（浏览器 mock）",
         };
+      case "recent_diagnostics":
+        return [
+          { kind: "chat", detail: "send_message 会话=mock 卡=小雨（DataHub（浏览器 mock），钩子=[on_context, on_message]）", ts: Math.floor(Date.now() / 1000) },
+          { kind: "hook", detail: "on_message turn=1 ran=true state={\"favorability\":51} 记忆写入=1 日志=[]", ts: Math.floor(Date.now() / 1000) },
+        ];
       case "runtime_info":
         return {
           dataRoot: "DataHub（浏览器 mock）",

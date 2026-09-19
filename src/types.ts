@@ -20,6 +20,13 @@ export interface AppInfo {
   dataRoot: string;
 }
 
+/** 一条运行时诊断（diag.rs） */
+export interface DiagRecord {
+  kind: string;
+  detail: string;
+  ts: number;
+}
+
 /** 运行环境（commands.rs · runtime_info） */
 export interface RuntimeInfo {
   dataRoot: string;

@@ -8,6 +8,7 @@ import type {
   CardDetail,
   CardDraft,
   CardSummary,
+  DiagRecord,
   ImportReport,
   MemRecord,
   Message,
@@ -34,6 +35,11 @@ export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   /** 运行环境速览（设置页「运行环境」） */
   runtimeInfo: () => invoke<RuntimeInfo>("runtime_info"),
+  /** 最近的运行时诊断（钩子/发送的关键决策） */
+  recentDiagnostics: (limit = 60) => invoke<DiagRecord[]>("recent_diagnostics", { limit }),
+  /** 前端侧诊断（拖放被忽略等）；失败静默——诊断绝不能影响主流程 */
+  recordDiagnostic: (kind: string, detail: string) =>
+    invoke<void>("record_diagnostic", { kind, detail }).catch(() => {}),
 
   listProviders: () => invoke<Provider[]>("list_providers"),
   /** 按名称 upsert，返回更新后的全量列表 */

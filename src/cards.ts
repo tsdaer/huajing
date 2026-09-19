@@ -21,6 +21,7 @@ let importNonce = 0;
 export function requestImport(path: string): void {
   importNonce += 1;
   importRequest.value = { path, nonce: importNonce };
+  void api.recordDiagnostic("import", `拖放收到文件：${path}`);
 }
 
 /// 待导入的卡文件扩展名（拖放过滤）

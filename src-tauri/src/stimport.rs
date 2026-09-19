@@ -52,15 +52,44 @@ pub struct CardDraft {
 #[tauri::command]
 pub fn import_st_card(path: String, overwrite: Option<bool>) -> Result<ImportReport, String> {
     let path = PathBuf::from(path.trim());
-    import_file_to(&crate::store::data_root(), &path, overwrite.unwrap_or(false))
+    let root = crate::store::data_root();
+    let outcome = import_file_to(&root, &path, overwrite.unwrap_or(false));
+    // 留痕：安装版没有控制台，「拖了没反应」只能靠诊断面板说清是哪一步断的
+    crate::diag::record(
+        if outcome.is_ok() { "import" } else { "error" },
+        match &outcome {
+            Ok(r) => format!(
+                "导入成功：{} ← {}（写入 {}",
+                r.dir_name,
+                path.display(),
+                root.display()
+            ),
+            Err(e) => format!("导入失败：{} ← {}：{e}", path.display(), root.display()),
+        },
+    );
+    outcome
 }
 
 /// 只解析不落盘（导入向导的预览步骤）
 #[tauri::command]
 pub fn preview_st_card(path: String) -> Result<CardDraft, String> {
     let path = PathBuf::from(path.trim());
-    let bytes = std::fs::read(&path).map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
-    parse_st_card(&bytes, path.file_stem().and_then(|s| s.to_str()))
+    let outcome = std::fs::read(&path)
+        .map_err(|e| format!("读取 {} 失败：{e}", path.display()))
+        .and_then(|bytes| parse_st_card(&bytes, path.file_stem().and_then(|s| s.to_str())));
+    crate::diag::record(
+        if outcome.is_ok() { "import" } else { "error" },
+        match &outcome {
+            Ok(d) => format!(
+                "解析成功：{}（{}，示例 {} 组）",
+                path.display(),
+                d.source_spec,
+                d.example_dialogue.len()
+            ),
+            Err(e) => format!("解析失败：{}：{e}", path.display()),
+        },
+    );
+    outcome
 }
 
 /// 解析 PNG / JSON 为草稿；`fallback_name` 用于卡里没有名字的情况（多为文件名）
