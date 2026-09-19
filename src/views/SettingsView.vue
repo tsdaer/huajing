@@ -90,7 +90,7 @@ async function remove(p: Provider) {
 
       <p v-if="providers.length === 0 && !editing" class="empty">
         还没有接入点。新增一个 OpenAI 兼容接入点（DeepSeek / GLM / Ollama 均可），
-        或参考 <code>DataHub/providers.example.json</code>。
+        或参考 <code>DataHub/providers.example.toml</code>。
       </p>
 
       <ul class="plist">

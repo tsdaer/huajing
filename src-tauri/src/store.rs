@@ -3,6 +3,7 @@
 //! M1.1 范围：providers / settings / personas 读写；会话目录骨架与
 //! messages.jsonl 追加式落盘（可回放）。卡片加载与热加载见 card.rs（M1.2）。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,8 @@ use crate::llm::Provider;
 pub enum StoreError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    TomlDe(toml::de::Error),
+    TomlSer(toml::ser::Error),
     NotFound(String),
 }
 
@@ -24,6 +27,8 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::Io(e) => write!(f, "IO 错误：{}", e),
             StoreError::Json(e) => write!(f, "JSON 解析错误：{}", e),
+            StoreError::TomlDe(e) => write!(f, "TOML 解析错误：{}", e),
+            StoreError::TomlSer(e) => write!(f, "TOML 写入错误：{}", e),
             StoreError::NotFound(what) => write!(f, "不存在：{}", what),
         }
     }
@@ -40,6 +45,18 @@ impl From<std::io::Error> for StoreError {
 impl From<serde_json::Error> for StoreError {
     fn from(e: serde_json::Error) -> Self {
         StoreError::Json(e)
+    }
+}
+
+impl From<toml::de::Error> for StoreError {
+    fn from(e: toml::de::Error) -> Self {
+        StoreError::TomlDe(e)
+    }
+}
+
+impl From<toml::ser::Error> for StoreError {
+    fn from(e: toml::ser::Error) -> Self {
+        StoreError::TomlSer(e)
     }
 }
 
@@ -74,7 +91,7 @@ pub fn ensure_layout(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-// ---------- providers.json（设计 §11：LLM 接入点）----------
+// ---------- providers.toml（设计 §11：LLM 接入点；手改配置用 TOML，带注释友好）----------
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProvidersFile {
@@ -83,7 +100,7 @@ pub struct ProvidersFile {
 }
 
 pub fn providers_path(root: &Path) -> PathBuf {
-    root.join("providers.json")
+    root.join("providers.toml")
 }
 
 pub fn load_providers(root: &Path) -> StoreResult<Vec<Provider>> {
@@ -92,15 +109,15 @@ pub fn load_providers(root: &Path) -> StoreResult<Vec<Provider>> {
         return Ok(Vec::new());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str::<ProvidersFile>(&raw)?.providers)
+    Ok(toml::from_str::<ProvidersFile>(&raw)?.providers)
 }
 
 pub fn save_providers(root: &Path, providers: &[Provider]) -> StoreResult<()> {
     std::fs::create_dir_all(root)?;
-    let json = serde_json::to_string_pretty(&ProvidersFile {
+    let toml = toml::to_string_pretty(&ProvidersFile {
         providers: providers.to_vec(),
     })?;
-    std::fs::write(providers_path(root), json + "\n")?;
+    std::fs::write(providers_path(root), toml + "\n")?;
     Ok(())
 }
 
@@ -126,7 +143,7 @@ pub fn delete_provider(root: &Path, name: &str) -> StoreResult<Vec<Provider>> {
     Ok(providers)
 }
 
-// ---------- settings.json（界面与全局配置）----------
+// ---------- settings.toml（界面与全局配置）----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -159,21 +176,21 @@ impl Default for Settings {
 }
 
 pub fn load_settings(root: &Path) -> StoreResult<Settings> {
-    let path = root.join("settings.json");
+    let path = root.join("settings.toml");
     if !path.exists() {
         return Ok(Settings::default());
     }
-    Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
+    Ok(toml::from_str(&std::fs::read_to_string(&path)?)?)
 }
 
 pub fn save_settings(root: &Path, settings: &Settings) -> StoreResult<()> {
     std::fs::create_dir_all(root)?;
-    let json = serde_json::to_string_pretty(settings)?;
-    std::fs::write(root.join("settings.json"), json + "\n")?;
+    let toml = toml::to_string_pretty(settings)?;
+    std::fs::write(root.join("settings.toml"), toml + "\n")?;
     Ok(())
 }
 
-// ---------- personas/（用户人格）----------
+// ---------- personas/（用户人格，*.toml）----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Persona {
@@ -188,11 +205,11 @@ pub fn list_personas(root: &Path) -> StoreResult<Vec<Persona>> {
     // 坏文件跳过而非整体报错：明文数据层对单个文件损坏保持容错
     for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
         if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(p) = serde_json::from_str::<Persona>(&raw) {
+            if let Ok(p) = toml::from_str::<Persona>(&raw) {
                 out.push(p);
             }
         }
@@ -296,33 +313,29 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
     Ok(meta)
 }
 
-/// 追加一行消息（messages.jsonl 为追加式日志：可回放、可恢复）
-pub fn append_message(root: &Path, session_id: &str, msg: &Message) -> StoreResult<()> {
-    use std::io::Write;
-    let dir = session_dir(root, session_id);
-    if !dir.is_dir() {
-        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("messages.jsonl"))?;
-    writeln!(f, "{}", serde_json::to_string(msg)?)?;
-    Ok(())
+/// 解析缓冲区里的完整行（返回消息与消费的字节数）。
+/// 只到最后一个 `\n` 为止——结尾半行（崩溃残留）留待补全；坏行跳过。
+/// 字节级切行对 UTF-8 安全（多字节字符的续字节不含 `\n`）。
+fn parse_complete_lines(buf: &[u8]) -> (Vec<Message>, usize) {
+    let complete = match buf.iter().rposition(|&b| b == b'\n') {
+        Some(p) => p + 1,
+        None => return (Vec::new(), 0),
+    };
+    let messages = buf[..complete]
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_slice::<Message>(l).ok())
+        .collect();
+    (messages, complete)
 }
 
-/// 读取全量消息（坏行跳过：追加式日志的容错读取）
+/// 读取全量消息（直读文件；热路径走 [`MessageLog`] 增量缓存）
 pub fn read_messages(root: &Path, session_id: &str) -> StoreResult<Vec<Message>> {
     let path = session_dir(root, session_id).join("messages.jsonl");
     if !path.exists() {
         return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
     }
-    let raw = std::fs::read_to_string(&path)?;
-    Ok(raw
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect())
+    Ok(parse_complete_lines(&std::fs::read(&path)?).0)
 }
 
 /// 扫描 sessions/*/session.json，按创建时间倒序
@@ -339,6 +352,115 @@ pub fn list_sessions(root: &Path) -> StoreResult<Vec<SessionMeta>> {
     }
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(out)
+}
+
+// ---------- MessageLog：会话消息的增量缓存（高轮次性能）----------
+//
+// messages.jsonl 是追加式日志，本应用是唯一写入者。缓存记住每会话
+// 已读到的字节偏移，读取时只 seek 续读新增部分——高轮次下每轮开销
+// 与新增行数成正比，而非全量重解析。半行（崩溃时未写完）留待补全
+// 后再消费；文件被外部截断/重写时缓存自动重置。
+
+/// 会话消息缓存（Tauri State；跨命令复用）
+#[derive(Default)]
+pub struct MessageLog {
+    inner: std::sync::Mutex<HashMap<String, LogEntry>>,
+}
+
+#[derive(Default)]
+struct LogEntry {
+    messages: std::sync::Arc<Vec<Message>>,
+    /// 已消费到的字节偏移（最后一个完整行的行尾）
+    pos: u64,
+}
+
+fn poisoned() -> StoreError {
+    StoreError::Io(std::io::Error::other("消息缓存锁 poisoned"))
+}
+
+impl MessageLog {
+    pub fn new() -> Self {
+        MessageLog::default()
+    }
+
+    /// 读取会话全部消息（增量续读；无新数据时直接返回缓存 Arc，零拷贝零解析）
+    pub fn read(&self, root: &Path, session_id: &str) -> StoreResult<std::sync::Arc<Vec<Message>>> {
+        let mut map = self.inner.lock().map_err(|_| poisoned())?;
+        sync_entry(&mut map, root, session_id)?;
+        Ok(map
+            .get(session_id)
+            .expect("sync_entry 已建立条目")
+            .messages
+            .clone())
+    }
+
+    /// 追加一条消息：写文件 + 同步缓存
+    pub fn append(&self, root: &Path, session_id: &str, msg: &Message) -> StoreResult<()> {
+        use std::io::Write;
+        let mut map = self.inner.lock().map_err(|_| poisoned())?;
+        sync_entry(&mut map, root, session_id)?;
+
+        let line = serde_json::to_string(msg)? + "\n";
+        let path = session_dir(root, session_id).join("messages.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        f.write_all(line.as_bytes())?;
+
+        let entry = map.get_mut(session_id).expect("sync_entry 已建立条目");
+        std::sync::Arc::make_mut(&mut entry.messages).push(msg.clone());
+        entry.pos += line.len() as u64;
+        Ok(())
+    }
+
+    /// 丢弃某会话（或全部）缓存；下次读取全量重建。
+    /// 消息编辑/删除/外部改动文件后调用。
+    pub fn invalidate(&self, session_id: Option<&str>) {
+        if let Ok(mut map) = self.inner.lock() {
+            match session_id {
+                Some(id) => {
+                    map.remove(id);
+                }
+                None => map.clear(),
+            }
+        }
+    }
+}
+
+/// 将缓存条目推进到文件当前末尾（只解析新增的完整行）
+fn sync_entry(
+    map: &mut HashMap<String, LogEntry>,
+    root: &Path,
+    session_id: &str,
+) -> StoreResult<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = session_dir(root, session_id).join("messages.jsonl");
+    if !path.exists() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    let len = std::fs::metadata(&path)?.len();
+    let entry = map.entry(session_id.to_string()).or_default();
+    if len < entry.pos {
+        // 文件被外部截断/重写：丢弃缓存全量重读
+        entry.pos = 0;
+        std::sync::Arc::make_mut(&mut entry.messages).clear();
+    }
+    if len == entry.pos {
+        return Ok(());
+    }
+    let mut f = std::fs::File::open(&path)?;
+    f.seek(SeekFrom::Start(entry.pos))?;
+    let mut buf = Vec::with_capacity((len - entry.pos) as usize);
+    f.read_to_end(&mut buf)?;
+
+    let (messages, consumed) = parse_complete_lines(&buf);
+    if consumed == 0 {
+        return Ok(()); // 只有半行：留待补全
+    }
+    std::sync::Arc::make_mut(&mut entry.messages).extend(messages);
+    entry.pos += consumed as u64;
+    Ok(())
 }
 
 // ---------- 时间工具（不引入时间库；Howard Hinnant civil 算法）----------
@@ -474,16 +596,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("personas")).unwrap();
         std::fs::write(
-            root.path().join("personas/b.json"),
-            r#"{"name":"beta","description":"夜读者"}"#,
+            root.path().join("personas/b.toml"),
+            "name = \"beta\"\ndescription = \"夜读者\"\n",
         )
         .unwrap();
+        std::fs::write(root.path().join("personas/a.toml"), "name = \"alpha\"\n").unwrap();
+        std::fs::write(root.path().join("personas/bad.toml"), "{not toml").unwrap();
+        // 旧 json 不再识别
         std::fs::write(
-            root.path().join("personas/a.json"),
-            r#"{"name":"alpha"}"#,
+            root.path().join("personas/legacy.json"),
+            "{\"name\":\"legacy\"}",
         )
         .unwrap();
-        std::fs::write(root.path().join("personas/bad.json"), "{not json").unwrap();
 
         let list = list_personas(root.path()).unwrap();
         assert_eq!(
@@ -492,6 +616,16 @@ mod tests {
         );
         assert_eq!(list[0].description, "");
         assert_eq!(list[1].description, "夜读者");
+    }
+
+    #[test]
+    fn providers_toml_roundtrip_with_special_chars() {
+        let root = tempfile::tempdir().unwrap();
+        let mut p = sample_provider("deepseek", "chat");
+        p.model = "模型#\"引号\"\n带换行".into(); // TOML 需正确转义
+        upsert_provider(root.path(), p).unwrap();
+        let list = load_providers(root.path()).unwrap();
+        assert_eq!(list[0].model, "模型#\"引号\"\n带换行");
     }
 
     #[test]
@@ -524,7 +658,8 @@ mod tests {
         assert_eq!((bb.day, bb.clock.as_str(), bb.place.as_str()), (3, "21:30", "图书馆自习区"));
         assert_eq!(bb.actors, vec!["小雨"]);
 
-        append_message(
+        let log = MessageLog::new();
+        log.append(
             root.path(),
             &meta.id,
             &Message {
@@ -536,7 +671,7 @@ mod tests {
             },
         )
         .unwrap();
-        append_message(
+        log.append(
             root.path(),
             &meta.id,
             &Message {
@@ -571,7 +706,7 @@ mod tests {
         assert!(another.id.starts_with("20"));
 
         // 不存在的会话追加报错而非 panic
-        assert!(append_message(root.path(), "no-such", &msgs[0]).is_err());
+        assert!(log.append(root.path(), "no-such", &msgs[0]).is_err());
     }
 
     #[test]
@@ -580,5 +715,191 @@ mod tests {
         assert_eq!(iso8601(946_684_800), "2000-01-01T00:00:00Z");
         // 闰日：2024-03-01 前一天是 2024-02-29（1709164800 = 2024-02-29T00:00:00Z）
         assert_eq!(iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn message_log_incremental_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                character: "小雨".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = MessageLog::new();
+
+        log.append(
+            root.path(),
+            &meta.id,
+            &Message {
+                turn: 1,
+                role: "user".into(),
+                content: "你好".into(),
+                ts: 1,
+                scene_id: None,
+            },
+        )
+        .unwrap();
+        let a = log.read(root.path(), &meta.id).unwrap();
+        assert_eq!(a.len(), 1);
+        // 无新数据：复用缓存（同一份 Arc，零重解析）
+        let b = log.read(root.path(), &meta.id).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+
+        log.append(
+            root.path(),
+            &meta.id,
+            &Message {
+                turn: 1,
+                role: "char".into(),
+                content: "……嗯。".into(),
+                ts: 2,
+                scene_id: None,
+            },
+        )
+        .unwrap();
+        let c = log.read(root.path(), &meta.id).unwrap();
+        assert_eq!(c.len(), 2);
+        assert!(!std::sync::Arc::ptr_eq(&a, &c));
+
+        // 与直接读文件的自由函数结果一致
+        let raw = read_messages(root.path(), &meta.id).unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw[1].content, "……嗯。");
+    }
+
+    #[test]
+    fn message_log_partial_line_waits_for_newline() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                character: "小雨".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = MessageLog::new();
+        log.append(
+            root.path(),
+            &meta.id,
+            &Message {
+                turn: 1,
+                role: "user".into(),
+                content: "第一条".into(),
+                ts: 1,
+                scene_id: None,
+            },
+        )
+        .unwrap();
+
+        // 模拟崩溃：直接写入半行 JSON（无换行）
+        let path = session_dir(root.path(), &meta.id).join("messages.jsonl");
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(r#"{"turn":2,"role":"user","content":"第"#.as_bytes())
+            .unwrap();
+        assert_eq!(log.read(root.path(), &meta.id).unwrap().len(), 1, "半行不消费");
+
+        // 补全换行后整行出现
+        f.write_all(r#"二条","ts":2}"#.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+        drop(f);
+        assert_eq!(log.read(root.path(), &meta.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn message_log_external_truncation_resets_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                character: "小雨".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = MessageLog::new();
+        for i in 0..3 {
+            log.append(
+                root.path(),
+                &meta.id,
+                &Message {
+                    turn: i + 1,
+                    role: "user".into(),
+                    content: format!("m{i}"),
+                    ts: i as u64,
+                    scene_id: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(log.read(root.path(), &meta.id).unwrap().len(), 3);
+
+        // 外部重写文件（消息编辑场景的简化版）
+        let path = session_dir(root.path(), &meta.id).join("messages.jsonl");
+        std::fs::write(
+            &path,
+            "{\"turn\":1,\"role\":\"user\",\"content\":\"edited\",\"ts\":9}\n",
+        )
+        .unwrap();
+        let msgs = log.read(root.path(), &meta.id).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "edited");
+    }
+
+    #[test]
+    fn message_log_survives_high_volume() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                character: "小雨".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = MessageLog::new();
+        let n = 10_000;
+        for i in 0..n {
+            log.append(
+                root.path(),
+                &meta.id,
+                &Message {
+                    turn: i as u64 / 2 + 1,
+                    role: if i % 2 == 0 { "user" } else { "char" }.into(),
+                    content: format!("消息正文 {:064}", i), // ~100B/行
+                    ts: i as u64,
+                    scene_id: None,
+                },
+            )
+            .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let msgs = log.read(root.path(), &meta.id).unwrap();
+        assert_eq!(msgs.len(), n);
+        // 增量读取：无新增时 read 只做一次 metadata 检查
+        assert!(started.elapsed().as_millis() < 500, "读取过慢");
+        // 新建缓存实例的全量重建也能工作（invalidate 后等价路径）
+        log.invalidate(Some(&meta.id));
+        assert_eq!(log.read(root.path(), &meta.id).unwrap().len(), n);
     }
 }

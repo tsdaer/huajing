@@ -105,8 +105,13 @@ pub fn list_sessions() -> Result<Vec<store::SessionMeta>, String> {
 }
 
 #[tauri::command]
-pub fn read_messages(session_id: String) -> Result<Vec<Message>, String> {
-    store::read_messages(&root(), &session_id).map_err(|e| e.to_string())
+pub fn read_messages(
+    session_id: String,
+    msg_log: State<'_, store::MessageLog>,
+) -> Result<std::sync::Arc<Vec<Message>>, String> {
+    msg_log
+        .read(&root(), &session_id)
+        .map_err(|e| e.to_string())
 }
 
 // ---------- 对话生成（设计 §4 流程 + §11 流式）----------
@@ -114,6 +119,10 @@ pub fn read_messages(session_id: String) -> Result<Vec<Message>, String> {
 /// 每个会话的生成中断标记
 #[derive(Default)]
 pub struct CancelFlags(Mutex<HashMap<String, Arc<AtomicBool>>>);
+
+/// 发给 LLM 的最近消息窗口（高轮次下请求不随历史无限膨胀；
+/// M1.4 正式预算分配 + 场景边界裁剪替换此占位）
+const HISTORY_WINDOW: usize = 40;
 
 /// 本地消息角色 → OpenAI 角色（char → assistant）
 fn to_openai(m: &Message) -> ChatMessage {
@@ -137,6 +146,7 @@ pub async fn send_message(
     content: String,
     on_event: Channel<StreamEvent>,
     flags: State<'_, CancelFlags>,
+    msg_log: State<'_, store::MessageLog>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -156,9 +166,13 @@ pub async fn send_message(
         .find(|p| p.role == "chat")
         .ok_or_else(|| "未配置 chat 档接入点，请先到设置页添加".to_string())?;
 
-    // 组装消息（M1.3 最小组装：卡静态字段做系统头 + 全量历史；M1.4 换正式 Prompt Builder）
-    let history = store::read_messages(&root, &session_id).map_err(|e| e.to_string())?;
+    // 组装消息（M1.3 最小组装：卡静态字段做系统头 + 最近窗口；M1.4 换正式 Prompt Builder）
+    // 读取走增量缓存：高轮次下每轮只解析新增行
+    let history = msg_log
+        .read(&root, &session_id)
+        .map_err(|e| e.to_string())?;
     let turn = history.last().map(|m| m.turn).unwrap_or(0) + 1;
+    let window_start = history.len().saturating_sub(HISTORY_WINDOW);
     let mut chat: Vec<ChatMessage> = Vec::new();
     if !loaded.card.scenario.is_empty() || !loaded.card.personality.is_empty() {
         chat.push(ChatMessage {
@@ -166,7 +180,7 @@ pub async fn send_message(
             content: format!("{}\n{}", loaded.card.scenario, loaded.card.personality),
         });
     }
-    chat.extend(history.iter().map(to_openai));
+    chat.extend(history[window_start..].iter().map(to_openai));
 
     // 用户消息落盘后进入流式请求
     let user_msg = Message {
@@ -176,7 +190,9 @@ pub async fn send_message(
         ts: store::unix_now(),
         scene_id: None,
     };
-    store::append_message(&root, &session_id, &user_msg).map_err(|e| e.to_string())?;
+    msg_log
+        .append(&root, &session_id, &user_msg)
+        .map_err(|e| e.to_string())?;
     chat.push(ChatMessage {
         role: "user".into(),
         content,
@@ -224,7 +240,7 @@ pub async fn send_message(
                     ts: store::unix_now(),
                     scene_id: None,
                 };
-                if let Err(e) = store::append_message(&root, &session_id, &reply) {
+                if let Err(e) = msg_log.append(&root, &session_id, &reply) {
                     return Ok(StreamEvent::Error {
                         message: format!("回复落盘失败：{e}"),
                     });

@@ -25,7 +25,7 @@ pnpm tauri dev        # 开发模式（首次会编译 Rust，需几分钟）
 pnpm tauri build      # 产出安装包
 ```
 
-首次使用：复制 `DataHub/providers.example.json` 为 `DataHub/providers.json`，填入你的 API key。
+首次使用：复制 `DataHub/providers.example.toml` 为 `DataHub/providers.toml`，填入你的 API key。
 
 ## 目录结构
 

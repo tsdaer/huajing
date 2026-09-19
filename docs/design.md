@@ -28,7 +28,7 @@
 | 记忆宫殿 | 情景记忆的空间化组织（房间/人物/时间线）+ 关联召回引擎（§5.2） | `sessions/<id>/palace.jsonl` |
 | 黑板 | 会话内多角色共享的世界状态（时间、地点、事件标志）——设定集的"现在时" | `sessions/<id>/blackboard.json` |
 | 场景快照 | 黑板 + 剧情线的每轮提示词投影——**六要素故事现状卡**（§4 槽位 B1） | 运行时生成，不落盘 |
-| Provider | 一个 LLM 接入点（OpenAI 兼容） | `providers.json` |
+| Provider | 一个 LLM 接入点（OpenAI 兼容） | `providers.toml` |
 
 ### 2.1 职责边界与单一事实来源（重叠裁决）
 
@@ -768,7 +768,7 @@ char 实体 facet 模板按心理学二分法重排（§6.2 已更新）：**倾
 ## 11. LLM 接入
 
 - 统一 **OpenAI 兼容协议**（OpenAI / DeepSeek / GLM / Kimi / Ollama / LM Studio 通吃；Claude 走兼容端点）。
-- `providers.json` 管理多个接入点，可为不同用途指定不同档位（主对话用强模型、自动总结/捕获/分类 evaluator 用便宜档）；角色卡可声明推荐参数（温度、模型档位），用户可覆盖。
+- `providers.toml` 管理多个接入点，可为不同用途指定不同档位（主对话用强模型、自动总结/捕获/分类 evaluator 用便宜档）；角色卡可声明推荐参数（温度、模型档位），用户可覆盖。
 - API key 存本地；v1 明文 + 警示，v2 接系统密钥库（Windows 凭据管理器）。
 - 每次请求在 UI 显示：现状卡、当前状态路径、活跃剧情线、各槽位命中内容与实际 token、花费估算。
 
@@ -776,9 +776,9 @@ char 实体 facet 模板按心理学二分法重排（§6.2 已更新）：**倾
 
 ```
 DataHub/
-  settings.json            # 界面与全局配置
-  providers.json           # LLM 接入点
-  personas/                # 用户人格
+  settings.toml            # 界面与全局配置
+  providers.toml           # LLM 接入点
+  personas/                # 用户人格（*.toml）
   codex/<世界名>/
     world.json             # 世界元信息（基调、适用风格、世界时钟）
     worldline.lua          # 可选：世界主线（阶段弧，§6.6）
@@ -790,7 +790,7 @@ DataHub/
     assets/                # 立绘、头像、音效
   sessions/<id>/
     session.json           # 元数据（角色阵容、模型、种子、启用的世界、premise 起因）
-    messages.jsonl         # 消息流（按 scene_id 分段）+ 状态转移/开线收线/设定确认事件（追加式：可回放、可恢复）
+    messages.jsonl         # 消息流（按 scene_id 分段）+ 状态转移/开线收线/设定确认事件（追加式：可回放、可恢复；宿主侧按字节偏移增量读取，高轮次无全量重解析）
     state.json             # 各角色 Lua state 快照（含 psyche） + 状态树活跃路径
     blackboard.json        # 世界层（时钟/天气/世界 flags）+ 各场景分区（地点/在场/场景 flags）
     threads.json           # 剧情线（起因/经过/结果/提及时机）
@@ -827,6 +827,7 @@ M1 的刻意不做（非目标，v1 全程不做）：账号/云同步、内置�
 2. **平台范围**：桌面 + 手机都要——选 Tauri 2 全平台；桌面先行（M1–M3），移动端 alpha 进 M4。
 3. **数据归属**：纯本地——无后端无账号，同步靠拷贝 DataHub 文件夹或导入导出，后续可加 WebDAV。
 4. **界面形态**：IM 聊天风打底——galgame 皮肤作为后续主题叠加，M1 起预留主题变量层。
+5. **文件格式分工**（2026-09-19 补充）：手改配置用 TOML（`settings.toml` / `providers.toml` / `personas/*.toml`，注释友好）；运行时数据保持 JSON/JSONL（机器读写、追加语义、Lua state 往返）。会话消息读取走宿主侧字节偏移增量缓存，高轮次开销与历史总量无关。
 
 ## 17. 技术选型（依上述决策推定）
 
@@ -837,6 +838,6 @@ M1 的刻意不做（非目标，v1 全程不做）：账号/云同步、内置�
 | 角色卡运行时 | **mlua（LuaJIT 构建特性）内嵌于 Rust** | mlua 自带宿主级沙箱支持（剥离 os/io、指令计数限制）；hooks、状态树转移求值、设定集 Lua 条件都在这里跑，前端不接触 Lua |
 | 状态树/记忆/设定集/剧情线引擎 | **Rust 宿主侧确定性实现**（别名解析用 aho-corasick 倒排索引） | 转移求值、召回打分、实体激活、线生命周期零 LLM 依赖、可回放；LLM 仅用于总结/捕获/补全/分类（复用同一 provider 通道，零新依赖） |
 | LLM 通信 | reqwest + SSE 流式，OpenAI 兼容协议 | 单一协议通吃 OpenAI/DeepSeek/GLM/Ollama 等 |
-| 数据 | 明文 JSON / JSONL + Lua 源文件 | 见 §12，天然 git / 网盘友好 |
+| 数据 | 明文：配置 TOML · 运行时数据 JSON/JSONL · Lua 源文件 | 见 §12 与 §16-5，天然 git / 网盘友好 |
 
 关键分工：**Rust 核心管 Lua 沙箱、状态树求值、剧情线生命周期、心理运行时（衰减/阈值/自动表情）、记忆宫殿、设定集解析与激活、上下文组装、流式转发、文件落盘；前端只做展示与交互；Lua 只出现在角色卡与设定集逻辑里。**
