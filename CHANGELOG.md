@@ -15,12 +15,14 @@
 - **M1.3 LLM 流式通道**：reqwest + SSE 流式补全（OpenAI 兼容 `/chat/completions`，bearer 认证，连接超时 15s、逐块超时 180s、无整体超时）；字节级 SSE 解析器（跨块事件重组、CRLF、多字节 UTF-8 截断安全、`data:` 单空格剥离不 trim、非 data 行忽略）；`send_message` 命令——chat 档 provider 选择、用户消息先落盘、Channel 流事件（delta/done/error）推送前端、同会话并发防重、回复（含中断部分文本）落盘；`stop_generation` 中断命令；前端 sendMessage/stopGeneration 封装；M1.3 最小组装（卡 scenario/personality 系统头 + 历史窗口，M1.4 换正式 Builder）；SSE 解析 7 例单元测试
 
 - **M1.4 Prompt Builder v0 与黑板 v0**：`prompt.rs` 双槽位组装器——A1 全局契约（表达契约/克制契约/资料优先级声明，叙事模式台词体/小说体/独白体三态）、A2 用户人格、A3 身份锚（scenario/personality + 按 psyche.affect 情绪命中排序的示例对话）、B1 场景快照（黑板投影，`<scene>` 标签，每轮强制、空黑板退化为"第N天 · 地点未定"）、B5 hook 注入（on_context 收集，降级卡跳过）、C3 最近 40 条消息窗口；空层省略不产生空标签；组装层明细带 token 估算（CJK≈1:1、其余≈4:1）。黑板 v0：load/save + `get_blackboard`/`update_blackboard` 命令（UI 手动编辑）+ 每轮回复后时钟 +10 分钟步进（跨日进位）。`send_message` 换用组装器并留存每会话最近一次组装；新增 `preview_prompt`（干跑预览）与 `last_prompt` 检查器命令。前端新增会话页（列表 + 最小新建表单）与会话详情（黑板编辑、记忆检查器 v0 逐层展示注入内容与 token、消息只读列表）
+- **M1.5 会话与聊天 UI**：`new_session` 写入 first_mes 开场白（turn 0 角色消息，卡片读取失败不阻塞建会话）；消息级操作命令 `edit_message` / `delete_message`（store 新增 `write_messages` 全量重写，配合 `MessageLog::invalidate` 保持缓存一致）与 `regenerate` 重roll（先删末尾角色回复再重新流式生成，失败不留并列回复；`send_message` 流式后半程抽出 `stream_reply` 共用）。前端会话详情重写为聊天界面：IM 气泡流（用户右/角色左、角落收口）、流式打字机（增量上屏 + 呼吸光标）、生成中可停止、消息悬停操作（编辑/重roll/删除，编辑支持 Ctrl+Enter 保存与 Esc 取消）、输入框 Enter 发送 / Shift+Enter 换行（跳过 IME 组词，中文输入安全）与自适应高度；黑板与记忆检查器收进右侧抽屉面板（窄屏浮层）；会话页布局改为撑满高度、消息流内部滚动。新增 `write_messages` 数据层测试（等长改写须 invalidate、重写后追加不串行），累计 37 例全绿
 
 ### Changed
 
 - 配置文件格式 JSON → TOML：`providers.json`→`providers.toml`、`settings.json`→`settings.toml`、`personas/*.json`→`*.toml`（手改友好、支持注释）；示例文件随之替换；运行时数据（session/messages/state/blackboard）保持 JSON/JSONL（追加与机器读写语义）
 - 会话消息读取改 `MessageLog` 增量缓存：按字节偏移 seek 续读，每轮开销只与新增行数相关（高轮次性能）；半行（崩溃残留）留待补全后消费；文件被外部截断/重写时缓存自动重置；提供 `invalidate` 供消息编辑/删除场景使用
 - `send_message` 发给 LLM 的历史加最近 40 条窗口上限（M1.4 正式预算分配的前置保护）
+- 界面主题层扩展：新增 `--hj-panel-2 / --hj-line(-strong) / --hj-accent-soft / --hj-accent-ink / --hj-danger` 变量；按钮、错误条提升为全局共享样式（修复会话页按钮类未定义的问题）；统一细滚动条、选区着色、`:focus-visible` 焦点环与 `prefers-reduced-motion` 降级；顶栏激活态改为金色呼应品牌
 
 ### Fixed
 

@@ -157,28 +157,28 @@ function fmtDate(iso: string): string {
 <style scoped>
 .page {
   flex: 1;
-  width: min(1080px, 100%);
+  min-height: 0;
+  width: min(1180px, 100%);
   margin: 0 auto;
-  padding: 20px 16px 40px;
-}
-.error {
-  margin: 0 0 12px;
-  padding: 10px 14px;
-  border-radius: 8px;
-  background: rgba(200, 80, 80, 0.15);
-  color: #e0a0a0;
-  font-size: 13px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .cols {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  gap: 16px;
-  align-items: flex-start;
+  gap: 12px;
+  align-items: stretch;
 }
 .col {
   background: var(--hj-panel);
+  border: 1px solid var(--hj-line);
   border-radius: 12px;
   padding: 14px 16px;
   flex: 0 0 280px;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -186,6 +186,11 @@ function fmtDate(iso: string): string {
 .col.wide {
   flex: 1;
   min-width: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  display: flex;
+  flex-direction: column;
 }
 .col-head {
   display: flex;
@@ -226,7 +231,7 @@ function fmtDate(iso: string): string {
 .field input,
 .field select {
   background: var(--hj-panel);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--hj-line-strong);
   border-radius: 6px;
   color: var(--hj-fg);
   padding: 6px 10px;
@@ -244,17 +249,24 @@ function fmtDate(iso: string): string {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 60vh;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
 }
 .slist li {
   padding: 10px 12px;
   border-radius: 8px;
   background: var(--hj-bg);
+  border: 1px solid transparent;
   cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.slist li:hover {
+  background: var(--hj-panel-2);
 }
 .slist li.active {
-  outline: 1px solid var(--hj-accent);
+  background: var(--hj-accent-soft);
+  border-color: rgba(212, 161, 94, 0.4);
 }
 .slist li.empty {
   color: var(--hj-dim);
@@ -275,10 +287,14 @@ function fmtDate(iso: string): string {
 @media (max-width: 760px) {
   .cols {
     flex-direction: column;
+    overflow-y: auto;
   }
   .col {
     flex: none;
     width: 100%;
+  }
+  .col.wide {
+    min-height: 68vh;
   }
 }
 </style>

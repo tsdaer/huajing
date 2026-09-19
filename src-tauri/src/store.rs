@@ -380,6 +380,23 @@ pub fn read_messages(root: &Path, session_id: &str) -> StoreResult<Vec<Message>>
     Ok(parse_complete_lines(&std::fs::read(&path)?).0)
 }
 
+/// 全量重写 messages.jsonl（消息编辑/删除/重roll 用）。
+/// 调用方必须随后 `MessageLog::invalidate`：缓存按字节偏移增量读，
+/// 重写后偏移失效（变短的文件会自动重置，但等长/变长改写检测不到）。
+pub fn write_messages(root: &Path, session_id: &str, messages: &[Message]) -> StoreResult<()> {
+    let dir = session_dir(root, session_id);
+    if !dir.is_dir() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    let mut buf = String::new();
+    for m in messages {
+        buf.push_str(&serde_json::to_string(m)?);
+        buf.push('\n');
+    }
+    std::fs::write(dir.join("messages.jsonl"), buf)?;
+    Ok(())
+}
+
 /// 扫描 sessions/*/session.json，按创建时间倒序
 pub fn list_sessions(root: &Path) -> StoreResult<Vec<SessionMeta>> {
     let dir = root.join("sessions");
@@ -940,6 +957,75 @@ mod tests {
         let msgs = log.read(root.path(), &meta.id).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "edited");
+    }
+
+    #[test]
+    fn write_messages_rewrites_and_invalidates() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                character: "小雨".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = MessageLog::new();
+        for i in 0..3 {
+            log.append(
+                root.path(),
+                &meta.id,
+                &Message {
+                    turn: 1,
+                    role: "user".into(),
+                    content: format!("原文{i}"),
+                    ts: i as u64,
+                    scene_id: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // 编辑：等长改写（缓存偏移检测不到，必须 invalidate）
+        let mut msgs = log.read(root.path(), &meta.id).unwrap().as_slice().to_vec();
+        msgs[1].content = "改写X".into(); // 与"原文1"字节数相同（均 7 字节）的等长改写
+        assert_eq!(msgs[1].content.len(), "原文1".len());
+        write_messages(root.path(), &meta.id, &msgs).unwrap();
+        log.invalidate(Some(&meta.id));
+        let after = log.read(root.path(), &meta.id).unwrap();
+        assert_eq!(after[1].content, "改写X");
+        assert_eq!(after.len(), 3);
+
+        // 删除：移除末尾后读回 2 条；文件变短走自动重置也行，但统一 invalidate
+        msgs = after.as_slice().to_vec();
+        msgs.pop();
+        write_messages(root.path(), &meta.id, &msgs).unwrap();
+        log.invalidate(Some(&meta.id));
+        assert_eq!(log.read(root.path(), &meta.id).unwrap().len(), 2);
+
+        // 重写后继续 append 不串行
+        log.append(
+            root.path(),
+            &meta.id,
+            &Message {
+                turn: 2,
+                role: "char".into(),
+                content: "新回复".into(),
+                ts: 9,
+                scene_id: None,
+            },
+        )
+        .unwrap();
+        let final_msgs = read_messages(root.path(), &meta.id).unwrap();
+        assert_eq!(final_msgs.len(), 3);
+        assert_eq!(final_msgs[2].content, "新回复");
+
+        // 不存在的会话报错
+        assert!(write_messages(root.path(), "no-such", &msgs).is_err());
     }
 
     #[test]

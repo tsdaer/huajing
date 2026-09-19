@@ -28,11 +28,21 @@ const view = ref<"home" | "sessions" | "settings">("home");
 <style>
 :root {
   /* 主题变量层：换肤只改这里（IM 风 / galgame 风） */
-  --hj-bg: #14161a;
-  --hj-panel: #1d2026;
-  --hj-fg: #e8e6e3;
-  --hj-dim: #9a9a94;
+  --hj-bg: #131518;
+  --hj-panel: #1c1f25;
+  --hj-panel-2: #242832;
+  --hj-fg: #e9e6e0;
+  --hj-dim: #98958c;
   --hj-accent: #d4a15e;
+  --hj-accent-soft: rgba(212, 161, 94, 0.16);
+  --hj-accent-ink: #231b10;
+  --hj-line: rgba(233, 230, 224, 0.09);
+  --hj-line-strong: rgba(233, 230, 224, 0.16);
+  --hj-danger: #c96f6f;
+}
+
+* {
+  box-sizing: border-box;
 }
 
 html,
@@ -45,7 +55,90 @@ body,
 body {
   background: var(--hj-bg);
   color: var(--hj-fg);
-  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(212, 161, 94, 0.32);
+}
+
+:focus-visible {
+  outline: 2px solid var(--hj-accent);
+  outline-offset: 2px;
+}
+
+/* 细滚动条，融进底色 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(233, 230, 224, 0.18) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(233, 230, 224, 0.16);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 全局共享控件：各视图共用的按钮与错误条 */
+.btn {
+  border: 1px solid var(--hj-line-strong);
+  background: transparent;
+  color: var(--hj-fg);
+  border-radius: 8px;
+  padding: 5px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s, filter 0.15s, color 0.15s, background 0.15s;
+}
+.btn:hover {
+  border-color: var(--hj-accent);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.btn.accent {
+  background: var(--hj-accent);
+  border-color: var(--hj-accent);
+  color: var(--hj-accent-ink);
+  font-weight: 600;
+}
+.btn.accent:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.btn.danger:hover {
+  border-color: var(--hj-danger);
+  color: var(--hj-danger);
+}
+
+.error {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(201, 111, 111, 0.14);
+  color: #e2a9a9;
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 </style>
 
@@ -62,7 +155,7 @@ body {
   gap: 24px;
   padding: 10px 20px;
   background: var(--hj-panel);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid var(--hj-line);
 }
 .brand {
   color: var(--hj-accent);
@@ -82,12 +175,13 @@ body {
   padding: 6px 14px;
   border-radius: 8px;
   cursor: pointer;
+  transition: color 0.15s, background 0.15s;
 }
 .nav button:hover {
   color: var(--hj-fg);
 }
 .nav button.active {
-  color: var(--hj-fg);
-  background: rgba(255, 255, 255, 0.08);
+  color: var(--hj-accent);
+  background: var(--hj-accent-soft);
 }
 </style>

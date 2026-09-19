@@ -182,18 +182,11 @@ async function remove(p: Provider) {
   padding: 20px 16px 40px;
   display: flex;
   flex-direction: column;
-  gap: 20px;
-}
-.error {
-  margin: 0;
-  padding: 10px 14px;
-  border-radius: 8px;
-  background: rgba(200, 80, 80, 0.15);
-  color: #e0a0a0;
-  font-size: 13px;
+  gap: 16px;
 }
 .block {
   background: var(--hj-panel);
+  border: 1px solid var(--hj-line);
   border-radius: 12px;
   padding: 16px 20px;
   display: flex;
@@ -278,31 +271,6 @@ code {
   font-family: Consolas, monospace;
 }
 
-.btn {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: transparent;
-  color: var(--hj-fg);
-  border-radius: 8px;
-  padding: 5px 14px;
-  font-size: 13px;
-  cursor: pointer;
-}
-.btn:hover {
-  border-color: var(--hj-accent);
-}
-.btn.accent {
-  background: var(--hj-accent);
-  border-color: var(--hj-accent);
-  color: #1d2026;
-}
-.btn.accent:hover {
-  filter: brightness(1.08);
-}
-.btn.danger:hover {
-  border-color: #c06060;
-  color: #d89090;
-}
-
 .pform {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -329,7 +297,7 @@ code {
 .field input,
 .field select {
   background: var(--hj-panel);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--hj-line-strong);
   border-radius: 6px;
   color: var(--hj-fg);
   padding: 7px 10px;

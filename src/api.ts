@@ -43,12 +43,24 @@ export const api = {
   newSession: (opts: NewSessionOptions) => invoke<SessionMeta>("new_session", opts),
   listSessions: () => invoke<SessionMeta[]>("list_sessions"),
   readMessages: (sessionId: string) => invoke<Message[]>("read_messages", { sessionId }),
+  /** 编辑指定下标的消息，返回更新后的全量列表 */
+  editMessage: (sessionId: string, index: number, content: string) =>
+    invoke<Message[]>("edit_message", { sessionId, index, content }),
+  /** 删除指定下标的消息，返回更新后的全量列表 */
+  deleteMessage: (sessionId: string, index: number) =>
+    invoke<Message[]>("delete_message", { sessionId, index }),
 
   /** 发送消息并流式接收（delta/done/error 经 onEvent 推送；返回值为终态事件） */
   sendMessage: (sessionId: string, content: string, onEvent: (e: StreamEvent) => void) => {
     const channel = new Channel<StreamEvent>();
     channel.onmessage = onEvent;
     return invoke<StreamEvent>("send_message", { sessionId, content, onEvent: channel });
+  },
+  /** 重roll：移除末尾角色回复并重新流式生成（流事件同 sendMessage） */
+  regenerate: (sessionId: string, onEvent: (e: StreamEvent) => void) => {
+    const channel = new Channel<StreamEvent>();
+    channel.onmessage = onEvent;
+    return invoke<StreamEvent>("regenerate", { sessionId, onEvent: channel });
   },
   /** 中断生成（保留已生成的部分文本）；返回是否存在进行中的生成 */
   stopGeneration: (sessionId: string) => invoke<boolean>("stop_generation", { sessionId }),
