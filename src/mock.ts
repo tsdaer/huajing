@@ -6,6 +6,8 @@ import type {
   Blackboard,
   CardDetail,
   CardSummary,
+  HookReport,
+  MemRecord,
   Message,
   Persona,
   PromptAssembly,
@@ -78,7 +80,7 @@ const messages: Message[] = [
 /** mock 的卡内状态与记忆流（M1.6 面板数据） */
 const mockCardState: Record<string, unknown> = { favorability: 52 };
 
-const memoryRecords: import("./types").MemRecord[] = [
+const memoryRecords: MemRecord[] = [
   {
     kind: "fact",
     key: "last_thanked",
@@ -153,12 +155,42 @@ function streamReply(
   return new Promise<StreamEvent>((resolve) => {
     let i = 0;
     const turn = (msgs[msgs.length - 1]?.turn ?? 0) + 1;
+    // 与真后端同形：回复落盘后跑 on_message（mock 里演一遍好感度 +1 与 ui.emit）
+    const finishHook = (): HookReport => {
+      const thanked = content.includes("谢谢");
+      const next = Number(mockCardState.favorability ?? 50) + (thanked ? 1 : 0);
+      mockCardState.favorability = next;
+      const memory = thanked
+        ? [{ key: "last_thanked", value: turn }]
+        : [];
+      if (memory.length) {
+        memoryRecords.push({
+          kind: "fact",
+          key: memory[0].key,
+          value: memory[0].value,
+          source: "hook.on_message",
+          turn,
+          ts: Math.floor(Date.now() / 1000),
+        });
+      }
+      return {
+        turn,
+        ran: true,
+        card_state: { ...mockCardState },
+        memory,
+        ui_events: [{ kind: "emotion", value: next >= 80 ? "shy" : "calm" }],
+        logs: [],
+      };
+    };
+
     const finish = (cancelled: boolean) => {
       const full = reply.slice(0, i);
       clearInterval(timer);
       timerMap.delete(timerKey);
       if (full) msgs.push({ turn, role: "char", content: full, ts: Math.floor(Date.now() / 1000) });
-      resolve({ event: "done", full, cancelled });
+      const report = full ? finishHook() : null;
+      if (report) onEvent?.onmessage?.({ event: "hook_event", ...report.ui_events[0] });
+      resolve({ event: "done", full, cancelled, report });
     };
     const timer = setInterval(() => {
       i = Math.min(i + 3, reply.length);
@@ -166,7 +198,9 @@ function streamReply(
         msgs.push({ turn, role: "char", content: reply, ts: Math.floor(Date.now() / 1000) });
         clearInterval(timer);
         timerMap.delete(timerKey);
-        resolve({ event: "done", full: reply, cancelled: false });
+        const report = finishHook();
+        onEvent?.onmessage?.({ event: "hook_event", ...report.ui_events[0] });
+        resolve({ event: "done", full: reply, cancelled: false, report });
         return;
       }
       onEvent?.onmessage?.({ event: "delta", text: reply.slice(i - 3, i) });
@@ -281,6 +315,13 @@ export function setupMock() {
         return assembly(messages);
       case "last_prompt":
         return null;
+      case "watch_cards":
+      case "unwatch_cards":
+        return null;
+      case "preview_st_card":
+        throw new Error("浏览器 mock 不支持导入：请用 pnpm tauri dev");
+      case "import_st_card":
+        throw new Error("浏览器 mock 不支持导入：请用 pnpm tauri dev");
       case "get_card_state":
         return { ...mockCardState };
       case "list_card_memory":
