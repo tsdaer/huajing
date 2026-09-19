@@ -3,10 +3,12 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  Blackboard,
   CardDetail,
   CardSummary,
   Message,
   Persona,
+  PromptAssembly,
   Provider,
   SessionMeta,
   Settings,
@@ -50,4 +52,19 @@ export const api = {
   },
   /** 中断生成（保留已生成的部分文本）；返回是否存在进行中的生成 */
   stopGeneration: (sessionId: string) => invoke<boolean>("stop_generation", { sessionId }),
+
+  getBlackboard: (sessionId: string) => invoke<Blackboard>("get_blackboard", { sessionId }),
+  updateBlackboard: (sessionId: string, bb: Blackboard) =>
+    invoke<Blackboard>("update_blackboard", {
+      sessionId,
+      day: bb.day,
+      clock: bb.clock,
+      place: bb.place,
+      actors: bb.actors,
+    }),
+
+  /** 预览组装（干跑，不发送） */
+  previewPrompt: (sessionId: string) => invoke<PromptAssembly>("preview_prompt", { sessionId }),
+  /** 最近一次实际发送的组装 */
+  lastPrompt: (sessionId: string) => invoke<PromptAssembly | null>("last_prompt", { sessionId }),
 };
