@@ -2457,4 +2457,32 @@ return {
             Some(&serde_json::json!("心情不错"))
         );
     }
+
+    /// 仓库自带的世界能真的加载成 Codex（真机数据是最有说服力的样本）：
+    /// 钉住「实体 schema 改了没人发现」，也钉住目录指纹缓存真的生效。
+    #[test]
+    fn workspace_worlds_load_into_codex() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../DataHub");
+        if !root.is_dir() {
+            return; // 打包/CI 环境没有 DataHub 时跳过
+        }
+        let cache = CodexCache::default();
+        let mut checked = 0;
+        for world in ["default", "崩坏3"] {
+            let dir = codex_entities_dir(&root, world);
+            if !dir.is_dir() {
+                continue;
+            }
+            let cx = load_codex(&root, Some(&cache), world);
+            assert!(!cx.entities().is_empty(), "世界 {world} 应至少解析出一个实体");
+            for e in cx.entities() {
+                assert!(!e.id.trim().is_empty() && !e.name.trim().is_empty());
+            }
+            // 指纹没变 → 复用同一份解析结果（每轮重解析上百个 Lua 文件是浪费）
+            let again = load_codex(&root, Some(&cache), world);
+            assert!(Arc::ptr_eq(&cx, &again), "世界 {world} 的缓存应命中");
+            checked += 1;
+        }
+        assert!(checked > 0, "仓库里应至少有一个世界");
+    }
 }
