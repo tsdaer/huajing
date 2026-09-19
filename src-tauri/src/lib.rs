@@ -12,6 +12,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(commands::CancelFlags::default())
+        .manage(store::MessageLog::new())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
             commands::list_providers,
