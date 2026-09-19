@@ -12,6 +12,12 @@
 
 - **M2.0 消息级操作可回滚**：编辑/删除历史消息现在会**重放重算**（`rebuild_from`）——改写或移除该消息事件后，丢掉它所在轮次起的派生事件，再按卡顺序重跑这些轮的 `on_context` / `on_message`（含轮末时钟步进），钩子是 (消息, 黑板, state) 的纯函数，因此重放得到一致状态。**M1 的同源遗留就此关闭**：改掉那句「谢谢」，好感度会跟着退回去，记忆也一并消失。老会话（事件流里没有 genesis）首次消息级操作时**从头全量重放并补上 init 事件**，就地升级为事件溯源会话（此后回滚精确；老会话的黑板已是终态，故重放不再叠加时钟步进）。重roll 的截断抽成 `truncate_turn`（命令与单测共用），「不重复计分」从启发式判据 `turn_has_reply` 变成结构性保证——旧效果已不在流里，重放恰好一次
 
+- **M2.1 记忆宫殿（引擎）**：新增 `palace.rs`——记忆对象 v1（kind/content/time/place/actors/witnesses/salience/emotion/links/thread/rehearsals，手写反序列化以兼容 M1 的 `fact` 行与设计 §5.2 的嵌套时间形态）、显著度打分（salience × 0.5^(Δ故事天/7) × 关联加成(≤3.0) × 再提及加成(≤1.5)，权重全部具名）、**视角过滤**（viewer 必须 ∈ witnesses，设计 §10.4 硬约束）、四类关联命中（recall 提示/地点/在场者/最近提及 + 活跃线）、`render_memory_block`（「回忆·第3天 23:40」框架 + 转述标注）、三视图（房间/时间线/关联图）与 `search`。31 例单测（衰减半衰期、视角过滤、四类命中、权重上限、legacy 兼容、同分确定性排序、预算截断等）
+
+- **M2.2 设定集（引擎）**：新增 `codex.rs`——实体 schema（char/place/item/event/org/rule/concept/note + facts/secrets/live/relations/lifecycle/variants/versions）、自建别名 trie（最长优先、CJK 精确、拉丁大小写不敏感，未引 aho-corasick 依赖）、**五激活源**（提及/在场/揭示/关系牵引/常驻，全部宿主侧确定性）、**三级注入深度**（1 行/卡片/深卡 + `look.anchors` 恒注入）、滞回（上一轮激活者保底卡片）、预算降级阶梯（深卡→卡片→精简卡→1 行→裁撤，**anchors 最后被裁**）、`variants` 条件变体与 `versions` 史变（按故事天解析：第 10 天与第 30 天取到不同事实）、`fill_placeholders`、`anchors_conflict`（提案与辨识点冲突即驳回）。32 例单测
+
+- **M2.1/M2.2 接入组装与运行时**：`prompt.rs` 新增 **B3 设定集**与 **B4 回忆**槽（`<world>` / `<memory>` 标签，空层省略；`PromptLayer.sources` 逐卡记录激活原因）；`commands.rs` 新增世界加载（`codex/<世界>/entities/*.lua|*.json`，`.lua` 走同一套 Lua 沙箱解析、坏文件跳过并留诊断）与**目录指纹缓存**（改文件即生效，与热加载同款判据）、会话级跨轮运行时（上一轮激活集合，供滞回）、召回查询构造（视角=本角色、故事天/地点/在场者/提及窗口来自黑板与别名扫描）；`api.memory` 读侧（`HookEnv.memory`）接上宫殿（M1 里这一侧恒空）；**黑板扩展出实体作用域键**（`api.blackboard.set('char.小雨.mood', …)` → `live` 字段拼出 `▸当前:心情不错`，读侧同时给平铺与嵌套两种形态）。新增端到端单测：别名提及激活进 B3 + anchors 恒注入 + 逐卡激活原因 + 卡写记忆进 B4 + 作用域键进 `▸当前`。记忆检查器逐层展示激活原因（`SessionView`）
+
 ### Changed
 
 - **预览组装改为纯干跑**：`preview_prompt` 不再落盘、不再记事件（M1 让预览也落盘是为了避免「预览一次状态变了、正式发送又变一次」的漂移；事件化之后正式发送自己会跑一次并留下事件，预览再落盘反而是多算一次）

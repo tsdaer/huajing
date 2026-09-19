@@ -289,6 +289,11 @@ pub struct Blackboard {
     pub clock: String,
     pub place: String,
     pub actors: Vec<String>,
+    /// 实体作用域键（设计 §6.4：状态树/导演改 `bb["char.小雨"].status`，设定集的
+    /// `live` 字段据此拼出 `▸当前`）。键形如 `char.小雨.status`；旧会话没有这个字段，
+    /// 反序列化默认空，不做破坏性迁移。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Blackboard {
@@ -299,6 +304,7 @@ impl Blackboard {
             clock: String::new(),
             place: String::new(),
             actors: Vec::new(),
+            extra: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -452,6 +458,7 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         clock: req.clock.clone().unwrap_or_default(),
         place: req.place.clone().unwrap_or_default(),
         actors: vec![req.character.clone()],
+        extra: std::collections::BTreeMap::new(),
     };
     std::fs::write(
         dir.join("blackboard.json"),
@@ -1088,6 +1095,7 @@ mod tests {
             clock: "23:05".into(),
             place: "天台".into(),
             actors: vec!["小雨".into(), "玩家".into()],
+            extra: Default::default(),
         };
         save_blackboard(root.path(), &meta.id, &bb).unwrap();
         assert_eq!(load_blackboard(root.path(), &meta.id).unwrap().place, "天台");

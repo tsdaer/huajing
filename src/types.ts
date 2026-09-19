@@ -229,6 +229,8 @@ export interface PromptLayer {
   name: string;
   content: string;
   tokens: number;
+  /** 逐卡激活原因（形如「小雨·人 ← 在场:图书馆 / 滞回」），只有 B3/B4 这类逐卡层才有 */
+  sources?: string[];
 }
 
 /** 一轮组装的完整结果 */

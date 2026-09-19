@@ -284,6 +284,17 @@ pub fn load_card(root: &Path, dir_name: &str) -> Result<LoadedCard, String> {
 }
 
 /// 卡片目录清单（characters/*/card.lua；单卡失败按降级卡收录，不拖垮整体）
+/// 解析一个 Lua **数据文件**（设定集实体：`return { ... }`）为 JSON（M2.2 · 设计 §6.2 的双格式之一）。
+///
+/// 与 card.lua 共用同一套沙箱（剥离 os/io、指令计数上限、内存上限），因此社区实体文件同样
+/// 不能作恶；文件里出现函数值会转换失败——实体本来就该是纯数据。
+pub fn eval_lua_value(source: &str) -> Result<serde_json::Value, String> {
+    let lua = new_sandbox().map_err(|e| format!("沙箱初始化失败：{e}"))?;
+    let table = eval_card(&lua, source).map_err(|e| format!("Lua 执行失败：{e}"))?;
+    lua.from_value(Value::Table(table))
+        .map_err(|e| format!("实体转 JSON 失败：{e}"))
+}
+
 pub fn list_cards(root: &Path) -> Vec<CardSummary> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(root.join("characters")) else {
@@ -581,7 +592,8 @@ fn make_api(
     );
     let _ = api.set("memory", mem_ns);
 
-    // 黑板：只允许写 BLACKBOARD_KEYS（黑板 v0 字段），越权键报 Lua 错误
+    // 黑板：白名单 = 世界层四字段 + 实体作用域键（设计 §6.4 的 `char.小雨.status`），
+    // 越权键报 Lua 错误。作用域键的规则写在白名单校验里（见 make_kv_ns 的 dotted 分支）。
     let allowed: Vec<String> = BLACKBOARD_KEYS.iter().map(|k| k.to_string()).collect();
     let bb_ns = make_kv_ns(
         lua,
@@ -658,9 +670,15 @@ fn make_kv_ns(
     let set_fn = lua
         .create_function(move |lua, (k, v): (String, Value)| {
             if let Some(allowed) = &allowed {
-                if !allowed.iter().any(|a| a == &k) {
+                // 白名单外的键一律拒绝，但**实体作用域键**放行：
+                // 形如 `char.小雨.status`（设计 §6.2/§6.4 的 live 数据源），
+                // 至少两段、每段非空，避免 `.` 这类噪声键混进黑板。
+                let dotted_ok = k.contains('.')
+                    && k.split('.').count() >= 2
+                    && k.split('.').all(|seg| !seg.trim().is_empty());
+                if !dotted_ok && !allowed.iter().any(|a| a == &k) {
                     return Err(mlua::Error::runtime(format!(
-                        "{ns_name}.set 不支持的键「{k}」（可用：{}）",
+                        "{ns_name}.set 不支持的键「{k}」（可用：{} 或实体作用域键 char.小雨.status）",
                         allowed.join(" / ")
                     )));
                 }

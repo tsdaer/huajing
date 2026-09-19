@@ -82,11 +82,29 @@ impl SceneSnapshot {
 /// 检查器中的一个注入层（设计 §4.2：组装结果每轮逐层可见，含实际 token）
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptLayer {
-    /// 层位：A1/A2/A3/B1/B5/C3
+    /// 层位：A1/A2/A3/B1/B2/B3/B4/B5/C1/C2/C3
     pub id: &'static str,
     pub name: String,
     pub content: String,
     /// 估算 token（CJK ≈ 1 字 1 token，其余 ≈ 4 字符 1 token）
+    pub tokens: usize,
+    /// 逐卡激活原因（设计 §6.11「记忆检查器中每张注入卡显示激活原因」）：
+    /// 形如 `小雨·人 ← 在场:图书馆 / 滞回`，界面直接照着列，不参与发给模型的内容
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+}
+
+/// 一张可注入的卡片（设定集实体卡 / 宫殿回忆卡）。
+///
+/// 由 commands 从 codex / palace 的产物转换而来——prompt.rs 不依赖那两个模块，
+/// 只认「正文 + 激活原因 + token」这件最小事，便于单测与后续换实现。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SourceCard {
+    pub id: String,
+    /// 正文（已渲染成紧凑结构卡的一行/一段）
+    pub text: String,
+    /// 中文可读的激活原因
+    pub reasons: Vec<String>,
     pub tokens: usize,
 }
 
@@ -108,6 +126,10 @@ pub struct BuildInputs<'a> {
     pub blackboard: &'a Blackboard,
     /// on_context hook 的 ctx.inject 收集结果（B5）
     pub hook_injections: &'a [InjectedText],
+    /// B3 设定集激活实体卡（M2.2）
+    pub entity_cards: &'a [SourceCard],
+    /// B4 记忆宫殿召回（M2.1）
+    pub memory_cards: &'a [SourceCard],
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
@@ -152,6 +174,23 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     let b1 = format!("<scene>\n{}\n</scene>", SceneSnapshot::from_blackboard(inputs.blackboard).render());
     layers.push(layer("B1", "场景快照", &b1));
     let mut b_messages = vec![ChatMessage { role: "system".into(), content: b1 }];
+
+    // B3 设定集激活实体卡（设计 §6.3：分级注入 + anchors 恒注入；空层省略）
+    if let Some(b3) = card_layer("B3", "设定集", "world", inputs.entity_cards) {
+        b_messages.push(ChatMessage {
+            role: "system".into(),
+            content: b3.content.clone(),
+        });
+        layers.push(b3);
+    }
+    // B4 记忆宫殿召回（设计 §4.1：统一「回忆」框架 + 故事时间戳，防止把旧事当正在发生）
+    if let Some(b4) = card_layer("B4", "回忆", "memory", inputs.memory_cards) {
+        b_messages.push(ChatMessage {
+            role: "system".into(),
+            content: b4.content.clone(),
+        });
+        layers.push(b4);
+    }
     if !inputs.hook_injections.is_empty() {
         let content = inputs
             .hook_injections
@@ -197,7 +236,41 @@ fn layer(id: &'static str, name: &str, content: &str) -> PromptLayer {
         name: name.into(),
         tokens: estimate_tokens(content),
         content: content.to_string(),
+        sources: Vec::new(),
     }
+}
+
+/// 分层带激活原因（设定集/宫殿这类「逐卡」层用）
+fn card_layer(
+    id: &'static str,
+    name: &str,
+    tag: &str,
+    cards: &[SourceCard],
+) -> Option<PromptLayer> {
+    if cards.is_empty() {
+        return None; // 空层省略，不产生空标签（设计 §4.3）
+    }
+    let content = format!(
+        "<{tag}>\n{}\n</{tag}>",
+        cards
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let sources = cards
+        .iter()
+        .map(|c| {
+            if c.reasons.is_empty() {
+                format!("{} ← 激活", c.id)
+            } else {
+                format!("{} ← {}", c.id, c.reasons.join(" / "))
+            }
+        })
+        .collect();
+    let mut l = layer(id, name, &content);
+    l.sources = sources;
+    Some(l)
 }
 
 /// 本地消息角色 → OpenAI 角色（char → assistant）
@@ -387,6 +460,8 @@ mod tests {
             card_state,
             blackboard,
             hook_injections,
+            entity_cards: &[],
+            memory_cards: &[],
             history,
             user_content,
         }
@@ -432,6 +507,7 @@ mod tests {
             clock: "21:30".into(),
             place: "图书馆自习区".into(),
             actors: vec!["小雨".into()],
+            extra: Default::default(),
         };
         let inj = vec![InjectedText {
             role: "system".into(),
@@ -481,6 +557,7 @@ mod tests {
             clock: String::new(),
             place: String::new(),
             actors: vec![],
+            extra: Default::default(),
         };
         // 预览：无历史、无 hook 注入、无用户消息
         let asm = build(&inputs(&settings, None, &card, &state, &bb, &[], &[], None));
@@ -503,6 +580,7 @@ mod tests {
             clock: "08:00".into(),
             place: "家".into(),
             actors: vec!["小雨".into()],
+            extra: Default::default(),
         };
         let persona = Persona {
             name: "夜读者".into(),
@@ -525,6 +603,7 @@ mod tests {
             clock: String::new(),
             place: String::new(),
             actors: vec![],
+            extra: Default::default(),
         };
         let asm = build(&inputs(&settings, None, &card, &state, &bb, &[], &[], None));
         let a3 = asm.layers.iter().find(|l| l.id == "A3").unwrap();
@@ -544,6 +623,7 @@ mod tests {
             clock: String::new(),
             place: String::new(),
             actors: vec![],
+            extra: Default::default(),
         };
         let history: Vec<Message> = (0..(WINDOW_MESSAGES + 20))
             .map(|i| msg("user", &format!("m{}", i), i as u64 / 2 + 1))

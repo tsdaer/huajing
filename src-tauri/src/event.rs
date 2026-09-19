@@ -158,14 +158,6 @@ impl LogBody {
         }
     }
 
-    /// 该事件属于哪个角色的私有状态（无归属返回 None）
-    pub fn character(&self) -> Option<&str> {
-        match self {
-            LogBody::Effect(e) => Some(e.character.as_str()),
-            _ => None,
-        }
-    }
-
     /// 序列化为带 kind 判别字段的对象
     pub fn to_value(&self) -> Result<serde_json::Value, String> {
         let mut v = match self {
@@ -479,7 +471,15 @@ pub fn apply_blackboard_sets(bb: &mut Blackboard, sets: &[KvSet]) -> bool {
                         .collect();
                 }
             }
-            _ => {} // 白名单已在沙箱侧拦住；这里兜底忽略
+            // 实体作用域键（设计 §6.4：`char.小雨.status`）——带点的键一律进 extra
+            (key, v) if key.contains('.') => {
+                if v.is_null() {
+                    bb.extra.remove(key);
+                } else {
+                    bb.extra.insert(key.to_string(), v.clone());
+                }
+            }
+            _ => {} // 其余未知键兜底忽略（沙箱侧还有一层白名单）
         }
     }
     format!("{bb:?}") != before
@@ -547,6 +547,7 @@ mod tests {
             clock: clock.into(),
             place: "图书馆".into(),
             actors: vec!["小雨".into()],
+            extra: Default::default(),
         }
     }
 

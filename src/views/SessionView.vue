@@ -758,6 +758,16 @@ watch(cardGeneration, () => {
               </div>
               <div class="collapse-content px-3">
                 <pre class="m-0 rounded-box border border-base-300 bg-base-100 p-2.5 text-xs leading-relaxed break-words whitespace-pre-wrap">{{ l.content }}</pre>
+                <!-- 逐卡激活原因（设计 §6.11：每张注入卡都说得清「它为什么在这里」） -->
+                <ul v-if="l.sources?.length" class="m-0 mt-1.5 flex list-none flex-col gap-1 p-0">
+                  <li
+                    v-for="s in l.sources"
+                    :key="s"
+                    class="rounded-box bg-base-200 px-2 py-1 font-mono text-[11px] text-base-content/60"
+                  >
+                    {{ s }}
+                  </li>
+                </ul>
               </div>
             </div>
           </template>

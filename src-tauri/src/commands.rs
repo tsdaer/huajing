@@ -9,7 +9,9 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::card;
+use crate::codex;
 use crate::event::{self, LogBody, LogRecord};
+use crate::palace;
 use crate::llm::{self, Provider, StreamEvent};
 use crate::prompt;
 use crate::store::{self, Message, NewSessionRequest, Settings};
@@ -403,7 +405,7 @@ fn run_load_hook_core(
         &card::HookEnv {
             state: state.clone(),
             blackboard: blackboard_env(&blackboard_of(&proj)),
-            memory: BTreeMap::new(),
+            memory: memory_env(&proj.memory),
         },
         meta.seed,
         sink,
@@ -575,7 +577,7 @@ fn rebuild_from(
             &card::HookEnv {
                 state: state.clone(),
                 blackboard: blackboard_env(&board),
-                memory: BTreeMap::new(),
+                memory: memory_env(&proj.memory),
             },
             meta.seed,
             &NOOP_SINK,
@@ -652,6 +654,213 @@ fn rebuild_from(
     Ok(out)
 }
 
+// ---------- 设定集与记忆宫殿的接入（M2.1 / M2.2）----------
+
+/// B3 实体卡与 B4 回忆的预算（设计 §4.2 的完整预算表在 M2.7 落地，这里先给固定值）
+const B3_TOKENS: usize = 1200;
+const B4_TOKENS: usize = 800;
+/// B3/B4 上限条数
+const B3_MAX_CARDS: usize = 12;
+const B4_TOP_K: usize = 6;
+/// 设定集别名扫描窗口（设计 §6.3：默认最近 16 条消息）
+const SCAN_WINDOW_MESSAGES: usize = 16;
+/// 滞回轮数（设计 §6.3：实体激活后保持 N 轮再退场）
+const CODEX_HOLD_ROUNDS: u32 = 3;
+
+/// 会话启用的世界（未指定时用 default；DataHub/codex/default 是脚手架自带的示例世界）
+fn session_world(meta: &store::SessionMeta) -> String {
+    meta.world.clone().unwrap_or_else(|| "default".into())
+}
+
+fn codex_entities_dir(root: &std::path::Path, world: &str) -> std::path::PathBuf {
+    root.join("codex").join(world).join("entities")
+}
+
+/// 实体目录指纹（文件名 + 大小 + 修改时间）：设定集是只读输入，
+/// 每轮重解析上百个 Lua 文件并不划算，指纹没变就直接用缓存（改文件即生效，与热加载同款判据）。
+fn world_fingerprint(dir: &std::path::Path) -> u64 {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    let mut fp: u64 = 1469598103934665603; // FNV 偏移
+    for path in entries {
+        let Ok(md) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for byte in format!("{}:{}:{}", path.display(), md.len(), mtime).bytes() {
+            fp = (fp ^ byte as u64).wrapping_mul(1099511628211);
+        }
+    }
+    fp
+}
+
+/// 设定集缓存（Tauri State）：世界名 → (指纹, 解析结果)
+#[derive(Default)]
+pub struct CodexCache(Mutex<HashMap<String, (u64, Arc<codex::Codex>)>>);
+
+/// 逐文件解析实体：.lua 走沙箱（设计 §6.2 双格式），坏文件跳过并留诊断，不让一个手滑的文件瘫痪整局
+fn parse_entities(dir: &std::path::Path) -> Vec<codex::CodexEntity> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("lua") | Some("json")
+            )
+        })
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::diag::record("codex", format!("实体读取失败 {}：{e}", path.display()));
+                continue;
+            }
+        };
+        let value = if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+            card::eval_lua_value(&raw)
+        } else {
+            serde_json::from_str(&raw).map_err(|e| e.to_string())
+        };
+        match value.and_then(|v| codex::CodexEntity::from_value(&v)) {
+            Ok(entity) => out.push(entity),
+            Err(e) => crate::diag::record("codex", format!("实体解析失败 {}：{e}", path.display())),
+        }
+    }
+    out
+}
+
+/// 取某个世界的设定集（带指纹缓存）
+fn load_codex(
+    root: &std::path::Path,
+    cache: Option<&CodexCache>,
+    world: &str,
+) -> Arc<codex::Codex> {
+    let dir = codex_entities_dir(root, world);
+    let fp = world_fingerprint(&dir);
+    if let Some(cache) = cache {
+        if let Ok(map) = cache.0.lock() {
+            if let Some((cached, codex)) = map.get(world) {
+                if *cached == fp {
+                    return codex.clone();
+                }
+            }
+        }
+    }
+    let codex = Arc::new(codex::Codex::build(parse_entities(&dir)));
+    if let Some(cache) = cache {
+        if let Ok(mut map) = cache.0.lock() {
+            map.insert(world.to_string(), (fp, codex.clone()));
+        }
+    }
+    codex
+}
+
+/// 会话级跨轮运行时（设定集滞回等需要「上一轮」的记忆；M2.3 起还会放活跃路径）
+#[derive(Default)]
+pub struct SessionRuntime(Mutex<HashMap<String, RuntimeEntry>>);
+
+#[derive(Default, Clone)]
+struct RuntimeEntry {
+    /// 上一轮激活的实体 id（设定集滞回用）
+    previously_active: std::collections::BTreeSet<String>,
+}
+
+impl SessionRuntime {
+    fn previously_active(&self, session_id: &str) -> std::collections::BTreeSet<String> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|m| m.get(session_id).map(|e| e.previously_active.clone()))
+            .unwrap_or_default()
+    }
+
+    fn set_previously_active(
+        &self,
+        session_id: &str,
+        ids: std::collections::BTreeSet<String>,
+    ) {
+        if let Ok(mut map) = self.0.lock() {
+            map.entry(session_id.to_string()).or_default().previously_active = ids;
+        }
+    }
+}
+
+/// 别名扫描窗口的正文：最近 N 条消息（带角色名，让「小雨说……」也算提及）
+fn scan_window_text(history: &[Message], card_name: &str) -> String {
+    let start = history.len().saturating_sub(SCAN_WINDOW_MESSAGES);
+    history[start..]
+        .iter()
+        .map(|m| format!("{}：{}", display_role(&m.role, card_name), m.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 记忆对象：把事件流里的记忆记录（`api.memory.set` 的键值形态）读成宫殿对象（设计 §5.2）。
+///
+/// 两处宿主侧补全，都写明了设计依据：
+/// - **见证者**：卡内 `api.memory` 是**角色私有**记忆（设计 §2.1/§10.4），故 witnesses 取本角色——
+///   否则具名视角的召回过滤会把它挡在门外（旧记录没有 actors 字段）；
+/// - **故事时刻**：M1 的 fact 记录只有轮次、没有故事天，按「当下」计（Δ=0 不衰减）；
+///   L3 事实本就是跨会话持久的键值，不该像情景记忆那样随时间淡去（设计 §5.1 分层责任）。
+fn memory_objects(
+    proj: &event::Projection,
+    character: &str,
+    now_day: i64,
+) -> Vec<palace::MemObject> {
+    proj.memory
+        .iter()
+        .enumerate()
+        .map(|(i, rec)| {
+            let mut obj = palace::from_legacy_fact(
+                &rec.key,
+                &rec.value,
+                &rec.source,
+                rec.turn,
+                rec.ts,
+            );
+            obj.id = palace::next_id(i + 1);
+            obj.actors = vec![character.to_string()];
+            obj.witnesses = vec![character.to_string()];
+            obj.story_day = now_day;
+            obj
+        })
+        .collect()
+}
+
+/// `api.memory.get` 的读侧：宫殿里的键值（同 key 后写覆盖；M1 里这一侧恒空）
+fn memory_env(records: &[store::MemRecord]) -> BTreeMap<String, serde_json::Value> {
+    let mut map = BTreeMap::new();
+    for rec in records {
+        map.insert(rec.key.clone(), rec.value.clone());
+    }
+    map
+}
+
+/// 角色名（消息显示用；卡名而不是目录名）
+fn display_role(role: &str, card_name: &str) -> String {
+    match role {
+        "user" => "玩家".to_string(),
+        "char" | "assistant" => card_name.to_string(),
+        other => other.to_string(),
+    }
+}
+
 // ---------- 对话生成（设计 §4 流程 + §11 流式）----------
 
 /// 每个会话的生成中断标记
@@ -693,13 +902,28 @@ fn load_card_state(
     Ok(state)
 }
 
-/// 黑板 → hook 读侧快照（`api.blackboard.get` 的数据源）
+/// 黑板 → hook / 设定集读侧快照（`api.blackboard.get` 与 `live` 取值的数据源）。
+///
+/// 世界层四字段平铺；实体作用域键**两种形态都给**（设计 §6.4 的 `bb["char.小雨"].status`）：
+/// - 平铺 `char.小雨.status`（设定集 live 的第二种取值路径）；
+/// - 嵌套 `char.小雨` → `{ status: … }`（第一种取值路径，也是卡作者最顺手的写法）。
 fn blackboard_env(bb: &store::Blackboard) -> BTreeMap<String, serde_json::Value> {
     let mut map = BTreeMap::new();
     map.insert("day".into(), serde_json::json!(bb.day));
     map.insert("clock".into(), serde_json::json!(bb.clock));
     map.insert("place".into(), serde_json::json!(bb.place));
     map.insert("actors".into(), serde_json::json!(bb.actors));
+    for (key, value) in &bb.extra {
+        map.insert(key.clone(), value.clone());
+        if let Some((scope, field)) = key.rsplit_once('.') {
+            let entry = map
+                .entry(scope.to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert(field.to_string(), value.clone());
+            }
+        }
+    }
     map
 }
 
@@ -727,7 +951,7 @@ fn run_context_hook(
         &card::HookEnv {
             state: state.clone(),
             blackboard: blackboard_env(&blackboard_of(proj)),
-            memory: BTreeMap::new(), // 长期记忆读侧（记忆宫殿）在 M2.1
+            memory: memory_env(&proj.memory), // 长期记忆读侧：记忆宫殿的键值（同 key 后写覆盖）
         },
         seed,
         sink,
@@ -754,7 +978,7 @@ fn run_message_hook_at(
         &card::HookEnv {
             state: state.clone(),
             blackboard: blackboard_env(&blackboard_of(proj)),
-            memory: BTreeMap::new(),
+            memory: memory_env(&proj.memory),
         },
         seed,
         sink,
@@ -781,6 +1005,8 @@ fn assemble_prompt_core(
     user_content: Option<&str>,
     turn: u64,
     log: Option<&store::EventLog>,
+    codex_cache: Option<&CodexCache>,
+    runtime: Option<&SessionRuntime>,
 ) -> Result<PromptRun, String> {
     let settings = store::load_settings(root).map_err(|e| e.to_string())?;
     let persona = match &meta.persona {
@@ -805,6 +1031,94 @@ fn assemble_prompt_core(
         }
     }
 
+    // ---- B3 设定集：别名扫描 → 五激活源 → 分级注入（设计 §6.3）----
+    let world = session_world(meta);
+    let cx = load_codex(root, codex_cache, &world);
+    let window_text = scan_window_text(history, &loaded.card.name);
+    let place = {
+        let p = blackboard.place.trim();
+        if p.is_empty() {
+            None
+        } else {
+            Some(p.to_string())
+        }
+    };
+    let bb_map = blackboard_env(&blackboard);
+    let previously = runtime
+        .map(|r| r.previously_active(&meta.id))
+        .unwrap_or_default();
+    let known: std::collections::BTreeSet<String> = proj.known.clone();
+    // reveals 是**本轮**揭示（命中即强制深卡、权重最高），累积已知集只喂 known——
+    // 否则揭示过的实体会每轮都插深卡并挤占 B3 预算。reveal 由状态树在 M2.3 写入事件流。
+    let reveals: Vec<String> = Vec::new();
+    let activation = codex::ActivationContext {
+        window_text: &window_text,
+        place: place.as_deref(),
+        actors: &blackboard.actors,
+        reveals: &reveals,
+        known: &known,
+        previously_active: &previously,
+        hold_rounds: CODEX_HOLD_ROUNDS,
+        day: blackboard.day,
+        clock: &blackboard.clock,
+        blackboard: &bb_map,
+    };
+    let activated = cx.activate(
+        &activation,
+        &codex::CodexBudget {
+            tokens: B3_TOKENS,
+            max_cards: B3_MAX_CARDS,
+        },
+    );
+    if let Some(runtime) = runtime {
+        runtime.set_previously_active(
+            &meta.id,
+            activated.iter().map(|a| a.id.clone()).collect(),
+        );
+    }
+    let entity_cards: Vec<prompt::SourceCard> = activated
+        .iter()
+        .map(|a| prompt::SourceCard {
+            id: format!("{}·{}", a.name, codex::type_cn(&a.ty)),
+            text: a.text.clone(),
+            reasons: a.reasons.clone(),
+            tokens: a.tokens,
+        })
+        .collect();
+
+    // ---- B4 记忆宫殿：视角过滤 → 召回打分 → top-K（设计 §5.4）----
+    let memories = memory_objects(proj, &character, blackboard.day);
+    let mentions: Vec<String> = cx
+        .scan_mentions(&window_text)
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    let query = palace::RecallQuery {
+        viewer: character.clone(),
+        now_day: blackboard.day,
+        place: place.clone(),
+        present: blackboard.actors.clone(),
+        mentions,
+        hints: Vec::new(),               // 状态树 recall 提示在 M2.3 接入
+        active_threads: Vec::new(),      // 活跃剧情线在 M2.4 接入
+        top_k: B4_TOP_K,
+        budget_tokens: B4_TOKENS,
+    };
+    let hits = palace::recall(&memories, &query);
+    let memory_cards: Vec<prompt::SourceCard> = hits
+        .iter()
+        .map(|hit| {
+            let text = palace::render_memory_block(std::slice::from_ref(hit));
+            let tokens = hit.tokens();
+            prompt::SourceCard {
+                id: hit.mem.id.clone(),
+                text,
+                reasons: hit.reasons.clone(),
+                tokens,
+            }
+        })
+        .collect();
+
     let inputs = prompt::BuildInputs {
         settings: &settings,
         persona: persona.as_ref(),
@@ -812,6 +1126,8 @@ fn assemble_prompt_core(
         card_state: &card_state,
         blackboard: &blackboard,
         hook_injections: &run.result.injections,
+        entity_cards: &entity_cards,
+        memory_cards: &memory_cards,
         history,
         user_content,
     };
@@ -1198,6 +1514,8 @@ pub async fn send_message(
     flags: State<'_, CancelFlags>,
     log: State<'_, store::EventLog>,
     assemblies: State<'_, LastAssemblies>,
+    codex_cache: State<'_, CodexCache>,
+    runtime: State<'_, SessionRuntime>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -1235,6 +1553,8 @@ pub async fn send_message(
         Some(&content),
         turn,
         Some(&log),
+        Some(&codex_cache),
+        Some(&runtime),
     )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
@@ -1307,6 +1627,8 @@ pub async fn regenerate(
     flags: State<'_, CancelFlags>,
     log: State<'_, store::EventLog>,
     assemblies: State<'_, LastAssemblies>,
+    codex_cache: State<'_, CodexCache>,
+    runtime: State<'_, SessionRuntime>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -1344,6 +1666,8 @@ pub async fn regenerate(
         Some(&content),
         turn,
         Some(&log),
+        Some(&codex_cache),
+        Some(&runtime),
     )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
@@ -1411,6 +1735,7 @@ pub fn update_blackboard(
         clock: clock.trim().to_string(),
         place: place.trim().to_string(),
         actors: actors.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
+        extra: Default::default(),
     };
     let turn = project_session(&log, &root, &meta)?
         .last_message()
@@ -1442,6 +1767,8 @@ pub fn preview_prompt(
     app: AppHandle,
     session_id: String,
     log: State<'_, store::EventLog>,
+    codex_cache: State<'_, CodexCache>,
+    runtime: State<'_, SessionRuntime>,
 ) -> Result<prompt::PromptAssembly, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
@@ -1459,6 +1786,8 @@ pub fn preview_prompt(
         None,
         turn,
         None, // 干跑：不记事件、不落盘
+        Some(&codex_cache),
+        Some(&runtime),
     )?;
     Ok(run.assembly)
 }
@@ -1638,6 +1967,8 @@ return {
             Some(content),
             turn,
             Some(log),
+            None,
+            None,
         )
         .unwrap();
         log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
@@ -1809,6 +2140,8 @@ return {
             Some(&content),
             turn,
             Some(&log),
+            None,
+            None,
         )
         .unwrap();
         run_message_hook_core(&root, &meta, &loaded, turn, None, &log);
@@ -1913,6 +2246,8 @@ return {
             None,
             2,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert!(!run.assembly.layers.is_empty());
@@ -1998,5 +2333,128 @@ return {
         let records = log.read(&root, &meta.id).unwrap();
         let proj = event::project_over(&records, &event::Base::default());
         assert_eq!(proj.state_of("小雨").unwrap()["favorability"], 50);
+    }
+
+    /// M2.1/M2.2 接入验收：设定集实体进 B3（逐卡激活原因 + anchors 恒注入），
+    /// 宫殿记忆进 B4（视角过滤之后，卡内私有记忆仍召回得到）。
+    #[test]
+    fn codex_entities_and_palace_memories_reach_the_prompt() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50 },
+  hooks = {
+    on_load = function(state, api) end,
+    on_context = function(ctx, state)
+      ctx.inject('system', string.format('【角色内部状态】好感度 %d/100', state.favorability))
+    end,
+    on_message = function(msg, state, api)
+      if msg.role == 'user' and msg.content:find('谢谢') then
+        state.favorability = math.min(100, state.favorability + 1)
+        api.memory.set('last_thanked', msg.turn)
+        api.blackboard.set('char.小雨.mood', '心情不错')
+      end
+    end,
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        // 造一个最小世界：角色实体（别名提及激活 + anchors）与地点实体（在场激活）
+        let dir = root.join("codex/default/entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("char.小雨.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'char.小雨', type = 'char', name = '小雨',
+  aliases = { '夜班管理员' },
+  one_liner = '大学图书馆夜班管理员。',
+  facts = { look = { impression = '旧毛衣', anchors = { '左眼角一颗泪痣' } } },
+  live = { 'mood' },
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("place.自习区.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'place.自习区', type = 'place', name = '自习区',
+  one_liner = '靠窗的一排长桌。',
+}
+"#,
+        )
+        .unwrap();
+
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        // 第一轮：用户提到别名「夜班管理员」→ 提及激活；黑板地点「自习区」→ 在场激活
+        let (assembly, _) = simulate_turn(&root, &meta, &loaded, &log, 1, "夜班管理员今天在吗？");
+        let b3 = assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B3")
+            .expect("B3 实体卡层应出现");
+        assert!(b3.content.starts_with("<world>") && b3.content.ends_with("</world>"));
+        assert!(b3.content.contains("小雨"), "提及即激活：{}", b3.content);
+        assert!(b3.content.contains("自习区"), "在场即激活：{}", b3.content);
+        assert!(
+            b3.content.contains("左眼角一颗泪痣"),
+            "anchors 必须恒注入（设计 §6.3）：{}",
+            b3.content
+        );
+        assert!(
+            b3.sources
+                .iter()
+                .any(|s| s.contains("小雨") && s.contains("提及")),
+            "逐卡激活原因（设计 §6.11）：{:?}",
+            b3.sources
+        );
+
+        // 第二轮说到「谢谢」→ 卡内写记忆；第三轮的 B4 应召回它（视角过滤后仍命中）
+        simulate_turn(&root, &meta, &loaded, &log, 2, "谢谢你。");
+        let (assembly, _) = simulate_turn(&root, &meta, &loaded, &log, 3, "今天也是。");
+        let b4 = assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B4")
+            .expect("B4 回忆层应出现");
+        assert!(b4.content.starts_with("<memory>") && b4.content.ends_with("</memory>"));
+        assert!(
+            b4.content.contains("last_thanked"),
+            "卡内记忆应可召回：{}",
+            b4.content
+        );
+        assert!(
+            assembly.total_tokens >= b3.tokens + b4.tokens,
+            "逐层 token 记账应含 B3/B4"
+        );
+
+        // 实体作用域黑板键（设计 §6.4）：卡写 char.小雨.mood → 实体的 live 字段拼出 ▸当前
+        let bb = store::load_blackboard(&root, &meta.id).unwrap();
+        assert_eq!(
+            bb.extra.get("char.小雨.mood"),
+            Some(&serde_json::json!("心情不错"))
+        );
+        let b3_now = assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B3")
+            .expect("B3 实体卡层");
+        assert!(
+            b3_now.content.contains("▸当前") && b3_now.content.contains("心情不错"),
+            "live 应把黑板现状拼进实体卡：{}",
+            b3_now.content
+        );
+        // 作用域键也进 hook / 设定集的读侧（平铺 + 嵌套两种形态都给）
+        let env = blackboard_env(&bb);
+        assert_eq!(
+            env.get("char.小雨.mood"),
+            Some(&serde_json::json!("心情不错"))
+        );
+        assert_eq!(
+            env.get("char.小雨").and_then(|v| v.get("mood")),
+            Some(&serde_json::json!("心情不错"))
+        );
     }
 }

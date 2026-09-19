@@ -22,6 +22,8 @@ pub fn run() {
         .manage(commands::CancelFlags::default())
         .manage(commands::LastAssemblies::default())
         .manage(store::EventLog::new())
+        .manage(commands::CodexCache::default())
+        .manage(commands::SessionRuntime::default())
         .manage(watch::CardWatch::default())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
