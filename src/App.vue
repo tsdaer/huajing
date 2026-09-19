@@ -1,36 +1,25 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { ref } from "vue";
+import HomeView from "./views/HomeView.vue";
+import SettingsView from "./views/SettingsView.vue";
 
-// 主题变量层从 M1 就预留（设计 §14 决策 4：IM 聊天风打底，galgame 皮肤后续叠加）
-const info = ref<{
-  name: string;
-  slogan: string;
-  version: string;
-  dataRoot: string;
-} | null>(null);
-
-onMounted(async () => {
-  info.value = await invoke("app_info");
-});
+// 壳 + 顶层导航。路由（会话列表/聊天等）随 M1.5 引入，此处先两页切换。
+const view = ref<"home" | "settings">("home");
 </script>
 
 <template>
-  <main class="stage">
-    <h1 class="title">化境</h1>
-    <p class="slogan">{{ info?.slogan ?? "扮谁，便入谁之境。" }}</p>
+  <div class="app">
+    <header class="topbar">
+      <span class="brand">化境</span>
+      <nav class="nav">
+        <button :class="{ active: view === 'home' }" @click="view = 'home'">首页</button>
+        <button :class="{ active: view === 'settings' }" @click="view = 'settings'">设置</button>
+      </nav>
+    </header>
 
-    <section class="card" v-if="info">
-      <div class="row"><span class="k">核心</span><span>Rust (Tauri 2) ↔ Vue 3 通道已打通</span></div>
-      <div class="row"><span class="k">版本</span><span>v{{ info.version }} · M1 施工中</span></div>
-      <div class="row"><span class="k">数据</span><span class="path">{{ info.dataRoot }}</span></div>
-    </section>
-
-    <p class="hint">
-      M1 目标：1v1 流式对话 · Lua 角色卡热加载 · 场景快照注入 —— 见
-      <code>docs/design.md §15</code>
-    </p>
-  </main>
+    <HomeView v-if="view === 'home'" />
+    <SettingsView v-else />
+  </div>
 </template>
 
 <style>
@@ -42,61 +31,60 @@ onMounted(async () => {
   --hj-dim: #9a9a94;
   --hj-accent: #d4a15e;
 }
-</style>
 
-<style scoped>
-.stage {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
   background: var(--hj-bg);
   color: var(--hj-fg);
   font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
 }
-.title {
-  font-size: 64px;
-  letter-spacing: 0.35em;
-  margin: 0 0 0 0.35em;
-  font-weight: 300;
-  color: var(--hj-accent);
-}
-.slogan {
-  color: var(--hj-dim);
-  letter-spacing: 0.2em;
-  margin: 0;
-}
-.card {
-  margin-top: 18px;
-  min-width: 420px;
-  padding: 16px 20px;
-  border-radius: 12px;
-  background: var(--hj-panel);
+</style>
+
+<style scoped>
+.app {
+  height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  font-size: 14px;
 }
-.row {
+.topbar {
+  flex: none;
   display: flex;
-  gap: 12px;
-  align-items: baseline;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 20px;
+  background: var(--hj-panel);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
-.k {
-  color: var(--hj-dim);
-  flex: 0 0 3em;
-}
-.path {
-  font-family: Consolas, monospace;
-  font-size: 12px;
-}
-.hint {
-  color: var(--hj-dim);
-  font-size: 12px;
-}
-code {
+.brand {
   color: var(--hj-accent);
+  font-weight: 300;
+  letter-spacing: 0.3em;
+  margin-right: 0.3em;
+}
+.nav {
+  display: flex;
+  gap: 4px;
+}
+.nav button {
+  border: none;
+  background: transparent;
+  color: var(--hj-dim);
+  font-size: 13px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.nav button:hover {
+  color: var(--hj-fg);
+}
+.nav button.active {
+  color: var(--hj-fg);
+  background: rgba(255, 255, 255, 0.08);
 }
 </style>
