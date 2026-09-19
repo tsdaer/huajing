@@ -17,8 +17,13 @@ src-tauri/target/
 src-tauri/gen/
 
 # 化境用户数据：密钥与会话不入库（样例数据保留）
+DataHub/providers.toml
 DataHub/providers.json
 DataHub/sessions/
+
+# 本机工具配置（命令面板 / DSH 技能与状态）
+.dsh/
+.commandcode/
 
 
 # Editor directories and files
