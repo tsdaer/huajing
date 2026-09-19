@@ -75,6 +75,13 @@ docs/
 
 纯前端调试：`pnpm dev` 在浏览器里走 `src/mock.ts` 的内存 mock，只调界面时不必编译 Rust；`pnpm build` 做类型检查与产物构建。
 
+## 当前状态
+
+**M1 能聊完成**（`0.1.0`，2026-09-19）：1v1 流式对话 · Lua 沙箱与基础 hooks（state/memory 落盘、
+`api.ui.emit` 到界面）· 黑板 v0 与场景快照 · 热加载 · SillyTavern 卡导入 · 首启向导 · NSIS/MSI 安装包。
+74 例 Rust 单测 + `pnpm build` 双绿。下一步 M2（记忆宫殿 / 状态树 / 设定集 / 剧情线 / 心理运行时），
+计划在 `docs/plan/m2.md` 编写。
+
 ## 路线图
 
 - **M1 能聊**：1v1 流式对话 · Lua 静态卡 + hooks · 黑板 v0 与场景快照 · ST 卡导入
