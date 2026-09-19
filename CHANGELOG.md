@@ -2,6 +2,28 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [0.2.0] - 2026-09-20
+
+> M2「记得住、走得稳、有始有终」进行中。执行计划见 [docs/plan/m2.md](docs/plan/m2.md)。
+
+### Added
+
+- **M2.0 事件日志与投影（设计 §7.3「可回放」/ §6.9 / §12）**：新增 `event.rs`——`messages.jsonl` 从「消息流」升级为**类型化事件流**，一行一个事件：`message`（消息）/ `effect`（钩子副作用：state 顶层键补丁 + 黑板写入 + 记忆写入）/ `blackboard`（init·manual·clock）/ `transition`（状态树转移，M2.3）/ `thread`（剧情线，M2.4）/ `codex`（设定揭示与确认，M2.2）。事件带 `seq`（按位置分配）与 `kind` 判别字段；**M1 写的无 kind 行照旧按消息读**，旧会话不做破坏性迁移。新增 `Projection`（投影）：消息列表、各角色 state、黑板、宫殿、转移、剧情线快照、秘密揭示集全部由事件流**纯函数折叠**得出，`state.json` / `blackboard.json` / `palace.jsonl` 一律由投影写出——**落盘只剩一条路径**。`store::MessageLog` 升级为 `store::EventLog`（字节偏移增量读不变，新增 `append` / `rewrite`）。25 例新测试（事件往返、旧行兼容、投影折叠、确定性重放、state 补丁、genesis 与老会话基线、手动事件与派生事件的区分、半行/坏行/序号重排、揭示集、线快照后写覆盖）
+
+- **M2.0 消息级操作可回滚**：编辑/删除历史消息现在会**重放重算**（`rebuild_from`）——改写或移除该消息事件后，丢掉它所在轮次起的派生事件，再按卡顺序重跑这些轮的 `on_context` / `on_message`（含轮末时钟步进），钩子是 (消息, 黑板, state) 的纯函数，因此重放得到一致状态。**M1 的同源遗留就此关闭**：改掉那句「谢谢」，好感度会跟着退回去，记忆也一并消失。老会话（事件流里没有 genesis）首次消息级操作时**从头全量重放并补上 init 事件**，就地升级为事件溯源会话（此后回滚精确；老会话的黑板已是终态，故重放不再叠加时钟步进）。重roll 的截断抽成 `truncate_turn`（命令与单测共用），「不重复计分」从启发式判据 `turn_has_reply` 变成结构性保证——旧效果已不在流里，重放恰好一次
+
+### Changed
+
+- **预览组装改为纯干跑**：`preview_prompt` 不再落盘、不再记事件（M1 让预览也落盘是为了避免「预览一次状态变了、正式发送又变一次」的漂移；事件化之后正式发送自己会跑一次并留下事件，预览再落盘反而是多算一次）
+- **钩子运行抽成与 Tauri 无关的内核**：`assemble_prompt_core` / `run_load_hook_core` / `run_message_hook_core` / `commit_reply` 生产与单测共用同一份代码（M1 曾因单测另写等价逻辑而漏掉生产的半步），单测的 `simulate_turn` 现在直接调用这些内核
+- 手改黑板（`update_blackboard`）进事件流（reason=manual）——它不是派生结果，重放历史时不会被抹掉
+
+### Fixed
+
+- **编辑/删除历史消息不再留下已发生的状态变化**（M1 遗留，见 docs/plan/m1.md 同源记录）：事件日志落地后，任何消息级操作都能得到与事件流一致的状态（设计 §15「同一事件流重放状态路径一致」）
+
+- **文档**：新增 M2 执行计划 [docs/plan/m2.md](docs/plan/m2.md)（验收标准、关键架构决断、M2.0–M2.8 任务分解、风险与进度日志）
+
 ## [0.1.0] - 2026-09-19
 
 ### Added

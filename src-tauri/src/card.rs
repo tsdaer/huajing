@@ -362,8 +362,9 @@ pub struct UiEvent {
     pub value: String,
 }
 
-/// api.memory / api.blackboard 的一次写入（同 key 后写覆盖前写）
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// api.memory / api.blackboard 的一次写入（同 key 后写覆盖前写）。
+/// 同时要能反序列化：钩子副作用现在作为事件流落盘（M2.0 · event.rs），重启后要读回来。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvSet {
     pub key: String,
     pub value: serde_json::Value,

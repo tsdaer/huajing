@@ -2,10 +2,15 @@
 // 设计文档：docs/design.md（各模块对应章节见文件头注释）
 
 mod card;     // 角色卡与 Lua 沙箱（设计 §3）
+mod codex;    // 设定集：实体图谱、激活与分级注入（M2.2 · 设计 §6）
 mod commands; // Tauri 命令层
 mod diag;     // 运行时诊断环形缓冲
+mod event;    // 事件日志：类型化事件流与投影（M2.0 · 设计 §7.3）
 mod llm;      // OpenAI 兼容 SSE 客户端（设计 §11）
+mod palace;   // 记忆宫殿：记忆对象、召回与视图（M2.1 · 设计 §5）
 mod prompt;   // Prompt Builder 双槽位组装（设计 §4）
+mod psyche;   // 心理运行时：情绪槽、衰减、意图（M2.5 · 设计 §9）
+mod threads;  // 剧情线：生命周期与提及时机（M2.4 · 设计 §8）
 mod stimport; // SillyTavern 角色卡导入（M1.8 · 设计 §13）
 mod store;    // DataHub 明文数据层（设计 §12）
 mod watch;    // DataHub 热加载监听（M1.7）
@@ -16,7 +21,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(commands::CancelFlags::default())
         .manage(commands::LastAssemblies::default())
-        .manage(store::MessageLog::new())
+        .manage(store::EventLog::new())
         .manage(watch::CardWatch::default())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,

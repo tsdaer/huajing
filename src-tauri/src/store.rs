@@ -266,8 +266,9 @@ pub struct SessionMeta {
     pub premise: Option<String>,
 }
 
-/// messages.jsonl 中的一行（追加式消息流；事件类条目后续里程碑再加）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 事件流里的一条消息（M2.0 起 messages.jsonl 是类型化事件流，
+/// 消息只是其中一种；事件类型见 event.rs）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     /// 轮次，从 1 起
     pub turn: u64,
@@ -282,12 +283,24 @@ pub struct Message {
 }
 
 /// 黑板 v0（设计 §4.1 B1 的数据源；UI 可手动编辑，每轮时钟步进）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Blackboard {
     pub day: i64,
     pub clock: String,
     pub place: String,
     pub actors: Vec<String>,
+}
+
+impl Blackboard {
+    /// 缺省黑板（没有黑板事件、也没有旧文件的会话用；与 new_session 的默认值一致）
+    pub fn default_board() -> Blackboard {
+        Blackboard {
+            day: 1,
+            clock: String::new(),
+            place: String::new(),
+            actors: Vec::new(),
+        }
+    }
 }
 
 pub fn load_blackboard(root: &Path, session_id: &str) -> StoreResult<Blackboard> {
@@ -339,7 +352,7 @@ pub fn save_state(root: &Path, session_id: &str, state: &serde_json::Value) -> S
 /// M1.6 只落卡内 `api.memory.set` 的键值写入，并按 `turn` 溯源；
 /// 记忆宫殿的读侧（召回/房间/时间线）在 M2 长出来，届时本结构按设计扩充
 /// （`kind` 之外的字段、witnesses 等），旧记录保持可读。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemRecord {
     /// 记录类型：M1 恒为 `fact`（卡内写入的长期事实）
     pub kind: String,
@@ -365,6 +378,22 @@ pub fn append_memory_record(root: &Path, session_id: &str, rec: &MemRecord) -> S
         .append(true)
         .open(dir.join("palace.jsonl"))?;
     f.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+/// 全量重写 palace.jsonl（M2.0：宫殿由事件流投影写出，不再由写入点各自追加）。
+/// 旧记录格式不变，读侧照旧可读。
+pub fn write_memory_records(root: &Path, session_id: &str, records: &[MemRecord]) -> StoreResult<()> {
+    let dir = session_dir(root, session_id);
+    if !dir.is_dir() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    let mut buf = String::new();
+    for rec in records {
+        buf.push_str(&serde_json::to_string(rec)?);
+        buf.push('\n');
+    }
+    std::fs::write(dir.join("palace.jsonl"), buf)?;
     Ok(())
 }
 
@@ -431,33 +460,31 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
     Ok(meta)
 }
 
-/// 解析缓冲区里的完整行（返回消息与消费的字节数）。
-/// 只到最后一个 `\n` 为止——结尾半行（崩溃残留）留待补全；坏行跳过。
-/// 字节级切行对 UTF-8 安全（多字节字符的续字节不含 `\n`）。
-fn parse_complete_lines(buf: &[u8]) -> (Vec<Message>, usize) {
-    let complete = match buf.iter().rposition(|&b| b == b'\n') {
-        Some(p) => p + 1,
-        None => return (Vec::new(), 0),
-    };
-    let messages = buf[..complete]
-        .split(|&b| b == b'\n')
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_slice::<Message>(l).ok())
-        .collect();
-    (messages, complete)
+/// 解析缓冲区里的完整事件行（返回事件与消费的字节数）。
+/// 只到最后一个换行符为止——结尾半行（崩溃残留）留待补全；坏行跳过。
+/// 字节级切行对 UTF-8 安全（多字节字符的续字节不含换行）。
+fn parse_complete_lines(
+    buf: &[u8],
+    next_seq: crate::event::Seq,
+) -> (Vec<crate::event::LogRecord>, usize) {
+    crate::event::parse_lines(buf, next_seq)
 }
 
-/// 读取全量消息（直读文件；热路径走 [`MessageLog`] 增量缓存）
+/// 读取全量消息（直读文件；热路径走 [`EventLog`] 增量缓存）
 pub fn read_messages(root: &Path, session_id: &str) -> StoreResult<Vec<Message>> {
     let path = session_dir(root, session_id).join("messages.jsonl");
     if !path.exists() {
         return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
     }
-    Ok(parse_complete_lines(&std::fs::read(&path)?).0)
+    Ok(crate::event::messages(
+        &parse_complete_lines(&std::fs::read(&path)?, 1).0,
+    ))
 }
 
-/// 全量重写 messages.jsonl（消息编辑/删除/重roll 用）。
-/// 调用方必须随后 `MessageLog::invalidate`：缓存按字节偏移增量读，
+/// 全量重写 messages.jsonl，**只写消息行**（M1 时代的形态；事件流的整体重写请用
+/// [`EventLog::rewrite`]。保留它是因为「纯消息」文件仍是合法的旧格式，测试与
+/// 手工修复都用得上）。
+/// 调用方必须随后 `EventLog::invalidate`：缓存按字节偏移增量读，
 /// 重写后偏移失效（变短的文件会自动重置，但等长/变长改写检测不到）。
 pub fn write_messages(root: &Path, session_id: &str, messages: &[Message]) -> StoreResult<()> {
     let dir = session_dir(root, session_id);
@@ -489,53 +516,74 @@ pub fn list_sessions(root: &Path) -> StoreResult<Vec<SessionMeta>> {
     Ok(out)
 }
 
-// ---------- MessageLog：会话消息的增量缓存（高轮次性能）----------
+// ---------- EventLog：会话事件流的增量缓存（高轮次性能）----------
 //
-// messages.jsonl 是追加式日志，本应用是唯一写入者。缓存记住每会话
-// 已读到的字节偏移，读取时只 seek 续读新增部分——高轮次下每轮开销
-// 与新增行数成正比，而非全量重解析。半行（崩溃时未写完）留待补全
-// 后再消费；文件被外部截断/重写时缓存自动重置。
+// messages.jsonl 是追加式**事件流**（设计 §12 + §7.3），本应用是唯一写入者。缓存记住每会话
+// 已读到的字节偏移，读取时只 seek 续读新增部分——高轮次下每轮开销与新增行数成正比，
+// 而非全量重解析。半行（崩溃时未写完）留待补全后再消费；文件被外部截断/重写时缓存自动重置。
 
-/// 会话消息缓存（Tauri State；跨命令复用）
+/// 会话事件流缓存（Tauri State；跨命令复用）
 #[derive(Default)]
-pub struct MessageLog {
+pub struct EventLog {
     inner: std::sync::Mutex<HashMap<String, LogEntry>>,
 }
 
 #[derive(Default)]
 struct LogEntry {
-    messages: std::sync::Arc<Vec<Message>>,
+    records: std::sync::Arc<Vec<crate::event::LogRecord>>,
     /// 已消费到的字节偏移（最后一个完整行的行尾）
     pos: u64,
 }
 
 fn poisoned() -> StoreError {
-    StoreError::Io(std::io::Error::other("消息缓存锁 poisoned"))
+    StoreError::Io(std::io::Error::other("事件流缓存锁 poisoned"))
 }
 
-impl MessageLog {
+impl EventLog {
     pub fn new() -> Self {
-        MessageLog::default()
+        EventLog::default()
     }
 
-    /// 读取会话全部消息（增量续读；无新数据时直接返回缓存 Arc，零拷贝零解析）
-    pub fn read(&self, root: &Path, session_id: &str) -> StoreResult<std::sync::Arc<Vec<Message>>> {
+    /// 读取会话全部事件（增量续读；无新数据时直接返回缓存 Arc，零拷贝零解析）
+    pub fn read(
+        &self,
+        root: &Path,
+        session_id: &str,
+    ) -> StoreResult<std::sync::Arc<Vec<crate::event::LogRecord>>> {
         let mut map = self.inner.lock().map_err(|_| poisoned())?;
         sync_entry(&mut map, root, session_id)?;
         Ok(map
             .get(session_id)
             .expect("sync_entry 已建立条目")
-            .messages
+            .records
             .clone())
     }
 
-    /// 追加一条消息：写文件 + 同步缓存
-    pub fn append(&self, root: &Path, session_id: &str, msg: &Message) -> StoreResult<()> {
+    /// 消息视图（对话历史；顺序即对话顺序）
+    pub fn messages(&self, root: &Path, session_id: &str) -> StoreResult<Vec<Message>> {
+        Ok(crate::event::messages(&self.read(root, session_id)?))
+    }
+
+    /// 追加一条事件：写文件 + 同步缓存，返回落定后的记录（含按位置分配的 seq）。
+    /// 参数接受任何能转成 [`crate::event::LogBody`] 的东西（`Message` 与 `&Message` 都行），
+    /// 于是「追加一条消息」在调用点读起来仍是原来那句。
+    pub fn append<B: Into<crate::event::LogBody>>(
+        &self,
+        root: &Path,
+        session_id: &str,
+        body: B,
+    ) -> StoreResult<crate::event::LogRecord> {
+        let body = body.into();
         use std::io::Write;
         let mut map = self.inner.lock().map_err(|_| poisoned())?;
         sync_entry(&mut map, root, session_id)?;
 
-        let line = serde_json::to_string(msg)? + "\n";
+        let entry = map.get_mut(session_id).expect("sync_entry 已建立条目");
+        let seq = entry.records.last().map(|r| r.seq).unwrap_or(0) + 1;
+        let record = crate::event::LogRecord::new(seq, body);
+        let line = record
+            .to_line()
+            .map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
         let path = session_dir(root, session_id).join("messages.jsonl");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -543,14 +591,37 @@ impl MessageLog {
             .open(&path)?;
         f.write_all(line.as_bytes())?;
 
-        let entry = map.get_mut(session_id).expect("sync_entry 已建立条目");
-        std::sync::Arc::make_mut(&mut entry.messages).push(msg.clone());
+        std::sync::Arc::make_mut(&mut entry.records).push(record.clone());
         entry.pos += line.len() as u64;
+        Ok(record)
+    }
+
+    /// 全量重写事件流（消息编辑/删除/重roll 的重建结果）。
+    /// 序号按位置重排；写盘后缓存直接换新——重写是本进程发起的，无需重读文件。
+    pub fn rewrite(
+        &self,
+        root: &Path,
+        session_id: &str,
+        records: &[crate::event::LogRecord],
+    ) -> StoreResult<()> {
+        let dir = session_dir(root, session_id);
+        if !dir.is_dir() {
+            return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+        }
+        let text = crate::event::render_lines(records)
+            .map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
+        std::fs::write(dir.join("messages.jsonl"), &text)?;
+
+        let mut map = self.inner.lock().map_err(|_| poisoned())?;
+        let entry = map.entry(session_id.to_string()).or_default();
+        // 重新编号后缓存与文件一致（parse_lines 也是按位置编号）
+        entry.records = std::sync::Arc::new(crate::event::parse_lines(text.as_bytes(), 1).0);
+        entry.pos = text.len() as u64;
         Ok(())
     }
 
     /// 丢弃某会话（或全部）缓存；下次读取全量重建。
-    /// 消息编辑/删除/外部改动文件后调用。
+    /// 外部改动文件后调用。
     pub fn invalidate(&self, session_id: Option<&str>) {
         if let Ok(mut map) = self.inner.lock() {
             match session_id {
@@ -579,7 +650,7 @@ fn sync_entry(
     if len < entry.pos {
         // 文件被外部截断/重写：丢弃缓存全量重读
         entry.pos = 0;
-        std::sync::Arc::make_mut(&mut entry.messages).clear();
+        std::sync::Arc::make_mut(&mut entry.records).clear();
     }
     if len == entry.pos {
         return Ok(());
@@ -589,11 +660,12 @@ fn sync_entry(
     let mut buf = Vec::with_capacity((len - entry.pos) as usize);
     f.read_to_end(&mut buf)?;
 
-    let (messages, consumed) = parse_complete_lines(&buf);
+    let next_seq = entry.records.last().map(|r| r.seq).unwrap_or(0) + 1;
+    let (records, consumed) = parse_complete_lines(&buf, next_seq);
     if consumed == 0 {
         return Ok(()); // 只有半行：留待补全
     }
-    std::sync::Arc::make_mut(&mut entry.messages).extend(messages);
+    std::sync::Arc::make_mut(&mut entry.records).extend(records);
     entry.pos += consumed as u64;
     Ok(())
 }
@@ -850,7 +922,7 @@ mod tests {
             },
         )
         .unwrap();
-        let log = MessageLog::new();
+        let log = EventLog::new();
         let sink: crate::card::UiSink = std::sync::Arc::new(|_| {});
 
         // on_load
@@ -940,7 +1012,7 @@ mod tests {
         assert_eq!((bb.day, bb.clock.as_str(), bb.place.as_str()), (3, "21:30", "图书馆自习区"));
         assert_eq!(bb.actors, vec!["小雨"]);
 
-        let log = MessageLog::new();
+        let log = EventLog::new();
         log.append(
             root.path(),
             &meta.id,
@@ -1053,6 +1125,11 @@ mod tests {
         assert_eq!(iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
     }
 
+    /// 读事件流里的消息视图（测试里比 records 本身更常用）
+    fn read_log_messages(log: &EventLog, root: &Path, id: &str) -> Vec<Message> {
+        crate::event::messages(&log.read(root, id).unwrap())
+    }
+
     #[test]
     fn message_log_incremental_reads() {
         let root = tempfile::tempdir().unwrap();
@@ -1068,7 +1145,7 @@ mod tests {
             },
         )
         .unwrap();
-        let log = MessageLog::new();
+        let log = EventLog::new();
 
         log.append(
             root.path(),
@@ -1108,6 +1185,7 @@ mod tests {
         let raw = read_messages(root.path(), &meta.id).unwrap();
         assert_eq!(raw.len(), 2);
         assert_eq!(raw[1].content, "……嗯。");
+        assert_eq!(read_log_messages(&log, root.path(), &meta.id).len(), 2);
     }
 
     #[test]
@@ -1125,7 +1203,7 @@ mod tests {
             },
         )
         .unwrap();
-        let log = MessageLog::new();
+        let log = EventLog::new();
         log.append(
             root.path(),
             &meta.id,
@@ -1169,7 +1247,7 @@ mod tests {
             },
         )
         .unwrap();
-        let log = MessageLog::new();
+        let log = EventLog::new();
         for i in 0..3 {
             log.append(
                 root.path(),
@@ -1193,7 +1271,7 @@ mod tests {
             "{\"turn\":1,\"role\":\"user\",\"content\":\"edited\",\"ts\":9}\n",
         )
         .unwrap();
-        let msgs = log.read(root.path(), &meta.id).unwrap();
+        let msgs = read_log_messages(&log, root.path(), &meta.id);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "edited");
     }
@@ -1213,7 +1291,7 @@ mod tests {
             },
         )
         .unwrap();
-        let log = MessageLog::new();
+        let log = EventLog::new();
         for i in 0..3 {
             log.append(
                 root.path(),
@@ -1230,21 +1308,40 @@ mod tests {
         }
 
         // 编辑：等长改写（缓存偏移检测不到，必须 invalidate）
-        let mut msgs = log.read(root.path(), &meta.id).unwrap().as_slice().to_vec();
+        let mut msgs = read_log_messages(&log, root.path(), &meta.id);
         msgs[1].content = "改写X".into(); // 与"原文1"字节数相同（均 7 字节）的等长改写
         assert_eq!(msgs[1].content.len(), "原文1".len());
         write_messages(root.path(), &meta.id, &msgs).unwrap();
         log.invalidate(Some(&meta.id));
-        let after = log.read(root.path(), &meta.id).unwrap();
+        let after = read_log_messages(&log, root.path(), &meta.id);
         assert_eq!(after[1].content, "改写X");
         assert_eq!(after.len(), 3);
 
         // 删除：移除末尾后读回 2 条；文件变短走自动重置也行，但统一 invalidate
-        msgs = after.as_slice().to_vec();
+        msgs = after.clone();
         msgs.pop();
         write_messages(root.path(), &meta.id, &msgs).unwrap();
         log.invalidate(Some(&meta.id));
-        assert_eq!(log.read(root.path(), &meta.id).unwrap().len(), 2);
+        assert_eq!(read_log_messages(&log, root.path(), &meta.id).len(), 2);
+
+        // 事件流整体重写（消息编辑/删除的实际路径）：序号重排、缓存换新
+        let mut records = log.read(root.path(), &meta.id).unwrap().as_ref().clone();
+        records.push(crate::event::LogRecord::new(
+            0,
+            crate::event::LogBody::Effect(crate::event::EffectEvent {
+                turn: 1,
+                trigger: "hook.on_message".into(),
+                character: "小雨".into(),
+                state_set: vec![],
+                blackboard: vec![],
+                memory: vec![],
+                ts: 0,
+            }),
+        ));
+        log.rewrite(root.path(), &meta.id, &records).unwrap();
+        let rewritten = log.read(root.path(), &meta.id).unwrap();
+        assert_eq!(rewritten.len(), 3);
+        assert_eq!(rewritten.last().unwrap().seq, 3, "重写后序号按位置重排");
 
         // 重写后继续 append 不串行
         log.append(
@@ -1282,7 +1379,7 @@ mod tests {
             },
         )
         .unwrap();
-        let log = MessageLog::new();
+        let log = EventLog::new();
         let n = 10_000;
         for i in 0..n {
             log.append(

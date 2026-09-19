@@ -9,6 +9,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::card;
+use crate::event::{self, LogBody, LogRecord};
 use crate::llm::{self, Provider, StreamEvent};
 use crate::prompt;
 use crate::store::{self, Message, NewSessionRequest, Settings};
@@ -172,7 +173,7 @@ pub fn new_session(
     clock: Option<String>,
     place: Option<String>,
     premise: Option<String>,
-    msg_log: State<'_, store::MessageLog>,
+    log: State<'_, store::EventLog>,
 ) -> Result<store::SessionMeta, String> {
     let root = root();
     let req = NewSessionRequest {
@@ -184,6 +185,22 @@ pub fn new_session(
         premise,
     };
     let meta = store::new_session(&root, &req).map_err(|e| e.to_string())?;
+
+    // genesis：初始黑板进事件流（M2.0）。此后黑板/状态/宫殿一律由事件流投影写出，
+    // 派生文件不再充当基线——老会话的判定见 event::has_genesis。
+    let board = store::load_blackboard(&root, &meta.id).map_err(|e| e.to_string())?;
+    log.append(
+        &root,
+        &meta.id,
+        LogBody::Blackboard(event::BlackboardEvent {
+            turn: 0,
+            reason: "init".into(),
+            board,
+            ts: store::unix_now(),
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
     // first_mes 开场白：turn 0 的角色消息（设计 §3；卡片读取失败不阻塞建会话）
     if let Some(dir) = meta.characters.first() {
         if let Ok(loaded) = card::load_card(&root, dir) {
@@ -196,25 +213,180 @@ pub fn new_session(
                     ts: store::unix_now(),
                     scene_id: None,
                 };
-                let _ = msg_log.append(&root, &meta.id, &opening);
+                let _ = log.append(&root, &meta.id, LogBody::Message(opening));
             }
             // on_load：角色入席（设计 §3「生命周期钩子」）——state 就位、
             // 卡内可能顺手初始化黑板与长期记忆
-            run_load_hook(&app, &root, &meta, &loaded, "hook.on_load")?;
+            run_load_hook(&app, &root, &meta, &loaded, &log, "hook.on_load")?;
         }
     }
     Ok(meta)
 }
 
-/// 跑 `on_load`（建会话、角色入席时一次）。与 on_message 共用同一套
-/// 环境构造与落盘规则；环境构造失败在此上报（建会话不能带着半截状态继续）。
-#[allow(clippy::too_many_arguments)] // 与 new_session 的参数一一对应，拆结构体反而绕
+// ---------- 事件流：投影 / 派生文件 / 重放（M2.0 · 设计 §7.3「可回放」）----------
+
+/// 会话的首个角色（M2 仍是 1v1；M3 群聊按角色分别投影）
+fn first_character(meta: &store::SessionMeta) -> Result<String, String> {
+    meta.characters
+        .first()
+        .cloned()
+        .ok_or_else(|| "会话未配置角色".to_string())
+}
+
+/// 事件流的起始基线：
+/// - M2 建的会话（事件流带 genesis）一切都在事件流里，基线为空；
+/// - M1 老会话的状态/黑板/宫殿只存在于派生文件里，以它们为基线继续折叠。
+fn base_for(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    records: &[LogRecord],
+) -> event::Base {
+    if event::has_genesis(records) {
+        return event::Base::default();
+    }
+    let mut base = event::Base {
+        blackboard: store::load_blackboard(root, &meta.id).ok(),
+        memory: store::read_memory_records(root, &meta.id).unwrap_or_default(),
+        ..Default::default()
+    };
+    if let Ok(character) = first_character(meta) {
+        if let Ok(state) = store::load_state(root, &meta.id) {
+            base.states.insert(character, state);
+        }
+    }
+    base
+}
+
+/// 事件流 → 会话现状
+fn project(
+    records: &[LogRecord],
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+) -> event::Projection {
+    event::project_over(records, &base_for(root, meta, records))
+}
+
+/// 读事件流并投影
+fn project_session(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+) -> Result<event::Projection, String> {
+    let records = log.read(root, &meta.id).map_err(|e| e.to_string())?;
+    Ok(project(&records, root, meta))
+}
+
+/// 投影 → 派生文件（state.json / blackboard.json / palace.jsonl）。
+/// **派生文件只能由这里写**——写入点各自落盘正是 M1 回滚不了状态的根因。
+fn sync_derived(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    proj: &event::Projection,
+) -> Result<(), String> {
+    let state = first_character(meta)
+        .ok()
+        .and_then(|c| proj.state_of(&c).cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+    store::save_state(root, &meta.id, &state).map_err(|e| e.to_string())?;
+    if let Some(bb) = &proj.blackboard {
+        store::save_blackboard(root, &meta.id, bb).map_err(|e| e.to_string())?;
+    }
+    store::write_memory_records(root, &meta.id, &proj.memory).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 只重投影 + 落派生文件（没有新事件时用）
+fn sync_now(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+) -> Result<event::Projection, String> {
+    let proj = project_session(log, root, meta)?;
+    sync_derived(root, meta, &proj)?;
+    Ok(proj)
+}
+
+/// 追加事件 → 重投影 → 落派生文件。**这是会话状态唯一的写入路径。**
+fn commit(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    body: LogBody,
+) -> Result<event::Projection, String> {
+    log.append(root, &meta.id, body).map_err(|e| e.to_string())?;
+    sync_now(log, root, meta)
+}
+
+/// 角色 state 现状：投影优先，空对象降级用卡上 default_state（设计 §4.3）
+fn current_state(
+    proj: &event::Projection,
+    character: &str,
+    loaded: &card::LoadedCard,
+) -> serde_json::Value {
+    match proj.state_of(character) {
+        Some(v) if v.as_object().map(|o| !o.is_empty()).unwrap_or(false) => v.clone(),
+        _ => loaded.default_state.clone(),
+    }
+}
+
+fn blackboard_of(proj: &event::Projection) -> store::Blackboard {
+    proj.blackboard
+        .clone()
+        .unwrap_or_else(store::Blackboard::default_board)
+}
+
+/// 一次钩子运行 → 事件。没改动就不记（事件流只留真发生的事）；
+/// 「入席建基线」（force_baseline）例外：即使与卡上默认值相同也要记，
+/// 因为它定义的正是这个会话的起点。
+fn hook_effect(
+    run: &card::HookRun,
+    before: &serde_json::Value,
+    character: &str,
+    turn: u64,
+    trigger: &str,
+    force_baseline: bool,
+) -> Option<LogBody> {
+    let after = run.state.clone().unwrap_or_else(|| before.clone());
+    let state_set = if force_baseline {
+        event::state_patch(&serde_json::json!({}), &after)
+    } else {
+        event::state_patch(before, &after)
+    };
+    if state_set.is_empty() && run.blackboard.is_empty() && run.memory.is_empty() {
+        return None;
+    }
+    Some(LogBody::Effect(event::EffectEvent {
+        turn,
+        trigger: trigger.into(),
+        character: character.into(),
+        state_set,
+        blackboard: run.blackboard.clone(),
+        memory: run.memory.clone(),
+        ts: store::unix_now(),
+    }))
+}
+
+/// 跑 `on_load`（建会话、角色入席时一次）。环境构造失败在此上报
+/// （建会话不能带着半截状态继续）。
 fn run_load_hook(
     app: &AppHandle,
     root: &std::path::Path,
     meta: &store::SessionMeta,
     loaded: &card::LoadedCard,
+    log: &store::EventLog,
     source: &str,
+) -> Result<llm::HookReport, String> {
+    run_load_hook_core(root, meta, loaded, log, source, &ui_sink(app))
+}
+
+/// on_load 的内核（与 Tauri 无关：生产传 ui_sink(app)，单测传空回调）
+fn run_load_hook_core(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    loaded: &card::LoadedCard,
+    log: &store::EventLog,
+    source: &str,
+    sink: &card::UiSink,
 ) -> Result<llm::HookReport, String> {
     if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_load") {
         return Ok(llm::HookReport {
@@ -222,47 +394,50 @@ fn run_load_hook(
             ..Default::default()
         });
     }
-    let mut state = load_card_state(root, meta, loaded)?;
-    let mut blackboard = store::load_blackboard(root, &meta.id).map_err(|e| e.to_string())?;
+    let proj = project_session(log, root, meta)?;
+    let character = first_character(meta)?;
+    let state = current_state(&proj, &character, loaded);
     let run = card::run_hook_full(
         &loaded.source,
         card::HookCall::OnLoad,
         &card::HookEnv {
             state: state.clone(),
-            blackboard: blackboard_env(&blackboard),
+            blackboard: blackboard_env(&blackboard_of(&proj)),
             memory: BTreeMap::new(),
         },
         meta.seed,
-        &ui_sink(app),
+        sink,
     );
-    apply_load_hook(root, &meta.id, source, &run, &mut state, &mut blackboard)
+    apply_load_hook(root, meta, log, source, &run, &state)
 }
 
-/// `on_load` 的落盘：入席是「建立基线」——无论 hook 是否改动，都把生效后的 state
-/// 写进会话快照（此后一律以会话为准，改卡的默认值不回头覆盖已有会话）。
-/// 与 [`apply_message_hook`] 分开：on_message 只写「真变了的」，on_load 必写。
+/// `on_load` 的落盘：入席是「建立基线」——生效后的 state 作为基线补丁记进事件流
+/// （此后一律以会话为准，改卡的默认值不回头覆盖已有会话）。
+/// 与 [`apply_message_hook`] 分开：on_message 只记「真变了的」，on_load 必记。
 fn apply_load_hook(
     root: &std::path::Path,
-    session_id: &str,
+    meta: &store::SessionMeta,
+    log: &store::EventLog,
     source: &str,
     run: &card::HookRun,
-    state: &mut serde_json::Value,
-    blackboard: &mut store::Blackboard,
+    before: &serde_json::Value,
 ) -> Result<llm::HookReport, String> {
-    let mut report = llm::HookReport {
+    let character = first_character(meta)?;
+    let proj = match hook_effect(run, before, &character, 0, source, true) {
+        Some(body) => commit(log, root, meta, body)?,
+        None => sync_now(log, root, meta)?,
+    };
+    Ok(llm::HookReport {
         turn: 0,
         ran: run.ran(),
         logs: run.result.logs.clone(),
         ui_events: run.result.ui_events.iter().map(ui_emit).collect(),
         memory: run.memory.clone(),
-        ..Default::default()
-    };
-    let _ = apply_hook_state(state, run);
-    let _ = merge_blackboard(blackboard, &run.blackboard);
-    persist_hook_state(root, session_id, Some(&*state), Some(&*blackboard))?;
-    persist_memory(root, session_id, source, 0, &run.memory);
-    report.card_state = state.clone();
-    Ok(report)
+        card_state: proj
+            .state_of(&character)
+            .cloned()
+            .unwrap_or_else(|| before.clone()),
+    })
 }
 
 #[tauri::command]
@@ -273,56 +448,208 @@ pub fn list_sessions() -> Result<Vec<store::SessionMeta>, String> {
 #[tauri::command]
 pub fn read_messages(
     session_id: String,
-    msg_log: State<'_, store::MessageLog>,
-) -> Result<std::sync::Arc<Vec<Message>>, String> {
-    msg_log
-        .read(&root(), &session_id)
-        .map_err(|e| e.to_string())
+    log: State<'_, store::EventLog>,
+) -> Result<Vec<Message>, String> {
+    log.messages(&root(), &session_id).map_err(|e| e.to_string())
 }
 
-/// 编辑指定下标的消息内容（全量重写 + 缓存失效），返回更新后的全量消息
+/// 第 index 条**消息**在事件流里的位置与轮次（下标是消息视图里的位置）
+fn locate_message(records: &[LogRecord], index: usize) -> Option<(usize, u64)> {
+    let mut seen = 0usize;
+    for (pos, rec) in records.iter().enumerate() {
+        if let Some(m) = rec.as_message() {
+            if seen == index {
+                return Some((pos, m.turn));
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
+/// 编辑指定下标的消息内容：改写该消息事件 → 丢弃它所在轮次起的派生事件 → 重放重算。
+///
+/// 这正是 M1 遗留问题的解药：改掉那句「谢谢」，好感度会跟着退回去
+/// （设计 §7.3-5「转移是事件流的纯函数」）。返回更新后的全量消息。
 #[tauri::command]
 pub fn edit_message(
     session_id: String,
     index: usize,
     content: String,
-    msg_log: State<'_, store::MessageLog>,
+    log: State<'_, store::EventLog>,
 ) -> Result<Vec<Message>, String> {
     let root = root();
-    let mut messages = msg_log
-        .read(&root, &session_id)
-        .map_err(|e| e.to_string())?
-        .as_slice()
-        .to_vec();
-    let Some(m) = messages.get_mut(index) else {
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
+    let Some((pos, turn)) = locate_message(&records, index) else {
         return Err(format!("消息下标越界：{index}"));
     };
-    m.content = content;
-    store::write_messages(&root, &session_id, &messages).map_err(|e| e.to_string())?;
-    msg_log.invalidate(Some(&session_id));
-    Ok(messages)
+    let mut edited = records.as_ref().clone();
+    if let LogBody::Message(m) = &mut edited[pos].body {
+        m.content = content;
+    }
+    let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn)?;
+    log.rewrite(&root, &session_id, &rebuilt)
+        .map_err(|e| e.to_string())?;
+    sync_now(&log, &root, &meta)?;
+    Ok(event::messages(&rebuilt))
 }
 
-/// 删除指定下标的消息（全量重写 + 缓存失效），返回更新后的全量消息
+/// 删除指定下标的消息：移除该消息事件 → 从它所在轮次起重放重算，返回更新后的全量消息
 #[tauri::command]
 pub fn delete_message(
     session_id: String,
     index: usize,
-    msg_log: State<'_, store::MessageLog>,
+    log: State<'_, store::EventLog>,
 ) -> Result<Vec<Message>, String> {
     let root = root();
-    let mut messages = msg_log
-        .read(&root, &session_id)
-        .map_err(|e| e.to_string())?
-        .as_slice()
-        .to_vec();
-    if index >= messages.len() {
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
+    let Some((pos, turn)) = locate_message(&records, index) else {
         return Err(format!("消息下标越界：{index}"));
+    };
+    let mut edited = records.as_ref().clone();
+    edited.remove(pos);
+    let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn)?;
+    log.rewrite(&root, &session_id, &rebuilt)
+        .map_err(|e| e.to_string())?;
+    sync_now(&log, &root, &meta)?;
+    Ok(event::messages(&rebuilt))
+}
+
+/// 重放：丢弃 from_turn 起的派生事件，按卡重新跑这些轮的钩子（设计 §7.3-5）。
+///
+/// - **M2 会话**（事件流带 genesis）：先折叠 from_turn 之前的事件得到起点，再从该轮重放；
+/// - **M1 老会话**（没有 genesis）：历史状态只存在于派生文件里、无法回退，故**从头全量重放**，
+///   并顺带把 init 事件补进流——就地升级为事件溯源会话（此后消息级操作都能精确回滚）。
+///   老会话的黑板已是终态、没有逐步的时钟记录，故重放时不再叠加时钟步进。
+/// - 玩家手动产生的事件（手改黑板、手动开收线）永不被丢弃——它们不是派生结果。
+/// - 重放期间不推界面事件：编辑历史不该再弹一次表情。
+fn rebuild_from(
+    _log: &store::EventLog, // 重建结果由调用方 rewrite；这里只依据传入的记录重算
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    loaded: &card::LoadedCard,
+    records: &[LogRecord],
+    from_turn: u64,
+) -> Result<Vec<LogRecord>, String> {
+    let character = first_character(meta)?;
+    let genesis = event::has_genesis(records);
+    let replay_from = if genesis { from_turn } else { 0 };
+
+    // 保留：全部消息（内容可能已被编辑）+ 重放点之前的记录 + 玩家手动事件
+    let kept: Vec<LogRecord> = records
+        .iter()
+        .filter(|r| {
+            r.as_message().is_some()
+                || r.turn() < replay_from
+                || !r.is_derived()
+                || matches!(&r.body, LogBody::Effect(e) if e.trigger == "hook.on_load")
+        })
+        .cloned()
+        .collect();
+
+    let mut out: Vec<LogRecord> = Vec::new();
+    let mut proj = event::Projection::default();
+    if !genesis {
+        // 老会话补 genesis：初始黑板取当前文件里的那份（M1 没留下更早的黑板）
+        let board = blackboard_of(&project(records, root, meta));
+        let init = LogRecord::new(
+            0,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 0,
+                reason: "init".into(),
+                board: board.clone(),
+                ts: store::unix_now(),
+            }),
+        );
+        out.push(init.clone());
+        event::fold(&mut proj, &init);
+        // 再补跑一次 on_load：老会话的事件流里没有入席基线，重放得从「角色刚入席」重新开始
+        let state = loaded.default_state.clone();
+        let run = card::run_hook_full(
+            &loaded.source,
+            card::HookCall::OnLoad,
+            &card::HookEnv {
+                state: state.clone(),
+                blackboard: blackboard_env(&board),
+                memory: BTreeMap::new(),
+            },
+            meta.seed,
+            &NOOP_SINK,
+        );
+        if let Some(body) = hook_effect(&run, &state, &character, 0, "hook.on_load", true) {
+            let rec = LogRecord::new(0, body);
+            out.push(rec.clone());
+            event::fold(&mut proj, &rec);
+        }
     }
-    messages.remove(index);
-    store::write_messages(&root, &session_id, &messages).map_err(|e| e.to_string())?;
-    msg_log.invalidate(Some(&session_id));
-    Ok(messages)
+
+    for rec in &kept {
+        let Some(msg) = rec.as_message().cloned() else {
+            // 非消息记录：重放点之前的直接折进起点；重放区内的只可能是手动事件
+            if rec.turn() < replay_from || !rec.is_derived() {
+                out.push(rec.clone());
+                event::fold(&mut proj, rec);
+            }
+            continue;
+        };
+        if msg.turn < replay_from || msg.turn == 0 {
+            // 重放点之前，或 turn 0 的开场白（它没有 on_message，设计 §3）
+            out.push(rec.clone());
+            event::fold(&mut proj, rec);
+            continue;
+        }
+        // ① 用户消息：on_context 在它之前跑（设计 §4.1 B5 的注入时机）
+        if msg.role == "user" {
+            let (run, before) = run_context_hook(
+                loaded,
+                &proj,
+                &character,
+                meta.seed,
+                &proj.messages.clone(),
+                &NOOP_SINK,
+            );
+            if let Some(body) = hook_effect(&run, &before, &character, msg.turn, "hook.on_context", false)
+            {
+                let rec = LogRecord::new(0, body);
+                out.push(rec.clone());
+                event::fold(&mut proj, &rec);
+            }
+        }
+        // ② 消息本身
+        out.push(rec.clone());
+        event::fold(&mut proj, rec);
+        // ③ 角色回复：时钟步进（设计 M1：每轮 +10 分钟，跨日进位）
+        if msg.role == "char" && genesis {
+            let mut board = blackboard_of(&proj);
+            let (day, clock) = prompt::advance_clock(board.day, &board.clock);
+            board.day = day;
+            board.clock = clock;
+            let rec = LogRecord::new(
+                0,
+                LogBody::Blackboard(event::BlackboardEvent {
+                    turn: msg.turn,
+                    reason: "clock".into(),
+                    board,
+                    ts: store::unix_now(),
+                }),
+            );
+            out.push(rec.clone());
+            event::fold(&mut proj, &rec);
+        }
+        // ④ on_message（每条新消息落地后，设计 §3）
+        let (run, before) =
+            run_message_hook_at(loaded, &proj, &character, &msg, meta.seed, &NOOP_SINK);
+        if let Some(body) = hook_effect(&run, &before, &character, msg.turn, "hook.on_message", false) {
+            let rec = LogRecord::new(0, body);
+            out.push(rec.clone());
+            event::fold(&mut proj, &rec);
+        }
+    }
+    Ok(out)
 }
 
 // ---------- 对话生成（设计 §4 流程 + §11 流式）----------
@@ -335,19 +662,20 @@ pub struct CancelFlags(Mutex<HashMap<String, Arc<AtomicBool>>>);
 #[derive(Default)]
 pub struct LastAssemblies(Mutex<HashMap<String, prompt::PromptAssembly>>);
 
-/// 组装一轮上下文（send_message 与 preview_prompt 共用）。
+/// 组装一轮上下文（send_message / regenerate / preview_prompt 共用）。
 /// `user_content` = Some 时为本轮真实发送（末尾带用户消息）；None 为检查器预览。
-/// 本轮组装的产物：注入层 + 被 hook 顺带改动的宿主状态（调用方负责落盘）。
+/// 本轮组装的产物：注入层 + 被 hook 顺带改动的宿主状态。
+///
+/// 落盘规则（M2.0）：真实组装（log = Some）会把 on_context 的副作用记成事件；
+/// **预览是干跑**（log = None），一律不落盘、不记事件——M1 让预览也落盘是为了避免
+/// 「预览一次变一次、发送又变一次」的漂移，而事件化之后正式发送自己会跑一次，
+/// 预览再落盘反而是多算一次。
 struct PromptRun {
     assembly: prompt::PromptAssembly,
     /// 生效后的角色 state（on_context 可能原地改过）
     card_state: serde_json::Value,
-    /// on_context 原地改过 state（需要回写 state.json）
-    state_dirty: bool,
     /// 生效后的黑板（on_context 可能经 api.blackboard.set 改过）
     blackboard: store::Blackboard,
-    /// 黑板被 hook 改过（需要回写 blackboard.json）
-    blackboard_dirty: bool,
     /// on_context 期间 `api.ui.emit` 的界面事件
     ui_events: Vec<llm::UiEmit>,
 }
@@ -375,54 +703,84 @@ fn blackboard_env(bb: &store::Blackboard) -> BTreeMap<String, serde_json::Value>
     map
 }
 
-/// 把 `api.blackboard.set` 的写入合并进黑板（只认黑白板 v0 字段；类型不符即忽略）。
-/// 返回是否有实际改动。
-fn merge_blackboard(bb: &mut store::Blackboard, sets: &[card::KvSet]) -> bool {
-    let before = format!("{bb:?}");
-    for kv in sets {
-        match (kv.key.as_str(), &kv.value) {
-            ("day", v) => {
-                if let Some(n) = v.as_i64() {
-                    bb.day = n;
-                }
-            }
-            ("clock", v) => {
-                if let Some(s) = v.as_str() {
-                    bb.clock = s.to_string();
-                }
-            }
-            ("place", v) => {
-                if let Some(s) = v.as_str() {
-                    bb.place = s.to_string();
-                }
-            }
-            ("actors", v) => {
-                if let Some(arr) = v.as_array() {
-                    bb.actors = arr
-                        .iter()
-                        .filter_map(|a| a.as_str().map(str::to_string))
-                        .collect();
-                }
-            }
-            _ => {} // 白名单已在沙箱侧拦住；这里兜底忽略
-        }
+/// 跑 `on_context`（B5 注入时机，设计 §4.1）：返回 (运行结果, 运行前的 state)。
+/// 降级卡与未定义该 hook 的卡返回默认（ran=false），不新建 Lua 实例。
+#[allow(clippy::too_many_arguments)]
+fn run_context_hook(
+    loaded: &card::LoadedCard,
+    proj: &event::Projection,
+    character: &str,
+    seed: u64,
+    history: &[Message],
+    sink: &card::UiSink,
+) -> (card::HookRun, serde_json::Value) {
+    let state = current_state(proj, character, loaded);
+    if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_context") {
+        return (card::HookRun::default(), state);
     }
-    format!("{bb:?}") != before
+    let start = history.len().saturating_sub(prompt::WINDOW_MESSAGES);
+    let run = card::run_hook_full(
+        &loaded.source,
+        card::HookCall::OnContext {
+            window: &history[start..],
+        },
+        &card::HookEnv {
+            state: state.clone(),
+            blackboard: blackboard_env(&blackboard_of(proj)),
+            memory: BTreeMap::new(), // 长期记忆读侧（记忆宫殿）在 M2.1
+        },
+        seed,
+        sink,
+    );
+    (run, state)
 }
 
-/// 组装一轮上下文（send_message / regenerate / preview_prompt 共用）。
+/// 跑 `on_message`（每条新消息落地后，设计 §3）：返回 (运行结果, 运行前的 state)。
+fn run_message_hook_at(
+    loaded: &card::LoadedCard,
+    proj: &event::Projection,
+    character: &str,
+    msg: &Message,
+    seed: u64,
+    sink: &card::UiSink,
+) -> (card::HookRun, serde_json::Value) {
+    let state = current_state(proj, character, loaded);
+    if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_message") {
+        return (card::HookRun::default(), state);
+    }
+    let run = card::run_hook_full(
+        &loaded.source,
+        card::HookCall::OnMessage { msg },
+        &card::HookEnv {
+            state: state.clone(),
+            blackboard: blackboard_env(&blackboard_of(proj)),
+            memory: BTreeMap::new(),
+        },
+        seed,
+        sink,
+    );
+    (run, state)
+}
+
+/// 组装一轮上下文的**内核**（与 Tauri 无关：生产传 ui_sink(app)，单测传空回调，
+/// 两边走同一份代码——M1 曾因单测另写一份等价逻辑而漏掉生产的半步）。
 ///
 /// `user_content` = Some 时为本轮真实发送（末尾带用户消息）；None 为检查器预览。
-/// on_context hook 在此运行（B5 注入时机，设计 §4.1）：其 state / 黑板改动
-/// 就地生效并标记 dirty，由调用方决定何时落盘（预览也会落盘——卡片的
-/// on_context 本就允许改状态，与是否真的发送无关）。
-fn assemble_prompt(
-    app: &AppHandle,
+/// on_context hook 在此运行（B5 注入时机，设计 §4.1）。
+///
+/// 落盘：`log` = Some（真实组装）时把 on_context 的副作用记成事件并落派生文件；
+/// `log` = None（预览干跑）时只在内存里生效，不落盘——理由见 [PromptRun]。
+#[allow(clippy::too_many_arguments)]
+fn assemble_prompt_core(
+    sink: &card::UiSink,
     root: &std::path::Path,
     meta: &store::SessionMeta,
     loaded: &card::LoadedCard,
     history: &[Message],
+    proj: &event::Projection,
     user_content: Option<&str>,
+    turn: u64,
+    log: Option<&store::EventLog>,
 ) -> Result<PromptRun, String> {
     let settings = store::load_settings(root).map_err(|e| e.to_string())?;
     let persona = match &meta.persona {
@@ -432,36 +790,19 @@ fn assemble_prompt(
             .find(|p| &p.name == name),
         None => None,
     };
-    let mut card_state = load_card_state(root, meta, loaded)?;
-    let mut blackboard = store::load_blackboard(root, &meta.id).map_err(|e| e.to_string())?;
+    let character = first_character(meta)?;
 
     // B5：on_context hook（降级卡与未定义该 hook 的卡都跳过；窗口给最近消息）
-    let start = history.len().saturating_sub(prompt::WINDOW_MESSAGES);
-    let mut hook_injections = Vec::new();
-    let mut state_dirty = false;
-    let mut blackboard_dirty = false;
-    let mut ui_events = Vec::new();
-    if !loaded.degraded && loaded.hook_names.iter().any(|h| h == "on_context") {
-        let mut hook_state = card_state.clone();
-        let mut hook_board = blackboard.clone();
-        let sink = ui_sink(app);
-        let run = card::run_hook_full(
-            &loaded.source,
-            card::HookCall::OnContext { window: &history[start..] },
-            &card::HookEnv {
-                state: hook_state.clone(),
-                blackboard: blackboard_env(&blackboard),
-                memory: BTreeMap::new(), // 长期记忆读侧（记忆宫殿）在 M2
-            },
-            meta.seed,
-            &sink,
-        );
-        hook_injections = run.result.injections.clone();
-        ui_events = run.result.ui_events.iter().map(ui_emit).collect();
-        state_dirty = apply_hook_state(&mut hook_state, &run);
-        blackboard_dirty = merge_blackboard(&mut hook_board, &run.blackboard);
-        card_state = hook_state;
-        blackboard = hook_board;
+    let (run, before) = run_context_hook(loaded, proj, &character, meta.seed, history, sink);
+    let card_state = run.state.clone().unwrap_or_else(|| before.clone());
+    let mut blackboard = blackboard_of(proj);
+    if run.ran() {
+        event::apply_blackboard_sets(&mut blackboard, &run.blackboard);
+    }
+    if let Some(log) = log {
+        if let Some(body) = hook_effect(&run, &before, &character, turn, "hook.on_context", false) {
+            commit(log, root, meta, body)?;
+        }
     }
 
     let inputs = prompt::BuildInputs {
@@ -470,17 +811,15 @@ fn assemble_prompt(
         card: &loaded.card,
         card_state: &card_state,
         blackboard: &blackboard,
-        hook_injections: &hook_injections,
+        hook_injections: &run.result.injections,
         history,
         user_content,
     };
     Ok(PromptRun {
         assembly: prompt::build(&inputs),
         card_state,
-        state_dirty,
         blackboard,
-        blackboard_dirty,
-        ui_events,
+        ui_events: run.result.ui_events.iter().map(ui_emit).collect(),
     })
 }
 
@@ -495,61 +834,11 @@ fn ui_sink(app: &AppHandle) -> card::UiSink {
     })
 }
 
-/// hook 运行后的 state 回传到 `card_state`；返回是否真的变了
-fn apply_hook_state(card_state: &mut serde_json::Value, run: &card::HookRun) -> bool {
-    match &run.state {
-        Some(next) if next != card_state => {
-            *card_state = next.clone();
-            true
-        }
-        _ => false,
-    }
-}
-
 /// 卡片事件 → 流事件类型（字段一致，避免同一概念两处定义）
 fn ui_emit(event: &card::UiEvent) -> llm::UiEmit {
     llm::UiEmit {
         kind: event.kind.clone(),
         value: event.value.clone(),
-    }
-}
-
-/// 落盘 state / 黑板（调用方决定失败是中断还是仅记日志）
-fn persist_hook_state(
-    root: &std::path::Path,
-    session_id: &str,
-    state: Option<&serde_json::Value>,
-    blackboard: Option<&store::Blackboard>,
-) -> Result<(), String> {
-    if let Some(state) = state {
-        store::save_state(root, session_id, state).map_err(|e| e.to_string())?;
-    }
-    if let Some(bb) = blackboard {
-        store::save_blackboard(root, session_id, bb).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// `api.memory.set` 的写入落 palace.jsonl（设计 §12；读侧由记忆宫殿在 M2 提供）
-fn persist_memory(
-    root: &std::path::Path,
-    session_id: &str,
-    source: &str,
-    turn: u64,
-    sets: &[card::KvSet],
-) {
-    for kv in sets {
-        let rec = store::MemRecord {
-            kind: "fact".into(),
-            key: kv.key.clone(),
-            value: kv.value.clone(),
-            source: source.into(),
-            turn,
-            ts: store::unix_now(),
-        };
-        if let Err(e) = store::append_memory_record(root, session_id, &rec) {
-            eprintln!("[huajing] palace.jsonl 写入失败：{e}");
-        }
     }
 }
 
@@ -581,7 +870,7 @@ fn acquire_flag(flags: &CancelFlags, session_id: &str) -> Result<Arc<AtomicBool>
 }
 
 /// 流式生成的后半程（send_message 与 regenerate 共用）：
-/// 中断标记 → 流式补全 → 回复落盘 → 时钟步进 → 记录组装（记忆检查器）。
+/// 中断标记 → 流式补全 → 回复落盘 → 时钟步进 → on_message → 记录组装（记忆检查器）。
 #[allow(clippy::too_many_arguments)]
 async fn stream_reply(
     app: &AppHandle,
@@ -593,7 +882,7 @@ async fn stream_reply(
     assembly: prompt::PromptAssembly,
     on_event: &Channel<StreamEvent>,
     flags: &CancelFlags,
-    msg_log: &store::MessageLog,
+    log: &store::EventLog,
     assemblies: &LastAssemblies,
     // 用户消息那一步的钩子报告（回复落盘后另有一次，会一起回给前端）
     user_report: llm::HookReport,
@@ -631,27 +920,24 @@ async fn stream_reply(
             // 前端也能看到卡对用户输入的反应
             let mut report = Some(user_report);
             if !outcome.text.is_empty() {
-                let reply = Message {
+                // 回复落定后的收尾与单测共用同一份代码：回复事件 → 时钟步进 → on_message
+                match commit_reply(
+                    root,
+                    meta,
+                    loaded,
                     turn,
-                    role: "char".into(),
-                    content: outcome.text.clone(),
-                    ts: store::unix_now(),
-                    scene_id: None,
-                };
-                if let Err(e) = msg_log.append(root, session_id, &reply) {
-                    return Ok(StreamEvent::Error {
-                        message: format!("回复落盘失败：{e}"),
-                    });
+                    &outcome.text,
+                    Some(&ui_sink(app)),
+                    log,
+                ) {
+                    Ok(next) => {
+                        forward_ui_events(on_event, &next);
+                        report = Some(next);
+                    }
+                    Err(e) => {
+                        return Ok(StreamEvent::Error { message: e });
+                    }
                 }
-                // 一轮完成：黑板时钟步进（设计 M1：每轮 +10 分钟，跨日进位）
-                if let Ok(mut bb) = store::load_blackboard(root, session_id) {
-                    let (day, clock) = prompt::advance_clock(bb.day, &bb.clock);
-                    bb.day = day;
-                    bb.clock = clock;
-                    let _ = store::save_blackboard(root, session_id, &bb);
-                }
-                // M1.6：回复落盘后跑 on_message（设计 §3：每条新消息落地后调用）
-                report = Some(run_message_hook(app, root, meta, loaded, turn, Some(on_event)));
             }
             Ok(StreamEvent::Done {
                 full: outcome.text,
@@ -687,18 +973,6 @@ fn plan_regenerate(
     Ok((kept, prior, turn, content))
 }
 
-/// 这一轮的回复是否已经生成过：有同轮次的 char 消息即视为已生成。
-///
-/// 用途：用户消息的 `on_message` 只该在「这条消息首次进入生成流程」时跑一次——
-/// 生成失败后重试要补跑，而重roll/重新生成是同一条消息的重放，再跑就等于重复计分
-/// （好感度会被反复 +1）。
-///
-/// M2 的事件日志（设计 §7.3「可回放」）落地后，这里换成按事件流重放判定更彻底：
-/// 届时任何消息级操作（编辑/删除/回滚）都能得到一致的状态，而不再依赖这条启发式判据。
-fn turn_has_reply(history: &[Message], turn: u64) -> bool {
-    history.iter().any(|m| m.turn == turn && m.role == "char")
-}
-
 /// 跑一轮 `on_message`（用户消息与回复都已落盘后调用，设计 §3）。
 ///
 /// 卡片没定义该 hook 时直接返回 ran=false（不新建 Lua 实例）；其余情况：
@@ -712,9 +986,10 @@ fn run_message_hook(
     loaded: &card::LoadedCard,
     turn: u64,
     on_event: Option<&Channel<StreamEvent>>,
+    log: &store::EventLog,
 ) -> llm::HookReport {
     let sink = ui_sink(app);
-    let report = run_message_hook_core(root, meta, loaded, turn, Some(&sink));
+    let report = run_message_hook_core(root, meta, loaded, turn, Some(&sink), log);
     if let Some(channel) = on_event {
         for event in &report.ui_events {
             let _ = channel.send(StreamEvent::HookEvent {
@@ -727,7 +1002,7 @@ fn run_message_hook(
 }
 
 /// `on_message` 的完整流程（与 Tauri 无关，便于单测走同一份代码）：
-/// 探测 → 取最新消息 → 组装环境 → 沙箱执行 → 落盘 → 报告。
+/// 探测 → 取最新消息 → 投影出环境 → 沙箱执行 → 事件化落盘 → 报告。
 /// `sink` 为 None 时卡片推来的界面事件只进报告、不实时外推。
 fn run_message_hook_core(
     root: &std::path::Path,
@@ -735,6 +1010,7 @@ fn run_message_hook_core(
     loaded: &card::LoadedCard,
     turn: u64,
     sink: Option<&card::UiSink>,
+    log: &store::EventLog,
 ) -> llm::HookReport {
     if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_message") {
         // 诊断：这条最容易被误判成「钩子没生效」——其实是这张卡没写 on_message
@@ -752,7 +1028,7 @@ fn run_message_hook_core(
     }
     // 钩子看到的最新一条消息：用户消息或刚落盘的角色回复。
     // 每个提前返回都要留痕——静默返回正是「钩子看起来没生效」最难查的形态。
-    let messages = match store::read_messages(root, &meta.id) {
+    let messages = match log.messages(root, &meta.id) {
         Ok(m) => m,
         Err(e) => {
             let log = format!("历史读取失败：{e}");
@@ -760,49 +1036,42 @@ fn run_message_hook_core(
             return report_with_log(turn, log);
         }
     };
-    let Some(current) = messages.last() else {
+    let Some(current) = messages.last().cloned() else {
         crate::diag::record("hook", "on_message 中止：没有可处理的消息");
         return report_with_log(turn, "没有可处理的消息".into());
     };
-    let mut state = match load_card_state(root, meta, loaded) {
-        Ok(s) => s,
+    let proj = match project_session(log, root, meta) {
+        Ok(p) => p,
         Err(e) => {
-            crate::diag::record("hook", format!("on_message 中止：state 读取失败：{e}"));
+            crate::diag::record("hook", format!("on_message 中止：投影失败：{e}"));
             return report_with_log(turn, e);
         }
     };
-    let mut blackboard = match store::load_blackboard(root, &meta.id) {
-        Ok(bb) => bb,
-        Err(e) => {
-            let log = format!("黑板读取失败：{e}");
-            crate::diag::record("hook", format!("on_message 中止：{log}"));
-            return report_with_log(turn, log);
-        }
+    let character = match first_character(meta) {
+        Ok(c) => c,
+        Err(e) => return report_with_log(turn, e),
     };
 
     // 钩子入参现场：把卡实际收到的 msg 与 state 原样记下来（JSON）。
     // 「条件不成立」这类静默失败，只有看到入参本身才能定死原因。
+    let (run, before) = run_message_hook_at(
+        loaded,
+        &proj,
+        &character,
+        &current,
+        meta.seed,
+        sink.unwrap_or(&NOOP_SINK),
+    );
     crate::diag::record(
         "hook",
         format!(
             "on_message 入参：msg={} state={}",
-            serde_json::to_string(current).unwrap_or_default(),
-            state
+            serde_json::to_string(&current).unwrap_or_default(),
+            before
         ),
     );
 
-    let run = card::run_hook_full(
-        &loaded.source,
-        card::HookCall::OnMessage { msg: current },
-        &card::HookEnv {
-            state: state.clone(),
-            blackboard: blackboard_env(&blackboard),
-            memory: BTreeMap::new(), // 长期记忆读侧（记忆宫殿）在 M2
-        },
-        meta.seed,
-        sink.unwrap_or(&NOOP_SINK),
-    );
-    let report = apply_message_hook(root, &meta.id, turn, &run, &mut state, &mut blackboard);
+    let report = apply_message_hook(log, root, meta, turn, &run, &before);
     crate::diag::record(
         "hook",
         format!(
@@ -828,18 +1097,18 @@ fn report_with_log(turn: u64, log: String) -> llm::HookReport {
     }
 }
 
-/// 把一轮 `on_message` 的结果落盘：state → state.json、黑板 → blackboard.json、
-/// `api.memory` 写入 → palace.jsonl，并汇总成给前端的钩子报告。
+/// 把一轮 `on_message` 的结果事件化落盘：副作用 → effect 事件（state 顶层键补丁 +
+/// 黑板写入 + 记忆写入），派生文件（state.json / blackboard.json / palace.jsonl）由投影写出。
 ///
 /// 与 `run_message_hook` 分开，是为了让「钩子副作用真的落盘」这件事能被单测直接钉住
-/// （不必启动 Tauri 运行时）。
+/// （不必启动 Tauri 运行时）；也正因如此，编辑/删除历史时同一份代码能被重放调用。
 fn apply_message_hook(
+    log: &store::EventLog,
     root: &std::path::Path,
-    session_id: &str,
+    meta: &store::SessionMeta,
     turn: u64,
     run: &card::HookRun,
-    state: &mut serde_json::Value,
-    blackboard: &mut store::Blackboard,
+    before: &serde_json::Value,
 ) -> llm::HookReport {
     let mut report = llm::HookReport {
         turn,
@@ -847,27 +1116,79 @@ fn apply_message_hook(
         logs: run.result.logs.clone(),
         ui_events: run.result.ui_events.iter().map(ui_emit).collect(),
         memory: run.memory.clone(),
-        ..Default::default()
+        card_state: run.state.clone().unwrap_or_else(|| before.clone()),
     };
 
-    let state_changed = apply_hook_state(state, run);
-    let board_changed = merge_blackboard(blackboard, &run.blackboard);
-    if let Err(e) = persist_hook_state(
-        root,
-        session_id,
-        state_changed.then_some(&*state),
-        board_changed.then_some(&*blackboard),
-    ) {
-        report.logs.push(e);
+    let character = first_character(meta).unwrap_or_default();
+    if let Some(body) = hook_effect(run, before, &character, turn, "hook.on_message", false) {
+        if let Err(e) = commit(log, root, meta, body) {
+            report.logs.push(e);
+        }
     }
-    persist_memory(root, session_id, "hook.on_message", turn, &run.memory);
-    report.card_state = state.clone();
     report
+}
+
+/// 回复落定后的收尾（stream_reply 与单测共用同一份代码，避免两处等价逻辑）：
+/// 回复事件 → 时钟步进事件 → on_message 事件。
+///
+/// 事件化后时钟步进也是事件：重放同一轮必然得到同一时刻（设计 §7.3-5）。
+fn commit_reply(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    loaded: &card::LoadedCard,
+    turn: u64,
+    text: &str,
+    sink: Option<&card::UiSink>,
+    log: &store::EventLog,
+) -> Result<llm::HookReport, String> {
+    let reply = Message {
+        turn,
+        role: "char".into(),
+        content: text.to_string(),
+        ts: store::unix_now(),
+        scene_id: None,
+    };
+    log.append(root, &meta.id, LogBody::Message(reply))
+        .map_err(|e| format!("回复落盘失败：{e}"))?;
+
+    // 一轮完成：黑板时钟步进（设计 M1：每轮 +10 分钟，跨日进位）
+    let proj = project_session(log, root, meta)?;
+    let mut bb = blackboard_of(&proj);
+    let (day, clock) = prompt::advance_clock(bb.day, &bb.clock);
+    bb.day = day;
+    bb.clock = clock;
+    log.append(
+        root,
+        &meta.id,
+        LogBody::Blackboard(event::BlackboardEvent {
+            turn,
+            reason: "clock".into(),
+            board: bb,
+            ts: store::unix_now(),
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 回复落盘后跑 on_message（设计 §3：每条新消息落地后调用）
+    Ok(run_message_hook_core(root, meta, loaded, turn, sink, log))
+}
+
+/// 把钩子推来的界面事件转推前端（用户消息一步与回复一步共用）
+fn forward_ui_events(channel: &Channel<StreamEvent>, report: &llm::HookReport) {
+    for event in &report.ui_events {
+        let _ = channel.send(StreamEvent::HookEvent {
+            kind: event.kind.clone(),
+            value: event.value.clone(),
+        });
+    }
 }
 
 /// 发送一条用户消息并流式生成回复。
 /// 流事件经 `on_event` 通道推给前端（delta / done / error），
 /// 返回值即终态事件。用户消息先落盘；回复（含中断时的部分文本）生成后落盘。
+///
+/// 事件顺序（与重放顺序一致，见 rebuild_from）：
+/// on_context 事件 → 用户消息事件 → on_message 事件 → 回复事件 → 时钟步进事件 → on_message 事件。
 #[tauri::command]
 pub async fn send_message(
     app: AppHandle,
@@ -875,18 +1196,14 @@ pub async fn send_message(
     content: String,
     on_event: Channel<StreamEvent>,
     flags: State<'_, CancelFlags>,
-    msg_log: State<'_, store::MessageLog>,
+    log: State<'_, store::EventLog>,
     assemblies: State<'_, LastAssemblies>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
     // 会话与角色卡
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let character = meta
-        .characters
-        .first()
-        .cloned()
-        .ok_or_else(|| "会话未配置角色".to_string())?;
+    let character = first_character(&meta)?;
     let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
 
     // 接入点（chat 档；先校验再落盘用户消息，配置错误不产生半截会话）
@@ -896,30 +1213,34 @@ pub async fn send_message(
         "chat",
         format!(
             "send_message 会话={} 卡={}（{}，钩子={:?}）",
-            session_id, character, root.display(), loaded.hook_names
+            session_id,
+            character,
+            root.display(),
+            loaded.hook_names
         ),
     );
 
-    // 双槽位组装（设计 §4.1）：历史读取走增量缓存，高轮次只解析新增行
-    let history = msg_log
-        .read(&root, &session_id)
-        .map_err(|e| e.to_string())?;
+    // 双槽位组装（设计 §4.1）：历史来自事件流投影，高轮次只解析新增行
+    let proj = project_session(&log, &root, &meta)?;
+    let history = proj.messages.clone();
     let turn = history.last().map(|m| m.turn).unwrap_or(0) + 1;
-    // on_context 在此运行：卡片可能顺手改了 state/黑板/界面事件，先落盘再生成本轮
-    let run = assemble_prompt(&app, &root, &meta, &loaded, &history, Some(&content))?;
+    // on_context 在此运行并事件化落盘：卡片可能顺手改了 state/黑板/界面事件
+    let run = assemble_prompt_core(
+        &ui_sink(&app),
+        &root,
+        &meta,
+        &loaded,
+        &history,
+        &proj,
+        Some(&content),
+        turn,
+        Some(&log),
+    )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
             kind: event.kind.clone(),
             value: event.value.clone(),
         });
-    }
-    if run.state_dirty || run.blackboard_dirty {
-        persist_hook_state(
-            &root,
-            &session_id,
-            run.state_dirty.then_some(&run.card_state),
-            run.blackboard_dirty.then_some(&run.blackboard),
-        )?;
     }
 
     // 用户消息落盘后进入流式请求
@@ -930,22 +1251,12 @@ pub async fn send_message(
         ts: store::unix_now(),
         scene_id: None,
     };
-    msg_log
-        .append(&root, &session_id, &user_msg)
+    log.append(&root, &session_id, LogBody::Message(user_msg))
         .map_err(|e| e.to_string())?;
 
     // 设计 §3：`on_message` 在**每条**新消息落地后调用——用户消息同样要跑，
     // 否则卡看不到本轮输入，且它的反应（比如好感度 +1）来不及影响这一轮的生成。
-    // 这一条是新消息（同轮次不可能已有回复），但保留判据以便与 regenerate 用同一套语义。
-    let report = if turn_has_reply(&history, turn) {
-        crate::diag::record("hook", format!("用户消息钩子跳过：第 {turn} 轮已生成过回复"));
-        llm::HookReport {
-            turn,
-            ..Default::default()
-        }
-    } else {
-        run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event))
-    };
+    let report = run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event), &log);
 
     stream_reply(
         &app,
@@ -957,11 +1268,33 @@ pub async fn send_message(
         run.assembly,
         &on_event,
         &flags,
-        &msg_log,
+        &log,
         &assemblies,
         report,
     )
     .await
+}
+
+/// 重roll 的截断（regenerate 与单测共用）：丢掉 turn 起的**派生事件**，
+/// 必要时连同末尾那条角色回复一起移除。剩下的记录就是「这一轮还没开始」的状态。
+///
+/// 手动事件（手改黑板、手动开收线）不是派生结果，照旧保留。
+fn truncate_turn(records: &[LogRecord], turn: u64, drop_reply: bool) -> Vec<LogRecord> {
+    let mut kept: Vec<LogRecord> = records
+        .iter()
+        .filter(|r| r.turn() < turn || !r.is_derived())
+        .cloned()
+        .collect();
+    if drop_reply {
+        if let Some(pos) = kept.iter().rposition(|r| {
+            r.as_message()
+                .map(|m| m.turn == turn && m.role == "char")
+                .unwrap_or(false)
+        }) {
+            kept.remove(pos);
+        }
+    }
+    kept
 }
 
 /// 重roll（设计 §4 消息级操作）：移除末尾角色回复，以最后一条用户消息
@@ -972,66 +1305,54 @@ pub async fn regenerate(
     session_id: String,
     on_event: Channel<StreamEvent>,
     flags: State<'_, CancelFlags>,
-    msg_log: State<'_, store::MessageLog>,
+    log: State<'_, store::EventLog>,
     assemblies: State<'_, LastAssemblies>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let character = meta
-        .characters
-        .first()
-        .cloned()
-        .ok_or_else(|| "会话未配置角色".to_string())?;
+    let character = first_character(&meta)?;
     let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
     let provider = pick_chat_provider(&root)?;
 
-    let all = msg_log
-        .read(&root, &session_id)
-        .map_err(|e| e.to_string())?
-        .as_slice()
-        .to_vec();
-    let (rewritten, prior, turn, content) = match plan_regenerate(&all) {
+    let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
+    let all = event::messages(&records);
+    let (rewritten, _prior, turn, content) = match plan_regenerate(&all) {
         Ok(plan) => plan,
         Err(message) => return Ok(StreamEvent::Error { message }),
     };
 
-    // 先移除末尾回复（文件与缓存同步），再组装生成
-    store::write_messages(&root, &session_id, &rewritten).map_err(|e| e.to_string())?;
-    msg_log.invalidate(Some(&session_id));
+    // 截断本轮：丢掉 turn 起的**派生事件**（上一次的 on_context / on_message / 时钟步进），
+    // 并按 plan 移除末尾回复。它们随后由正常流程重新产生——**「重roll 不重复计分」
+    // 由此从启发式判据变成结构性保证**：旧效果已经不在流里了。
+    // 手动事件（手改黑板、手动开收线）不是派生结果，照旧保留。
+    let kept = truncate_turn(&records, turn, rewritten.len() < all.len());
+    log.rewrite(&root, &session_id, &kept)
+        .map_err(|e| e.to_string())?;
+    sync_now(&log, &root, &meta)?;
 
     // 重roll 前先让 on_context 按当前（已删掉末尾回复的）历史跑一轮
-    let run = assemble_prompt(&app, &root, &meta, &loaded, &prior, Some(&content))?;
+    let proj = project_session(&log, &root, &meta)?;
+    let history = &proj.messages[..proj.messages.len().saturating_sub(1)]; // 组装历史不含本轮用户消息
+    let run = assemble_prompt_core(
+        &ui_sink(&app),
+        &root,
+        &meta,
+        &loaded,
+        history,
+        &proj,
+        Some(&content),
+        turn,
+        Some(&log),
+    )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
             kind: event.kind.clone(),
             value: event.value.clone(),
         });
     }
-    if run.state_dirty || run.blackboard_dirty {
-        persist_hook_state(
-            &root,
-            &session_id,
-            run.state_dirty.then_some(&run.card_state),
-            run.blackboard_dirty.then_some(&run.blackboard),
-        )?;
-    }
-    // 这一轮的用户消息是否已被钩子处理过：
-    // - 重roll（末尾本来就有回复）→ 不重复跑，否则每次重roll 都把好感度 +1（同一句话被反复计分）
-    // - 生成失败后重试（末尾没有回复）→ 补跑，此时用户消息还没被卡「看过」
-    let already = turn_has_reply(&all, turn);
-    let report = if already {
-        crate::diag::record(
-            "hook",
-            format!("用户消息钩子跳过：第 {turn} 轮是重roll 重放，不重复计分"),
-        );
-        llm::HookReport {
-            turn,
-            ..Default::default()
-        }
-    } else {
-        run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event))
-    };
+    // 上一轮的 on_message 效果已随截断消失，这里补跑：**恰好一次**，不是重复计分
+    let report = run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event), &log);
     stream_reply(
         &app,
         &root,
@@ -1042,7 +1363,7 @@ pub async fn regenerate(
         run.assembly,
         &on_event,
         &flags,
-        &msg_log,
+        &log,
         &assemblies,
         report,
     )
@@ -1072,7 +1393,8 @@ pub fn get_blackboard(session_id: String) -> Result<store::Blackboard, String> {
     store::load_blackboard(&root(), &session_id).map_err(|e| e.to_string())
 }
 
-/// 手动编辑黑板（全量替换；保存后下一轮组装生效）
+/// 手动编辑黑板（全量替换；保存后下一轮组装生效）。
+/// 手改进事件流（reason=manual）——它不是派生结果，重放历史时不会被抹掉。
 #[tauri::command]
 pub fn update_blackboard(
     session_id: String,
@@ -1080,48 +1402,64 @@ pub fn update_blackboard(
     clock: String,
     place: String,
     actors: Vec<String>,
+    log: State<'_, store::EventLog>,
 ) -> Result<store::Blackboard, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
     let bb = store::Blackboard {
         day,
         clock: clock.trim().to_string(),
         place: place.trim().to_string(),
         actors: actors.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
     };
-    store::save_blackboard(&root(), &session_id, &bb).map_err(|e| e.to_string())?;
-    Ok(bb)
+    let turn = project_session(&log, &root, &meta)?
+        .last_message()
+        .map(|m| m.turn)
+        .unwrap_or(0);
+    let proj = commit(
+        &log,
+        &root,
+        &meta,
+        LogBody::Blackboard(event::BlackboardEvent {
+            turn,
+            reason: "manual".into(),
+            board: bb.clone(),
+            ts: store::unix_now(),
+        }),
+    )?;
+    Ok(proj.blackboard.unwrap_or(bb))
 }
 
 // ---------- 记忆检查器 v0（设计 §4.2：组装结果逐层可见）----------
 
-/// 预览组装：按当前状态干跑一轮（不含用户消息），不发送
+/// 预览组装：按当前状态干跑一轮（不含用户消息），不发送。
+///
+/// **干跑不落盘**（M2.0 起）：预览不再记事件、也不再改 state/黑板。
+/// M1 让预览也落盘，是为了避免「预览一次状态变了、正式发送又变一次」的漂移；
+/// 事件化之后正式发送自己会跑一次并留下事件，预览再落盘反而是多算一次。
 #[tauri::command]
 pub fn preview_prompt(
     app: AppHandle,
     session_id: String,
-    msg_log: State<'_, store::MessageLog>,
+    log: State<'_, store::EventLog>,
 ) -> Result<prompt::PromptAssembly, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let character = meta
-        .characters
-        .first()
-        .cloned()
-        .ok_or_else(|| "会话未配置角色".to_string())?;
-    let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
-    let history = msg_log
-        .read(&root, &session_id)
-        .map_err(|e| e.to_string())?;
-    let run = assemble_prompt(&app, &root, &meta, &loaded, &history, None)?;
-    // 预览也落盘：on_context 允许改状态（与是否真的发送无关），不落盘会出现
-    // 「预览一次状态变了、正式发送又变一次」的漂移
-    if run.state_dirty || run.blackboard_dirty {
-        persist_hook_state(
-            &root,
-            &session_id,
-            run.state_dirty.then_some(&run.card_state),
-            run.blackboard_dirty.then_some(&run.blackboard),
-        )?;
-    }
+    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    let history = proj.messages.clone();
+    let turn = history.last().map(|m| m.turn).unwrap_or(0) + 1;
+    let run = assemble_prompt_core(
+        &ui_sink(&app),
+        &root,
+        &meta,
+        &loaded,
+        &history,
+        &proj,
+        None,
+        turn,
+        None, // 干跑：不记事件、不落盘
+    )?;
     Ok(run.assembly)
 }
 
@@ -1132,12 +1470,7 @@ pub fn preview_prompt(
 pub fn get_card_state(session_id: String) -> Result<serde_json::Value, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let character = meta
-        .characters
-        .first()
-        .cloned()
-        .ok_or_else(|| "会话未配置角色".to_string())?;
-    let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
+    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
     load_card_state(&root, &meta, &loaded)
 }
 
@@ -1186,8 +1519,67 @@ return {
 }
 "#;
 
-    /// 建一个临时 DataHub + 会话（表驱动：单测不碰真实用户数据）
+    fn noop_sink() -> card::UiSink {
+        std::sync::Arc::new(|_: &card::UiEvent| {})
+    }
+
+    /// 建一个临时 DataHub + 会话（表驱动：单测不碰真实用户数据）。
+    /// 顺序与 new_session 命令一致：init 黑板事件（genesis）→ 开场白 → on_load。
     fn setup(card_src: &str) -> (tempfile::TempDir, store::SessionMeta, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        store::ensure_layout(&root).unwrap();
+        let card_dir = root.join("characters/小雨");
+        std::fs::create_dir_all(&card_dir).unwrap();
+        std::fs::write(card_dir.join("card.lua"), card_src).unwrap();
+        let meta = store::new_session(
+            &root,
+            &store::NewSessionRequest {
+                character: "小雨".into(),
+                persona: None,
+                day: Some(1),
+                clock: Some("20:00".into()),
+                place: Some("自习区".into()),
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = store::EventLog::new();
+        let board = store::load_blackboard(&root, &meta.id).unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 0,
+                reason: "init".into(),
+                board,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let first = loaded.card.first_mes.trim().to_string();
+        if !first.is_empty() {
+            log.append(
+                &root,
+                &meta.id,
+                LogBody::Message(Message {
+                    turn: 0,
+                    role: "char".into(),
+                    content: first,
+                    ts: store::unix_now(),
+                    scene_id: None,
+                }),
+            )
+            .unwrap();
+        }
+        run_load_hook_core(&root, &meta, &loaded, &log, "hook.on_load", &noop_sink()).unwrap();
+        (dir, meta, root)
+    }
+
+    /// 造一个 **M1 形态**的会话：只建目录与元数据，不写 init 事件、不跑 on_load——
+    /// 状态只存在于派生文件里（老会话升级重放的测试用）。
+    fn setup_legacy(card_src: &str) -> (tempfile::TempDir, store::SessionMeta, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         store::ensure_layout(&root).unwrap();
@@ -1219,42 +1611,39 @@ return {
         }
     }
 
-    /// 一轮完整生成：on_context 组装（含 hook）→ 用户消息落盘 → 回复落盘 → on_message
+    fn stored_state(root: &std::path::Path, meta: &store::SessionMeta) -> serde_json::Value {
+        store::load_state(root, &meta.id).unwrap()
+    }
+
+    /// 一轮完整生成：**与生产共用同一份内核**（assemble_prompt_core / run_message_hook_core /
+    /// commit_reply），只把界面事件回调换成空实现。此前单测另写了一份等价逻辑，
+    /// 于是生产漏掉「用户消息那一步」时测试仍然绿——这个坑不再重犯。
     fn simulate_turn(
         root: &std::path::Path,
         meta: &store::SessionMeta,
         loaded: &card::LoadedCard,
-        log: &store::MessageLog,
+        log: &store::EventLog,
         turn: u64,
         content: &str,
-) -> (prompt::PromptAssembly, llm::HookReport) {
-        let history = log.read(root, &meta.id).unwrap();
-        let run = assemble_prompt_for(root, meta, loaded, &history, Some(content));
-        if run.state_dirty || run.blackboard_dirty {
-            persist_hook_state(
-                root,
-                &meta.id,
-                run.state_dirty.then_some(&run.card_state),
-                run.blackboard_dirty.then_some(&run.blackboard),
-            )
-            .unwrap();
-        }
-        // 与生产一致：用户消息落盘后跑一次，回复落盘后再跑一次
-        log.append(root, &meta.id, &user_msg(turn, content)).unwrap();
-        let after_user = run_message_hook_offline(root, meta, loaded, turn);
-        log.append(
+    ) -> (prompt::PromptAssembly, llm::HookReport) {
+        let proj = project_session(log, root, meta).unwrap();
+        let history = proj.messages.clone();
+        let run = assemble_prompt_core(
+            &noop_sink(),
             root,
-            &meta.id,
-            &Message {
-                turn,
-                role: "char".into(),
-                content: "（回复）".into(),
-                ts: store::unix_now(),
-                scene_id: None,
-            },
+            meta,
+            loaded,
+            &history,
+            &proj,
+            Some(content),
+            turn,
+            Some(log),
         )
         .unwrap();
-        let after_reply = run_message_hook_offline(root, meta, loaded, turn);
+        log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
+            .unwrap();
+        let after_user = run_message_hook_core(root, meta, loaded, turn, None, log);
+        let after_reply = commit_reply(root, meta, loaded, turn, "（回复）", None, log).unwrap();
 
         // 报告取「本轮最后一次」（回复后的状态就是前端看到的最终状态）
         let mut report = after_reply;
@@ -1263,119 +1652,17 @@ return {
         (run.assembly, report)
     }
 
-    /// 与 assemble_prompt 同逻辑但不带 AppHandle（单测不启动 Tauri）
-    fn assemble_prompt_for(
-        root: &std::path::Path,
-        meta: &store::SessionMeta,
-        loaded: &card::LoadedCard,
-        history: &[Message],
-        user_content: Option<&str>,
-    ) -> PromptRun {
-        let mut card_state = load_card_state(root, meta, loaded).unwrap();
-        let mut blackboard = store::load_blackboard(root, &meta.id).unwrap();
-        let start = history.len().saturating_sub(prompt::WINDOW_MESSAGES);
-        let mut hook_injections = Vec::new();
-        let mut state_dirty = false;
-        let mut blackboard_dirty = false;
-        let mut ui_events = Vec::new();
-        if !loaded.degraded && loaded.hook_names.iter().any(|h| h == "on_context") {
-            let run = card::run_hook_full(
-                &loaded.source,
-                card::HookCall::OnContext { window: &history[start..] },
-                &card::HookEnv {
-                    state: card_state.clone(),
-                    blackboard: blackboard_env(&blackboard),
-                    memory: BTreeMap::new(),
-                },
-                meta.seed,
-                &noop_sink(),
-            );
-            hook_injections = run.result.injections.clone();
-            ui_events = run.result.ui_events.iter().map(ui_emit).collect();
-            state_dirty = apply_hook_state(&mut card_state, &run);
-            blackboard_dirty = merge_blackboard(&mut blackboard, &run.blackboard);
-        }
-        let settings = store::load_settings(root).unwrap();
-        let inputs = prompt::BuildInputs {
-            settings: &settings,
-            persona: None,
-            card: &loaded.card,
-            card_state: &card_state,
-            blackboard: &blackboard,
-            hook_injections: &hook_injections,
-            history,
-            user_content,
-        };
-        PromptRun {
-            assembly: prompt::build(&inputs),
-            card_state,
-            state_dirty,
-            blackboard,
-            blackboard_dirty,
-            ui_events,
-        }
-    }
-
-    fn noop_sink() -> card::UiSink {
-        std::sync::Arc::new(|_: &card::UiEvent| {})
-    }
-
-    /// 走生产同一份内核（run_message_hook_core），只把界面事件回调换成空实现——
-    /// 此前这里另写了一份等价逻辑，于是生产漏掉「用户消息那一步」时测试仍然绿。
-    fn run_message_hook_offline(
-        root: &std::path::Path,
-        meta: &store::SessionMeta,
-        loaded: &card::LoadedCard,
-        turn: u64,
-    ) -> llm::HookReport {
-        run_message_hook_core(root, meta, loaded, turn, None)
-    }
-
-    #[test]
-    fn reroll_does_not_rescore_the_same_user_message() {
-        // 重roll = 重放同一轮：用户消息的钩子不能再跑一次，否则好感度会随点击次数无限增长
-        let user = |turn| Message {
-            turn,
-            role: "user".into(),
-            content: "谢谢".into(),
-            ts: 0,
-            scene_id: None,
-        };
-        let reply = |turn| Message {
-            turn,
-            role: "char".into(),
-            content: "……不用谢。".into(),
-            ts: 0,
-            scene_id: None,
-        };
-
-        // 首次：这一轮还没有回复 → 钩子该跑
-        let first = vec![user(1)];
-        assert!(!turn_has_reply(&first, 1));
-        // 重roll：同轮已有回复 → 钩子不该再跑（判据基于入参，注：regenerate 传入的是重roll 前的历史）
-        let before_reroll = vec![user(1), reply(1)];
-        assert!(turn_has_reply(&before_reroll, 1));
-        // 生成失败后重试：错误轮次没有回复 → 该补跑
-        let failed = vec![reply(0), user(2)];
-        assert!(!turn_has_reply(&failed, 2));
-        // 别轮的回复不算本轮已生成
-        assert!(!turn_has_reply(&[reply(0), user(1)], 1));
-    }
-
     #[test]
     fn hooks_persist_state_memory_and_blackboard() {
-        // 对应 M1.6 验收：好感度随对话变化、写入落盘、重启后仍读得到
+        // 对应 M1.6 验收：好感度随对话变化、写入落盘、重启后读得到
         let (_dir, meta, root) = setup(HOOK_CARD);
         let loaded = card::load_card(&root, "小雨").unwrap();
         assert_eq!(loaded.hook_names.len(), 3, "示例卡应带三个 hook");
-        let log = store::MessageLog::new();
+        let log = store::EventLog::new();
 
         // 回归：钩子必须在**用户消息**落盘后就跑（设计 §3「每条新消息落地后」）——
-        // 此前只有回复落盘后跑一次，于是卡看不到用户输入、它的反应也来不及影响本轮生成；
-        // 更糟的是单测自己模拟了两步，把生产代码漏掉的那半步掩盖了。
+        // 此前只有回复落盘后跑一次，于是卡看不到用户输入、它的反应也来不及影响本轮生成。
         // 诊断留痕是当时唯一能看见这件事的地方，故在此也断言它。
-        let before_diag = crate::diag::recent(200).len();
-        let _ = before_diag;
         let (assembly, report) = simulate_turn(&root, &meta, &loaded, &log, 1, "今天好冷。");
         let traces: Vec<String> = crate::diag::recent(10).iter().map(|d| d.detail.clone()).collect();
         assert!(
@@ -1400,14 +1687,12 @@ return {
         assert_eq!(report.card_state["favorability"], 50, "没道谢就不涨");
         assert!(store::read_memory_records(&root, &meta.id).unwrap().is_empty());
 
-        // 第二轮：说「谢谢」→ 好感度 +1，state.json 与 palace.jsonl 都落盘
+        // 第二轮：说「谢谢」→ 好感度 +1，state.json 与 palace.jsonl 都由投影写出
         let (_, report) = simulate_turn(&root, &meta, &loaded, &log, 2, "谢谢你。");
         assert_eq!(report.card_state["favorability"], 51);
         assert_eq!(report.memory.len(), 1);
         assert_eq!(report.memory[0].key, "last_thanked");
-        // 落盘：直接读文件（重启 App 等价于这一步）
-        let state = store::load_state(&root, &meta.id).unwrap();
-        assert_eq!(state["favorability"], 51, "state.json 应记住好感度");
+        assert_eq!(stored_state(&root, &meta)["favorability"], 51, "state.json 应记住好感度");
         let records = store::read_memory_records(&root, &meta.id).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].value, serde_json::json!(2));
@@ -1424,6 +1709,215 @@ return {
             .any(|l| l.id == "B5" && l.content.contains("好感度 51")),
             "本轮注入用的应是上一轮存下的值");
         assert_eq!(store::read_memory_records(&root, &meta.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn editing_a_message_rolls_the_hook_state_back() {
+        // M1 的同源遗留（docs/plan/m1.md）：编辑历史消息不会回滚钩子对 state 的改动。
+        // 事件日志落地后这条必须成立——改掉那句「谢谢」，好感度跟着退回去。
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "今天好冷。");
+        simulate_turn(&root, &meta, &loaded, &log, 2, "谢谢你。");
+        assert_eq!(stored_state(&root, &meta)["favorability"], 51);
+        assert_eq!(store::read_memory_records(&root, &meta.id).unwrap().len(), 1);
+
+        // 消息视图：[0] 开场 · [1] user1 · [2] char1 · [3] user2 · [4] char2
+        let records = log.read(&root, &meta.id).unwrap();
+        let (pos, turn) = locate_message(&records, 3).expect("第 3 条消息");
+        assert_eq!((turn, records[pos].as_message().unwrap().role.as_str()), (2, "user"));
+
+        let mut edited = records.as_ref().clone();
+        if let LogBody::Message(m) = &mut edited[pos].body {
+            m.content = "今天也是。".into(); // 不再道谢
+        }
+        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn).unwrap();
+        log.rewrite(&root, &meta.id, &rebuilt).unwrap();
+        sync_now(&log, &root, &meta).unwrap();
+
+        assert_eq!(
+            stored_state(&root, &meta)["favorability"],
+            50,
+            "改掉「谢谢」后好感度必须退回"
+        );
+        assert!(
+            store::read_memory_records(&root, &meta.id).unwrap().is_empty(),
+            "那条记忆也应随重放消失"
+        );
+        // 回复本身没被删（编辑的是用户消息），消息视图只少了内容变化
+        assert_eq!(event::messages(&rebuilt).len(), 5);
+        assert_eq!(event::messages(&rebuilt)[3].content, "今天也是。");
+    }
+
+    #[test]
+    fn deleting_a_message_rolls_its_effects_back() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+        assert_eq!(stored_state(&root, &meta)["favorability"], 51);
+
+        // 删掉那条用户消息：这一轮的钩子效果必须一并消失
+        let records = log.read(&root, &meta.id).unwrap();
+        let (pos, turn) = locate_message(&records, 1).unwrap();
+        assert_eq!(turn, 1);
+        let mut edited = records.as_ref().clone();
+        edited.remove(pos);
+        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn).unwrap();
+        log.rewrite(&root, &meta.id, &rebuilt).unwrap();
+        sync_now(&log, &root, &meta).unwrap();
+
+        assert_eq!(event::messages(&rebuilt).len(), 2, "开场白 + 角色回复");
+        assert_eq!(stored_state(&root, &meta)["favorability"], 50);
+        assert!(store::read_memory_records(&root, &meta.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reroll_reapplies_the_turn_exactly_once() {
+        // 重roll 曾经因为「用户消息的钩子被重放」而把好感度反复 +1（M1 真机 bug）。
+        // 事件化后截断是结构性的：旧的派生事件先被丢掉，再恰好重跑一次。
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+        assert_eq!(stored_state(&root, &meta)["favorability"], 51);
+
+        // 截断（regenerate 命令与这里调的是同一个函数）
+        let records = log.read(&root, &meta.id).unwrap();
+        let all = event::messages(&records);
+        let (rewritten, _prior, turn, content) = plan_regenerate(&all).unwrap();
+        let kept = truncate_turn(&records, turn, rewritten.len() < all.len());
+        log.rewrite(&root, &meta.id, &kept).unwrap();
+        sync_now(&log, &root, &meta).unwrap();
+        assert_eq!(
+            stored_state(&root, &meta)["favorability"],
+            50,
+            "截断后回到本轮之前"
+        );
+
+        // 重放本轮：on_context → on_message → 回复
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let history = &proj.messages[..proj.messages.len().saturating_sub(1)];
+        assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &loaded,
+            history,
+            &proj,
+            Some(&content),
+            turn,
+            Some(&log),
+        )
+        .unwrap();
+        run_message_hook_core(&root, &meta, &loaded, turn, None, &log);
+        commit_reply(&root, &meta, &loaded, turn, "（重roll 的回复）", None, &log).unwrap();
+
+        assert_eq!(
+            stored_state(&root, &meta)["favorability"],
+            51,
+            "重roll 之后仍是 51：恰好计一次分"
+        );
+        assert_eq!(store::read_memory_records(&root, &meta.id).unwrap().len(), 1);
+        assert_eq!(event::messages(&log.read(&root, &meta.id).unwrap()).len(), 3);
+    }
+
+    #[test]
+    fn replay_of_the_same_event_stream_is_identical() {
+        // 设计 §7.3-5：同一事件流重放必然得到同一状态
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+        simulate_turn(&root, &meta, &loaded, &log, 2, "今天好冷。");
+        let records = log.read(&root, &meta.id).unwrap();
+
+        let a = project(&records, &root, &meta);
+        let b = project(&records, &root, &meta);
+        assert_eq!(a.messages, b.messages);
+        assert_eq!(a.states, b.states);
+        assert_eq!(a.blackboard, b.blackboard);
+        assert_eq!(a.memory, b.memory);
+        assert_eq!(a.transitions, b.transitions);
+
+        // 再重放一遍整段历史（等价于消息级操作后的重建）：状态逐字相同
+        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
+        let c = event::project_over(&rebuilt, &event::Base::default());
+        assert_eq!(c.states, a.states, "重放得到同一份 state");
+        assert_eq!(c.blackboard, a.blackboard, "重放得到同一块黑板");
+        assert_eq!(c.memory, a.memory, "重放得到同一条记忆流");
+        assert_eq!(
+            event::messages(&rebuilt),
+            a.messages,
+            "消息一个字都不该变"
+        );
+    }
+
+    #[test]
+    fn legacy_session_without_genesis_is_upgraded_on_rebuild() {
+        // M1 老会话：messages.jsonl 只有消息行、state.json 是快照、没有 init 事件
+        let (_dir, meta, root) = setup_legacy(HOOK_CARD);
+        let log = store::EventLog::new();
+        // 手工造出 M1 形态：一条用户消息 + 一份「已经被 +1 过」的快照
+        log.append(&root, &meta.id, LogBody::Message(user_msg(1, "谢谢你。")))
+            .unwrap();
+        store::save_state(&root, &meta.id, &serde_json::json!({"favorability": 51})).unwrap();
+        let records = log.read(&root, &meta.id).unwrap();
+        assert!(!event::has_genesis(&records));
+        assert_eq!(
+            project(&records, &root, &meta).state_of("小雨").unwrap()["favorability"],
+            51,
+            "老会话以派生文件为基线"
+        );
+
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
+        assert!(event::has_genesis(&rebuilt), "重建后应补上 init 事件");
+        log.rewrite(&root, &meta.id, &rebuilt).unwrap();
+        sync_now(&log, &root, &meta).unwrap();
+
+        // 从头重放：on_load 建立 50 → 「谢谢你」+1 = 51，与 M1 快照一致（重放可靠）
+        assert_eq!(stored_state(&root, &meta)["favorability"], 51);
+        // 此后再编辑历史就能精确回滚（见 editing_a_message_rolls_the_hook_state_back）
+        let mut edited = rebuilt.clone();
+        let (pos, turn) = locate_message(&edited, 0).expect("唯一那条用户消息");
+        assert_eq!(turn, 1);
+        if let LogBody::Message(m) = &mut edited[pos].body {
+            m.content = "算了。".into();
+        }
+        let again = rebuild_from(&log, &root, &meta, &loaded, &edited, turn).unwrap();
+        log.rewrite(&root, &meta.id, &again).unwrap();
+        sync_now(&log, &root, &meta).unwrap();
+        assert_eq!(stored_state(&root, &meta)["favorability"], 50);
+    }
+
+    #[test]
+    fn preview_is_a_dry_run_and_leaves_the_log_untouched() {
+        // 预览干跑：不记事件、不改 state/黑板（M2.0 起；M1 的预览会落盘）
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+        let before = log.read(&root, &meta.id).unwrap().len();
+        let state_before = stored_state(&root, &meta);
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &loaded,
+            &proj.messages.clone(),
+            &proj,
+            None,
+            2,
+            None,
+        )
+        .unwrap();
+        assert!(!run.assembly.layers.is_empty());
+        assert_eq!(log.read(&root, &meta.id).unwrap().len(), before, "预览不写事件");
+        assert_eq!(stored_state(&root, &meta), state_before, "预览不改状态");
     }
 
     #[test]
@@ -1467,54 +1961,42 @@ return {
         let plain = "return { spec='charcard/1.0', name='静卡', scenario='s', personality='p', first_mes='f' }";
         let (_dir, meta, root) = setup(plain);
         let loaded = card::load_card(&root, "小雨").unwrap();
-        let log = store::MessageLog::new();
+        let log = store::EventLog::new();
         let (assembly, report) = simulate_turn(&root, &meta, &loaded, &log, 1, "你好");
         assert!(!report.ran);
         // 没有 on_context：B5 层不该出现（空层省略）
         assert!(!assembly.layers.iter().any(|l| l.id == "B5"));
         // 也不该写 state/palace
-        assert_eq!(store::load_state(&root, &meta.id).unwrap(), serde_json::json!({}));
+        assert_eq!(stored_state(&root, &meta), serde_json::json!({}));
         assert!(store::read_memory_records(&root, &meta.id).unwrap().is_empty());
+        // 静卡不产生 effect 事件（事件流只留真发生的事）
+        let records = log.read(&root, &meta.id).unwrap();
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(&r.body, LogBody::Effect(e) if e.trigger != "hook.on_load")),
+            "静卡不该产生钩子副作用事件"
+        );
     }
 
     #[test]
     fn on_load_initialises_state_from_card_defaults() {
         let (_dir, meta, root) = setup(HOOK_CARD);
         let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
         // 会话初始 state.json 是空对象：卡上默认值尚未落到会话（这正是 on_load 的职责）
         let initial = load_card_state(&root, &meta, &loaded).unwrap();
         assert_eq!(initial, serde_json::json!({ "favorability": 50 }), "空快照降级用卡上默认值");
-        assert_eq!(store::load_state(&root, &meta.id).unwrap(), serde_json::json!({}));
 
-        // 生产路径：new_session 用 load_card_state 的初值喂 on_load，再落盘
-        let run = card::run_hook_full(
-            &loaded.source,
-            card::HookCall::OnLoad,
-            &card::HookEnv {
-                state: initial.clone(),
-                ..Default::default()
-            },
-            meta.seed,
-            &noop_sink(),
-        );
-        assert!(run.ran());
-        assert_eq!(run.result.ui_events[0].value, "calm");
-        let mut state = initial;
-        let mut blackboard = store::load_blackboard(&root, &meta.id).unwrap();
-        let report = apply_load_hook(
-            &root,
-            &meta.id,
-            "hook.on_load",
-            &run,
-            &mut state,
-            &mut blackboard,
-        )
-        .unwrap();
+        // 生产路径（run_load_hook_core 是会话语料的同一份内核）：入席必写基线
+        let report = run_load_hook_core(&root, &meta, &loaded, &log, "hook.on_load", &noop_sink()).unwrap();
+        assert!(report.ran);
         assert_eq!(report.card_state["favorability"], 50);
-        // 入席必写基线：即使 hook 没改状态，state.json 也要就位
-        assert_eq!(
-            store::load_state(&root, &meta.id).unwrap()["favorability"],
-            50
-        );
+        assert_eq!(report.ui_events[0].value, "calm");
+        assert_eq!(stored_state(&root, &meta)["favorability"], 50);
+        // 基线进了事件流：即使 state.json 被删，投影也能算出同一份状态
+        let records = log.read(&root, &meta.id).unwrap();
+        let proj = event::project_over(&records, &event::Base::default());
+        assert_eq!(proj.state_of("小雨").unwrap()["favorability"], 50);
     }
 }

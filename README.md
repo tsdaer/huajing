@@ -48,6 +48,7 @@ src/                  # Vue 前端
   views/              # 概览 · 会话 · 主题 · 设置
 src-tauri/src/        # Rust 核心
   card.rs             # 角色卡与 Lua 沙箱、hooks 运行时（设计 §3）
+  event.rs            # 事件日志：类型化事件流、投影与重放（M2.0 · 设计 §7.3）
   prompt.rs           # Prompt Builder 双槽位组装（设计 §4）
   llm.rs              # OpenAI 兼容 SSE 客户端（设计 §11）
   store.rs            # DataHub 明文数据层（设计 §12）
@@ -79,8 +80,14 @@ docs/
 
 **M1 能聊完成**（`0.1.0`，2026-09-19）：1v1 流式对话 · Lua 沙箱与基础 hooks（state/memory 落盘、
 `api.ui.emit` 到界面）· 黑板 v0 与场景快照 · 热加载 · SillyTavern 卡导入 · 首启向导 · NSIS/MSI 安装包。
-74 例 Rust 单测 + `pnpm build` 双绿。下一步 M2（记忆宫殿 / 状态树 / 设定集 / 剧情线 / 心理运行时），
-计划在 `docs/plan/m2.md` 编写。
+
+**M2 进行中**（`0.2.x`，执行计划 [docs/plan/m2.md](docs/plan/m2.md)）：
+
+- **M2.0 事件日志与投影已完成**——`messages.jsonl` 升级为类型化事件流（消息 / 钩子副作用 / 黑板 /
+  转移 / 剧情线 / 设定），state、黑板、宫殿一律由事件流**投影**写出；编辑或删除历史消息会重放重算，
+  M1 遗留的「改历史不回滚状态」就此关闭，重roll 不重复计分也变成结构性保证。
+  老会话首次消息级操作时自动升级为事件溯源（从头重放并补上 init 事件），无需手动迁移。
+- 待办：记忆宫殿 alpha · 设定集 v1 · 状态树 v1 · 剧情线 v0 · 心理运行时 v0 · 双槽位预算 · 记忆检查器升级。
 
 ## 路线图
 
