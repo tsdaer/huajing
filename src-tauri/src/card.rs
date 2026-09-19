@@ -966,6 +966,7 @@ return {
         assert!(!a.ui_events.is_empty());
     }
 
+
     #[test]
     fn edited_card_file_takes_effect_without_restart() {
         // M1.7 验收：改 first_mes 保存后，下一次读取即用新值（每轮从磁盘重读，无需重启）

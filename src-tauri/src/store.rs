@@ -763,6 +763,57 @@ mod tests {
         assert_eq!(list[0].model, "模型#\"引号\"\n带换行");
     }
 
+    /// 真机会话的 JSONL 解析回归：把 APPDATA 里最新一场会话读回，逐条断言 role/content。
+    #[test]
+    fn installed_app_session_parses_from_jsonl() {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let sessions = std::path::Path::new(&appdata).join("huajing/DataHub/sessions");
+        if !sessions.is_dir() {
+            println!("SKIP: 无 APPDATA sessions");
+            return;
+        }
+        let mut newest: Option<std::path::PathBuf> = None;
+        for entry in std::fs::read_dir(&sessions).unwrap().flatten() {
+            let p = entry.path();
+            if !p.join("messages.jsonl").is_file() {
+                continue;
+            }
+            let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+            let better = match (&newest, mtime) {
+                (None, _) => true,
+                (Some(prev), Some(t)) => std::fs::metadata(prev)
+                    .and_then(|m| m.modified())
+                    .map(|pt| t > pt)
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if better {
+                newest = Some(p);
+            }
+        }
+        let Some(dir) = newest else {
+            println!("SKIP: 无会话");
+            return;
+        };
+        let raw = std::fs::read_to_string(dir.join("messages.jsonl")).unwrap();
+        let msgs: Vec<Message> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Message>(l).expect("每条 JSONL 都应解析为 Message"))
+            .collect();
+        println!("CHECK 会话 {} 共 {} 条", dir.file_name().unwrap().to_string_lossy(), msgs.len());
+        for m in &msgs {
+            println!(
+                "CHECK turn={} role={:?} content={:?} 字符数={}",
+                m.turn,
+                m.role,
+                m.content.chars().take(12).collect::<String>(),
+                m.content.chars().count()
+            );
+        }
+        assert!(msgs.iter().any(|m| m.role == "user" && m.content.contains("谢谢")));
+    }
+
     /// 真机数据回归：若本机 `%APPDATA%\huajing\DataHub` 存在（安装版跑过），
     /// 用它那份卡跑一遍钩子流水线——钩子探测、state 演进、记忆写入、诊断留痕。
     /// 无该目录时跳过（开发机/CI 上不会因此变红）。

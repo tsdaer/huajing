@@ -730,6 +730,17 @@ fn run_message_hook(
         Err(e) => return report_with_log(turn, format!("黑板读取失败：{e}")),
     };
 
+    // 钩子入参现场：把卡实际收到的 msg 与 state 原样记下来（JSON）。
+    // 「条件不成立」这类静默失败，只有看到入参本身才能定死原因。
+    crate::diag::record(
+        "hook",
+        format!(
+            "on_message 入参：msg={} state={}",
+            serde_json::to_string(current).unwrap_or_default(),
+            state
+        ),
+    );
+
     let run = card::run_hook_full(
         &loaded.source,
         card::HookCall::OnMessage { msg: current },
