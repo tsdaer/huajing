@@ -51,4 +51,4 @@ docs/
 - **M3 热闹、会长大、有节奏、不串台**：群聊/剧场 · 场景隔离与多线 · 设定补全 · 素材规格化
 - **M4 好发布**：自动更新 · 角色/世界包 · 移动端 alpha
 
-详见 `docs/design.md §15 里程碑`。
+详见 [ROADMAP.md](ROADMAP.md)（版本策略与状态）· [docs/plan/m1.md](docs/plan/m1.md)（M1 执行计划）· `docs/design.md §15`（里程碑验收标准）· [CHANGELOG.md](CHANGELOG.md)。
