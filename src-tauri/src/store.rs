@@ -523,6 +523,59 @@ pub fn list_sessions(root: &Path) -> StoreResult<Vec<SessionMeta>> {
     Ok(out)
 }
 
+// ---------- summary.md / proposals.jsonl（M2.6 的派生文件）----------
+
+/// 全量重写 summary.md（由投影写出：摘要事件按序拼接）
+pub fn write_summary(root: &Path, session_id: &str, text: &str) -> StoreResult<()> {
+    let dir = session_dir(root, session_id);
+    if !dir.is_dir() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    std::fs::write(dir.join("summary.md"), text)?;
+    Ok(())
+}
+
+/// 读取 summary.md（不存在返回空串）
+pub fn read_summary(root: &Path, session_id: &str) -> StoreResult<String> {
+    let path = session_dir(root, session_id).join("summary.md");
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    Ok(std::fs::read_to_string(&path)?)
+}
+
+/// 全量重写 proposals.jsonl（设定收件箱：一条提案一行，由投影写出）
+pub fn write_proposals(
+    root: &Path,
+    session_id: &str,
+    proposals: &[serde_json::Value],
+) -> StoreResult<()> {
+    let dir = session_dir(root, session_id);
+    if !dir.is_dir() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    let mut buf = String::new();
+    for p in proposals {
+        buf.push_str(&serde_json::to_string(p)?);
+        buf.push('\n');
+    }
+    std::fs::write(dir.join("proposals.jsonl"), buf)?;
+    Ok(())
+}
+
+/// 读取全部提案（坏行跳过；文件不存在返回空）
+pub fn read_proposals(root: &Path, session_id: &str) -> StoreResult<Vec<serde_json::Value>> {
+    let path = session_dir(root, session_id).join("proposals.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(std::fs::read_to_string(&path)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect())
+}
+
 // ---------- EventLog：会话事件流的增量缓存（高轮次性能）----------
 //
 // messages.jsonl 是追加式**事件流**（设计 §12 + §7.3），本应用是唯一写入者。缓存记住每会话

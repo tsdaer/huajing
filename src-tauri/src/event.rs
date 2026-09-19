@@ -107,6 +107,43 @@ pub struct CodexEvent {
     pub ts: u64,
 }
 
+/// 滚动摘要增量（M2.6 · 设计 §5.3：总结管线产出 L1 摘要，编年史体）
+///
+/// 注意：LLM 产物**不是派生事件**（重放不会重新调用模型），因此编辑历史时它不会被丢弃——
+/// 摘要描述的是「当时总结出来的东西」，可回放性承诺针对的是状态/转移，不是模型输出。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummaryEvent {
+    pub turn: u64,
+    /// 本次增量（并入 summary.md）
+    pub delta: String,
+    /// 总结覆盖的批次范围（溯源用）
+    #[serde(default)]
+    pub from_turn: u64,
+    #[serde(default)]
+    pub to_turn: u64,
+    pub ts: u64,
+}
+
+/// 设定收件箱的一条提案（M2.6 · 设计 §6.9：草稿→确认，确认/否决动作也进事件流）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProposalEvent {
+    pub turn: u64,
+    pub id: String,
+    /// propose | accept | reject
+    pub op: String,
+    /// new_entity | new_fact | fact_change | relation | episode | thread | psyche
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default = "default_origin")]
+    pub origin: String,
+    /// 提案正文（propose 时必带；accept/reject 可省）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub ts: u64,
+}
+
 fn default_origin() -> String {
     "manual".into()
 }
@@ -120,6 +157,8 @@ pub enum LogBody {
     Transition(TransitionEvent),
     Thread(ThreadEvent),
     Codex(CodexEvent),
+    Summary(SummaryEvent),
+    Proposal(ProposalEvent),
 }
 
 impl From<Message> for LogBody {
@@ -143,6 +182,8 @@ impl LogBody {
             LogBody::Transition(_) => "transition",
             LogBody::Thread(_) => "thread",
             LogBody::Codex(_) => "codex",
+            LogBody::Summary(_) => "summary",
+            LogBody::Proposal(_) => "proposal",
         }
     }
 
@@ -155,6 +196,8 @@ impl LogBody {
             LogBody::Transition(t) => t.turn,
             LogBody::Thread(t) => t.turn,
             LogBody::Codex(c) => c.turn,
+            LogBody::Summary(s) => s.turn,
+            LogBody::Proposal(p) => p.turn,
         }
     }
 
@@ -167,6 +210,8 @@ impl LogBody {
             LogBody::Transition(t) => serde_json::to_value(t),
             LogBody::Thread(t) => serde_json::to_value(t),
             LogBody::Codex(c) => serde_json::to_value(c),
+            LogBody::Summary(s) => serde_json::to_value(s),
+            LogBody::Proposal(p) => serde_json::to_value(p),
         }
         .map_err(|e| format!("事件序列化失败：{e}"))?;
         if let Some(obj) = v.as_object_mut() {
@@ -194,6 +239,8 @@ impl LogBody {
                 .map_err(bad),
             "thread" => serde_json::from_value(v).map(LogBody::Thread).map_err(bad),
             "codex" => serde_json::from_value(v).map(LogBody::Codex).map_err(bad),
+            "summary" => serde_json::from_value(v).map(LogBody::Summary).map_err(bad),
+            "proposal" => serde_json::from_value(v).map(LogBody::Proposal).map_err(bad),
             other => Err(format!("未知事件类型：{other}")),
         }
     }
@@ -237,6 +284,9 @@ impl LogRecord {
             LogBody::Blackboard(b) => b.reason == "clock" || b.reason == "hook",
             LogBody::Thread(t) => t.origin != "manual",
             LogBody::Codex(c) => c.origin != "manual",
+            // 摘要与提案是**模型产物**，不是确定性派生：重放不重新调用模型，
+            // 所以它们永远保留（编辑历史只重算状态/转移/心理，设计 §7.3-5 的承诺范围）
+            LogBody::Summary(_) | LogBody::Proposal(_) => false,
         }
     }
 
@@ -346,6 +396,10 @@ pub struct Projection {
     /// 秘密揭示集（"实体.秘密" 路径）
     pub known: std::collections::BTreeSet<String>,
     pub codex_log: Vec<CodexEvent>,
+    /// L1 滚动摘要（summary 事件按序拼接，设计 §5.3）
+    pub summary: String,
+    /// 设定收件箱：提案 id → 当前状态（propose/accept/reject 后写覆盖）
+    pub proposals: BTreeMap<String, serde_json::Value>,
     pub last_seq: Seq,
 }
 
@@ -438,6 +492,38 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
                 _ => {}
             }
             p.codex_log.push(c.clone());
+        }
+        LogBody::Summary(s) => {
+            let delta = s.delta.trim();
+            if !delta.is_empty() {
+                if !p.summary.is_empty() {
+                    p.summary.push('\n');
+                }
+                p.summary.push_str(delta);
+            }
+        }
+        LogBody::Proposal(pr) => {
+            // 提案是状态机：propose 落条目，accept/reject 改状态（payload 缺失时保留原提案正文）
+            let entry = p
+                .proposals
+                .entry(pr.id.clone())
+                .or_insert_with(|| serde_json::json!({}));
+            if !entry.is_object() {
+                *entry = serde_json::json!({});
+            }
+            let obj = entry.as_object_mut().expect("上面刚保证是对象");
+            obj.insert("id".into(), serde_json::json!(pr.id));
+            obj.insert("status".into(), serde_json::json!(pr.op));
+            if !pr.kind.is_empty() {
+                obj.insert("kind".into(), serde_json::json!(pr.kind));
+            }
+            obj.insert("turn".into(), serde_json::json!(pr.turn));
+            if let Some(payload) = &pr.payload {
+                obj.insert("payload".into(), payload.clone());
+            }
+            if let Some(note) = &pr.note {
+                obj.insert("note".into(), serde_json::json!(note));
+            }
         }
     }
 }

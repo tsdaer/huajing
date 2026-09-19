@@ -297,6 +297,10 @@ fn sync_derived(
         store::save_blackboard(root, &meta.id, bb).map_err(|e| e.to_string())?;
     }
     store::write_memory_records(root, &meta.id, &proj.memory).map_err(|e| e.to_string())?;
+    // M2.6 的两份派生文件（摘要与设定收件箱）同样由投影写出
+    store::write_summary(root, &meta.id, &proj.summary).map_err(|e| e.to_string())?;
+    let proposals: Vec<serde_json::Value> = proj.proposals.values().cloned().collect();
+    store::write_proposals(root, &meta.id, &proposals).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3417,5 +3421,94 @@ return {
         assert_eq!(payload["threads"]["active"].as_array().unwrap().len(), 0);
         assert_eq!(payload["codex"]["world"], "default");
         assert!(payload["known"].as_array().unwrap().is_empty());
+    }
+
+    /// M2.6 数据模型：摘要增量与设定提案进事件流，派生文件（summary.md / proposals.jsonl）由投影写出；
+    /// 它们是**模型产物**、不是确定性派生，所以编辑历史的重建不会把它们丢掉。
+    #[test]
+    fn summary_and_proposals_are_projected_to_files() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let log = store::EventLog::new();
+
+        for (turn, delta) in [
+            (2u64, "第一段：她记住了那个约定。"),
+            (4u64, "第二段：约定如约了结。"),
+        ] {
+            log.append(
+                &root,
+                &meta.id,
+                LogBody::Summary(event::SummaryEvent {
+                    turn,
+                    delta: delta.into(),
+                    from_turn: turn - 1,
+                    to_turn: turn,
+                    ts: 0,
+                }),
+            )
+            .unwrap();
+        }
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: 2,
+                id: "p1".into(),
+                op: "propose".into(),
+                kind: "new_fact".into(),
+                origin: "pipeline".into(),
+                payload: Some(serde_json::json!({"key": "猫名", "value": "墨墨"})),
+                note: None,
+                ts: 0,
+            }),
+        )
+        .unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: 3,
+                id: "p1".into(),
+                op: "accept".into(),
+                kind: String::new(),
+                origin: "manual".into(),
+                payload: None,
+                note: Some("玩家确认".into()),
+                ts: 0,
+            }),
+        )
+        .unwrap();
+        sync_now(&log, &root, &meta).unwrap();
+
+        let summary = store::read_summary(&root, &meta.id).unwrap();
+        assert!(summary.contains("第一段") && summary.contains("第二段"));
+        assert!(
+            summary.find("第一段").unwrap() < summary.find("第二段").unwrap(),
+            "摘要增量按序拼接：{summary}"
+        );
+        let proposals = store::read_proposals(&root, &meta.id).unwrap();
+        assert_eq!(proposals.len(), 1, "同一提案的确认不新增行");
+        assert_eq!(proposals[0]["status"], "accept");
+        assert_eq!(
+            proposals[0]["payload"]["value"], "墨墨",
+            "确认不丢提案正文：{}",
+            proposals[0]
+        );
+
+        // 模型产物保留：编辑历史的重建不丢弃摘要与提案
+        let records = log.read(&root, &meta.id).unwrap();
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
+        assert!(
+            rebuilt
+                .iter()
+                .any(|r| matches!(&r.body, LogBody::Summary(_))),
+            "摘要应保留"
+        );
+        assert!(
+            rebuilt
+                .iter()
+                .any(|r| matches!(&r.body, LogBody::Proposal(_))),
+            "提案应保留"
+        );
     }
 }
