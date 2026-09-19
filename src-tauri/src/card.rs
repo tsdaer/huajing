@@ -1001,6 +1001,48 @@ return {
     }
 
     #[test]
+    fn workspace_codex_entities_are_valid_lua() {
+        // 设定集实体同样是用户手写的明文文件：至少要能在沙箱里跑通、且带 id/type。
+        // （引用完整性——relations 指向的实体是否存在——留到 M2 的图谱校验做。）
+        let codex = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../DataHub/codex");
+        if !codex.is_dir() {
+            return;
+        }
+        let mut checked = 0;
+        let mut stack = vec![codex.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("lua") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("读实体文件");
+                let lua = new_sandbox().expect("沙箱初始化");
+                let table = lua
+                    .load(&source)
+                    .set_name(path.to_string_lossy())
+                    .eval::<Table>()
+                    .unwrap_or_else(|e| panic!("实体 {} 执行失败：{e}", path.display()));
+                for key in ["id", "type"] {
+                    let value: String = table
+                        .get(key)
+                        .unwrap_or_else(|_| panic!("实体 {} 缺 `{key}`", path.display()));
+                    assert!(!value.trim().is_empty(), "实体 {} 的 `{key}` 为空", path.display());
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "codex 下应至少有一个实体文件");
+    }
+
+    #[test]
     fn every_workspace_card_parses() {
         // 工作区里可能有用户自己导入/手写的卡（含 ST 导入产物）——它们同样必须可用。
         // 坏卡在这里失败，比在真机上开聊时才发现要早得多。
