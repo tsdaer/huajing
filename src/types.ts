@@ -233,9 +233,32 @@ export interface PromptLayer {
   sources?: string[];
 }
 
+/** 单层预算用量（M2.7 · 设计 §4.2：逐层可见，含实际 token） */
+export interface LayerUsage {
+  id: string;
+  name: string;
+  /** 实际占用（估算 token） */
+  tokens: number;
+  /** 该层所属预算组的 token 上限（A1/A2/A3 共享 A 组，B5 的内心与 hook 共享） */
+  limit: number;
+  /** 本层被裁/被截断的中文说明；没被动过就没有这个字段 */
+  trimmed?: string;
+}
+
+/** 一轮组装的预算总账（M2.7） */
+export interface BudgetReport {
+  /** 输入预算 = 模型上下文 × 75% */
+  input_tokens: number;
+  /** 各层实际之和 */
+  used_tokens: number;
+  layers: LayerUsage[];
+}
+
 /** 一轮组装的完整结果 */
 export interface PromptAssembly {
   layers: PromptLayer[];
   messages: ChatMessage[];
   total_tokens: number;
+  /** 预算总账（M2.7；老后端不带这个字段） */
+  budget?: BudgetReport;
 }

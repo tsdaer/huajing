@@ -310,7 +310,8 @@ pub struct CodexDraft {
 // ---------- 拼提示词（宿主 ① 的入口）----------
 
 /// 角色简介（提示词第一段）：告诉模型它是谁、不许做什么。
-const ROLE_BRIEF: &str = "你是《化境》的「自动总结管线」引擎（设计 §5.3）：一批消息滑出最近窗口后，\
+const ROLE_BRIEF: &str =
+    "你是《化境》的「自动总结管线」引擎（设计 §5.3）：一批消息滑出最近窗口后，\
 由你把已经发生的剧情整理成长期记忆与提案。\
 你不续写剧情、不扮演角色、不替角色做决定；只做归纳与抽取。\
 宁可少写，不要编造——下面这批消息里没有的东西，一个字也不要补。";
@@ -336,7 +337,6 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的六类产物】（设计 �
    - links：关联标签，用命名空间写法 topic:<话题> / person:<人名> / place:<地点>；
    - thread：属于哪条剧情线（填线 id，如 thread.周五还书），不属于就省略；
    - turns：这件事发生的轮次（本批消息的 turn，升序）。
-
 
 3. facts —— L3 事实键值（设计 §5.1）
    跨会话仍然要记得的稳定事实：玩家叫什么、生日、约定、关键事件、稳定偏好。
@@ -364,7 +364,6 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的六类产物】（设计 �
    - framing：提起时的表演指引一句话（她打算怎么开这个口、被问到会怎样），例如
      「她在意但不好意思催；若对方主动提起，会松一口气」。没有特别指引给 ""。
 
-
 5. psyche —— 心理评价提案（设计 §9.2：情绪是对「需要是否被满足」的态度体验）
    对照上文的「需要（needs）」清单评价本批消息——某个需要被满足或受挫时：
    - 情绪：{"kind": "feel", "name": "<情绪名>", "intensity": <0–1>, "source": "<哪个需要被满足/受挫>"}；
@@ -383,4 +382,1558 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的六类产物】（设计 �
    绝不允许改动任何实体的恒定辨识点 anchors（设计 §6.8：anchors 是最高保护级，与之冲突的提案
    会被直接驳回）；只是气氛描写、拿不准的，不要写。最多 6 条，没有就给 []。"#;
 
-// @@TAIL@@
+/// 输出格式要求：只输出一个 JSON 对象 + 骨架（骨架由 build_prompt 拼在最后）。
+const OUTPUT_SPEC: &str = "【输出格式】\
+只输出一个 JSON 对象：不要 Markdown 代码围栏、不要任何解释、不要在对象前后写别的字。\
+字段名照抄下面的骨架；缺的数组给 []，缺的字符串给 \"\"，缺失字段按空处理。骨架：";
+
+/// 空批次的说明（§5.3：批次为空时不该编内容出来）。
+const EMPTY_BATCH_NOTE: &str =
+    "（本批没有消息。summary_delta 给空串，episodes / facts / threads / psyche / codex 全给 []。）";
+
+/// 拼一次总结调用的提示词（宿主 ①：批次与上下文进，提示词出）。
+///
+/// 结构（顺序固定，因而同输入同输出）：
+///   角色简介 → 【当前上下文】→【本批消息】→【必须逐条产出的六类产物】→【输出格式 + 骨架】。
+/// 空批次也照常拼（明确写「本批没有消息」），绝不产出「让模型自己编」的提示词。
+/// 上下文里空着的位置写「（未给）」占位，免得模型把「没给」当成「没有」。
+pub fn build_prompt(ctx: &SummaryContext<'_>, batch: &[BatchMessage]) -> String {
+    let mut out = String::with_capacity(4096);
+
+    out.push_str(ROLE_BRIEF);
+    out.push_str("\n\n");
+
+    // ---- 当前上下文 ----
+    out.push_str("【当前上下文】\n");
+    push_line(&mut out, "角色卡", ctx.card_name);
+    if let Some(p) = ctx.persona_name {
+        push_line(&mut out, "玩家角色", p);
+    }
+    if let Some(p) = ctx.premise {
+        push_line(&mut out, "起因（premise）", p);
+    }
+    push_line(&mut out, "故事时钟", ctx.story_clock);
+    let summary = ctx.rolling_summary.trim();
+    if summary.is_empty() {
+        out.push_str("已有滚动摘要（L1）：（还没有，这是开头）\n");
+    } else {
+        out.push_str("已有滚动摘要（L1，本批之前的梗概）：\n");
+        out.push_str(summary);
+        out.push('\n');
+    }
+    push_bullets(
+        &mut out,
+        "活跃剧情线（C1 未决事项，全量；已在此列出的线不要重复开）",
+        ctx.active_threads,
+    );
+    push_join(
+        &mut out,
+        "角色的需要（needs，第 5 条评价的对照表）",
+        ctx.needs,
+    );
+
+    // ---- 本批消息 ----
+    out.push('\n');
+    if batch.is_empty() {
+        out.push_str("【本批消息】（空批次：没有消息滑出最近窗口）\n");
+        out.push_str(EMPTY_BATCH_NOTE);
+        out.push('\n');
+    } else {
+        let first = batch[0].turn;
+        let last = batch[batch.len() - 1].turn;
+        out.push_str(&format!(
+            "【本批消息】（共 {} 条，turn {}–{}）\n",
+            batch.len(),
+            first,
+            last
+        ));
+        for m in batch {
+            out.push_str(&format!("[turn {} · {}] ", m.turn, m.role.trim()));
+            out.push_str(m.content.trim());
+            out.push('\n');
+        }
+    }
+
+    // ---- 六类产物 + 输出格式 ----
+    out.push('\n');
+    out.push_str(PRODUCT_SPEC);
+    out.push_str("\n\n");
+    out.push_str(OUTPUT_SPEC);
+    out.push('\n');
+    out.push_str(OUTCOME_SCHEMA_HINT);
+    out.push_str("\n\n再次强调：整个回复就是这一个 JSON 对象本身，不要围栏、不要旁白。");
+    out
+}
+
+/// 一行「标签：值」（值空则写「（未给）」占位）。
+fn push_line(out: &mut String, label: &str, value: &str) {
+    let v = value.trim();
+    out.push_str(label);
+    out.push('：');
+    out.push_str(if v.is_empty() { "（未给）" } else { v });
+    out.push('\n');
+}
+
+/// 一行「标签：a、b、c」（全空则整行省略）。
+fn push_join(out: &mut String, label: &str, items: &[String]) {
+    let cleaned: Vec<&str> = items
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        return;
+    }
+    out.push_str(label);
+    out.push('：');
+    out.push_str(&cleaned.join("、"));
+    out.push('\n');
+}
+
+/// 「标签：」+ 逐条 `- ` 列表（全空则整行省略）。
+fn push_bullets(out: &mut String, label: &str, items: &[String]) {
+    let cleaned: Vec<&str> = items
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        return;
+    }
+    out.push_str(label);
+    out.push_str("：\n");
+    for item in cleaned {
+        out.push_str("- ");
+        out.push_str(item);
+        out.push('\n');
+    }
+}
+
+// ---------- 解析模型回复（宿主 ③ 的第一道关）----------
+
+/// 解析一次总结的模型回复。
+///
+/// 容错口径（对应 m2.md M2.6 的「LLM 产物不稳定」风险）：
+/// - **围栏与杂文**：先取回复里第一个 `{` 到最后一个 `}` 之间的片段——Markdown 代码围栏、
+///   「好的，结果如下：」这类前后缀都不影响解析；
+/// - **缺字段**：给空（字符串 ""、数组 []、数值取缺省，见各 *Draft 的字段说明）；
+/// - **类型不符**：按缺处理。数值不认字符串（`"salience": "0.8"` 当没给，避免脏串被当权威），
+///   数组位置放对象/字符串也当没给；单条产物不是对象就跳过；
+/// - **解析失败**：返回 Err 且信息可读（带出错片段），宿主据此重试或丢弃；
+/// - **绝不 panic**：任何输入（空串、半个 JSON、全角括号、超长噪声）都只会走进 Ok/Err。
+///
+/// 解析只管「形状」，归一（夹紧、去重、限额）交给 [`sanitize`]——两步分开，方便宿主先看
+/// 原始解析结果再决定是否清洗，也方便单测各自钉死。
+pub fn parse_outcome(raw: &str) -> Result<SummaryOutcome, String> {
+    let Some(text) = extract_json_object(raw) else {
+        return Err(format!(
+            "总结结果里找不到 JSON 对象（共 {} 字，没有成对的 {{ 与 }}；片段：{}）",
+            raw.chars().count(),
+            excerpt(raw)
+        ));
+    };
+    let value: Value = serde_json::from_str(text).map_err(|e| {
+        format!(
+            "总结结果不是合法 JSON：{e}（已截取第 1 个 {{ 到最后一个 }}，共 {} 字；片段：{}）",
+            text.chars().count(),
+            excerpt(text)
+        )
+    })?;
+    let Some(map) = value.as_object() else {
+        return Err(format!(
+            "总结结果的最外层不是 JSON 对象（片段：{}）",
+            excerpt(text)
+        ));
+    };
+
+    Ok(SummaryOutcome {
+        summary_delta: text_of(map.get("summary_delta")),
+        episodes: objects_of(map.get("episodes"))
+            .iter()
+            .map(|m| episode_of(m))
+            .collect(),
+        facts: objects_of(map.get("facts"))
+            .iter()
+            .map(|m| fact_of(m))
+            .collect(),
+        threads: objects_of(map.get("threads"))
+            .iter()
+            .map(|m| thread_of(m))
+            .collect(),
+        psyche: objects_of(map.get("psyche"))
+            .iter()
+            .map(|m| psyche_of(m))
+            .collect(),
+        codex: objects_of(map.get("codex"))
+            .iter()
+            .map(|m| codex_of(m))
+            .collect(),
+    })
+}
+
+/// 取回复里第一个 `{` 到最后一个 `}` 的片段（剥围栏与前后杂文）。
+///
+/// 全角括号、空串、只有一个括号的情况都返回 None（交给调用方报错）。
+fn extract_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(&raw[start..=end])
+}
+
+/// 错误信息里的片段：最多 80 字，按字符切（不切坏 UTF-8）。
+fn excerpt(text: &str) -> String {
+    let mut out: String = text.trim().chars().take(80).collect();
+    if text.trim().chars().count() > 80 {
+        out.push('…');
+    }
+    out
+}
+
+// ---------- 单条产物：形状解析（缺字段给空，类型不符按缺）----------
+
+/// 一条情景记忆草稿（缺 salience 取 palace::DEFAULT_SALIENCE；turns 收数字，浮点整值也认）。
+fn episode_of(map: &Map<String, Value>) -> EpisodeDraft {
+    EpisodeDraft {
+        content: text_of(map.get("content")),
+        salience: f32_of(map.get("salience"), palace::DEFAULT_SALIENCE),
+        emotion: opt_text_of(map.get("emotion")),
+        place: opt_text_of(map.get("place")),
+        actors: list_of_text(map.get("actors")),
+        witnesses: list_of_text(map.get("witnesses")),
+        links: list_of_text(map.get("links")),
+        thread: opt_text_of(map.get("thread")),
+        turns: turns_of(map.get("turns")),
+    }
+}
+
+/// 一条 L3 事实草稿（value 缺失给 null，字符串值 trim）。
+fn fact_of(map: &Map<String, Value>) -> FactDraft {
+    FactDraft {
+        key: text_of(map.get("key")),
+        value: map
+            .get("value")
+            .cloned()
+            .map(trim_value)
+            .unwrap_or(Value::Null),
+    }
+}
+
+/// 一条剧情线提案（缺 importance 取 threads::DEFAULT_IMPORTANCE；windows 只收对象）。
+fn thread_of(map: &Map<String, Value>) -> ThreadDraft {
+    ThreadDraft {
+        title: text_of(map.get("title")),
+        cause: text_of(map.get("cause")),
+        actors: list_of_text(map.get("actors")),
+        importance: f32_of(map.get("importance"), threads::DEFAULT_IMPORTANCE),
+        grade: text_of(map.get("grade")),
+        windows: windows_of(map.get("windows")),
+        deadline_day: map.get("deadline_day").and_then(int_of),
+        cooldown: map.get("cooldown").and_then(u32_of).unwrap_or(0),
+        framing: text_of(map.get("framing")),
+    }
+}
+
+/// 一条心理评价提案（缺 intensity 按 kind 取 psyche 侧的缺省）。
+fn psyche_of(map: &Map<String, Value>) -> PsycheDraft {
+    let kind = normalize_psyche_kind(&text_of(map.get("kind")));
+    let fallback = if kind == PSYCHE_INTEND {
+        psyche::DEFAULT_INTENT_STRENGTH
+    } else {
+        psyche::DEFAULT_AFFECT_INTENSITY
+    };
+    PsycheDraft {
+        kind,
+        name: text_of(map.get("name")),
+        intensity: f32_of(map.get("intensity"), fallback),
+        source: text_of(map.get("source")),
+    }
+}
+
+/// 一条设定提案（value 缺失给 null）。
+fn codex_of(map: &Map<String, Value>) -> CodexDraft {
+    CodexDraft {
+        kind: normalize_codex_kind(&text_of(map.get("kind"))),
+        target: text_of(map.get("target")),
+        value: map
+            .get("value")
+            .cloned()
+            .map(trim_value)
+            .unwrap_or(Value::Null),
+        reason: text_of(map.get("reason")),
+    }
+}
+
+// ---------- 取值小工具（类型不符一律按缺）----------
+
+/// 数组取值：不是数组（缺字段 / 类型不符）给空切片。
+fn array_of(v: Option<&Value>) -> &[Value] {
+    match v.and_then(Value::as_array) {
+        Some(items) => items.as_slice(),
+        None => &[],
+    }
+}
+
+/// 数组里的对象（字符串 / 数字 / null 元素跳过）。
+fn objects_of(v: Option<&Value>) -> Vec<&Map<String, Value>> {
+    array_of(v).iter().filter_map(Value::as_object).collect()
+}
+
+/// 文本取值：非字符串按空串；顺带 trim。
+fn text_of(v: Option<&Value>) -> String {
+    v.and_then(Value::as_str).unwrap_or("").trim().to_string()
+}
+
+/// 可选文本：空串 / 空白 / 类型不符都给 None。
+fn opt_text_of(v: Option<&Value>) -> Option<String> {
+    let t = text_of(v);
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// 数值取值：非数字（含数字字符串）按缺省；超范围由 sanitize 夹紧。
+fn f32_of(v: Option<&Value>, fallback: f32) -> f32 {
+    match v.and_then(Value::as_f64) {
+        Some(n) => n as f32,
+        None => fallback,
+    }
+}
+
+/// 字符串数组：非字符串元素跳过，空白项丢弃。
+fn list_of_text(v: Option<&Value>) -> Vec<String> {
+    array_of(v)
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 轮次数组：只收数字（浮点整值如 14.0 也认，负数 / 非数字跳过）。
+fn turns_of(v: Option<&Value>) -> Vec<u64> {
+    array_of(v).iter().filter_map(turn_of).collect()
+}
+
+/// 单个轮次。
+fn turn_of(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    let n = v.as_f64()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Some(n as u64)
+}
+
+/// 整数（deadline_day）：整数与浮点整值都收。
+fn int_of(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n.min(i64::MAX as u64) as i64);
+    }
+    let n = v.as_f64()?;
+    if !n.is_finite() {
+        return None;
+    }
+    Some(n as i64)
+}
+
+/// 无符号数（cooldown）：负数 / 非数字给 None，超大值封顶。
+fn u32_of(v: &Value) -> Option<u32> {
+    if let Some(n) = v.as_u64() {
+        return Some(n.min(u32::MAX as u64) as u32);
+    }
+    let n = v.as_f64()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Some(n.min(u32::MAX as f64) as u32)
+}
+
+/// 可提及窗口：设计 §8.2 的**对象**形态才收（数组元素非对象丢弃；单个对象也接受，
+/// 与 threads::Resurface::from_value 的读侧宽容度一致）。
+fn windows_of(v: Option<&Value>) -> Vec<Value> {
+    let Some(v) = v else {
+        return Vec::new();
+    };
+    match v {
+        Value::Object(_) => vec![v.clone()],
+        Value::Array(items) => items.iter().filter(|w| w.is_object()).cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 字符串值 trim（只动顶层：对象 / 数组里的内容原样，免得改坏结构化数据）。
+fn trim_value(v: Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(s.trim().to_string()),
+        other => other,
+    }
+}
+
+// ---------- 归一与夹紧（宿主 ③ 的第二道关）----------
+
+/// 清洗一次解析结果：丢垃圾、夹紧、去重、限额。**幂等**（sanitize(sanitize(x)) == sanitize(x)）。
+///
+/// 口径（逐条可测）：
+/// - 文本字段一律 trim；content / key / title / target / name 为空的条目**丢弃**（空记忆、
+///   空键、无标题的线、无目标的提案都是噪声）；
+/// - salience / importance 夹到 0–1（NaN / ∞ → 0.5，与 palace / threads 的缺省同值）；
+/// - psyche.intensity 夹到 −1–1（意图增减可为负，§9.2「受挫可削弱」；NaN → 0.5）；
+/// - actors / witnesses / links 去重（trim + 拉丁大小写不敏感，保留首次出现的写法），
+///   turns 去重并升序；
+/// - grade 归一为 dormant | natural | eager，未知 / 空 → natural（§8.4 的默认档）；
+/// - cooldown 为 0 视为没给 → threads::DEFAULT_COOLDOWN（§8.2 示例值 5；「被提及后立刻可再进
+///   窗口」与 §8.4「防反复横跳」相悖，管线不产出无冷却的线）；
+/// - windows 只保留 threads::ResurfaceWindow::from_value 认得的对象（宿主能直接喂进去），
+///   并按 JSON 文本去重；
+/// - episodes / threads / codex 截断到 MAX_*（保留顺序，先到先得）；
+/// - facts / psyche 不设上限——它们没有「一条顶十条」的破坏力，且都要过收件箱分级与情绪
+///   槽位互斥；未识别的 kind 归一为最普通的形态（psyche → feel、codex → new_fact）。
+pub fn sanitize(outcome: SummaryOutcome) -> SummaryOutcome {
+    let mut episodes: Vec<EpisodeDraft> = outcome
+        .episodes
+        .into_iter()
+        .filter_map(normalize_episode)
+        .collect();
+    episodes.truncate(MAX_EPISODES);
+
+    let facts: Vec<FactDraft> = outcome
+        .facts
+        .into_iter()
+        .filter_map(normalize_fact)
+        .collect();
+
+    let mut threads: Vec<ThreadDraft> = outcome
+        .threads
+        .into_iter()
+        .filter_map(normalize_thread)
+        .collect();
+    threads.truncate(MAX_THREADS);
+
+    let psyche: Vec<PsycheDraft> = outcome
+        .psyche
+        .into_iter()
+        .filter_map(normalize_psyche)
+        .collect();
+
+    let mut codex: Vec<CodexDraft> = outcome
+        .codex
+        .into_iter()
+        .filter_map(normalize_codex)
+        .collect();
+    codex.truncate(MAX_CODEX_DRAFTS);
+
+    SummaryOutcome {
+        summary_delta: outcome.summary_delta.trim().to_string(),
+        episodes,
+        facts,
+        threads,
+        psyche,
+        codex,
+    }
+}
+
+/// 一条情景记忆（空正文丢弃）。
+fn normalize_episode(e: EpisodeDraft) -> Option<EpisodeDraft> {
+    let content = e.content.trim().to_string();
+    if content.is_empty() {
+        return None;
+    }
+    Some(EpisodeDraft {
+        content,
+        salience: clamp_unit(e.salience, palace::DEFAULT_SALIENCE),
+        emotion: clean_opt(e.emotion),
+        place: clean_opt(e.place),
+        actors: dedup_words(e.actors),
+        witnesses: dedup_words(e.witnesses),
+        links: dedup_words(e.links),
+        thread: clean_opt(e.thread),
+        turns: sorted_turns(e.turns),
+    })
+}
+
+/// 一条事实（空 key 丢弃）。
+fn normalize_fact(f: FactDraft) -> Option<FactDraft> {
+    let key = f.key.trim().to_string();
+    if key.is_empty() {
+        return None;
+    }
+    Some(FactDraft {
+        key,
+        value: trim_value(f.value),
+    })
+}
+
+/// 一条剧情线提案（空标题丢弃；windows 过一遍可解析性）。
+fn normalize_thread(t: ThreadDraft) -> Option<ThreadDraft> {
+    let title = t.title.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    Some(ThreadDraft {
+        title,
+        cause: t.cause.trim().to_string(),
+        actors: dedup_words(t.actors),
+        importance: clamp_unit(t.importance, threads::DEFAULT_IMPORTANCE),
+        grade: normalize_grade(&t.grade),
+        windows: clean_windows(t.windows),
+        deadline_day: t.deadline_day,
+        cooldown: normalize_cooldown(t.cooldown),
+        framing: t.framing.trim().to_string(),
+    })
+}
+
+/// 一条心理评价（空名字丢弃；kind 归一）。
+fn normalize_psyche(p: PsycheDraft) -> Option<PsycheDraft> {
+    let name = p.name.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let kind = normalize_psyche_kind(&p.kind);
+    let fallback = if kind == PSYCHE_INTEND {
+        psyche::DEFAULT_INTENT_STRENGTH
+    } else {
+        psyche::DEFAULT_AFFECT_INTENSITY
+    };
+    Some(PsycheDraft {
+        kind,
+        name,
+        intensity: clamp_signed(p.intensity, fallback),
+        source: p.source.trim().to_string(),
+    })
+}
+
+/// 一条设定提案（空 target 丢弃；kind 归一）。
+fn normalize_codex(c: CodexDraft) -> Option<CodexDraft> {
+    let target = c.target.trim().to_string();
+    if target.is_empty() {
+        return None;
+    }
+    Some(CodexDraft {
+        kind: normalize_codex_kind(&c.kind),
+        target,
+        value: trim_value(c.value),
+        reason: c.reason.trim().to_string(),
+    })
+}
+
+// ---------- 归一细则：夹紧 / 去重 / 归一（全模块一个口径）----------
+
+/// 夹到 0–1（NaN / ±∞ → fallback）。
+fn clamp_unit(v: f32, fallback: f32) -> f32 {
+    if !v.is_finite() {
+        return fallback;
+    }
+    v.clamp(0.0, 1.0)
+}
+
+/// 夹到 −1–1（意图增减可为负，§9.2）。
+fn clamp_signed(v: f32, fallback: f32) -> f32 {
+    if !v.is_finite() {
+        return fallback;
+    }
+    v.clamp(-1.0, 1.0)
+}
+
+/// 可选文本归一：trim 后为空给 None。
+fn clean_opt(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// 词表去重：trim、丢空、比较用拉丁大小写不敏感（与 threads 的 normalize_word 同口径，
+/// CJK 因此是精确比较），保留首次出现的写法。
+fn dedup_words(items: Vec<String>) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for raw in items {
+        let word = raw.trim();
+        if word.is_empty() {
+            continue;
+        }
+        let key = word.to_ascii_lowercase();
+        if seen.iter().any(|s| s == &key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(word.to_string());
+    }
+    out
+}
+
+/// 轮次去重并升序（宿主取首个做 MemObject.turn 的溯源锚点）。
+fn sorted_turns(mut turns: Vec<u64>) -> Vec<u64> {
+    turns.sort_unstable();
+    turns.dedup();
+    turns
+}
+
+/// 克制梯度归一（§8.4）：dormant | natural | eager；未知 / 空 → natural。
+fn normalize_grade(raw: &str) -> String {
+    let g = raw.trim().to_ascii_lowercase();
+    if g == threads::GRADE_DORMANT {
+        return threads::GRADE_DORMANT.to_string();
+    }
+    if g == threads::GRADE_EAGER {
+        return threads::GRADE_EAGER.to_string();
+    }
+    threads::GRADE_NATURAL.to_string()
+}
+
+/// cooldown 归一：0 视为没给 → threads::DEFAULT_COOLDOWN（见 sanitize 的口径说明）。
+fn normalize_cooldown(c: u32) -> u32 {
+    if c == 0 {
+        threads::DEFAULT_COOLDOWN
+    } else {
+        c
+    }
+}
+
+/// 心理评价类型归一：只认 feel / intend；未知 / 空 → feel（情绪是瞬时的，比猜「她想要什么」保守）。
+fn normalize_psyche_kind(raw: &str) -> String {
+    if raw.trim().eq_ignore_ascii_case(PSYCHE_INTEND) {
+        PSYCHE_INTEND.to_string()
+    } else {
+        PSYCHE_FEEL.to_string()
+    }
+}
+
+/// 设定提案类型归一：只认 §6.8 的四种；未知 / 空 → new_fact（最普通的形态，仍要过收件箱分级）。
+fn normalize_codex_kind(raw: &str) -> String {
+    let kind = raw.trim().to_ascii_lowercase();
+    for known in [
+        CODEX_NEW_ENTITY,
+        CODEX_NEW_FACT,
+        CODEX_FACT_CHANGE,
+        CODEX_RELATION,
+    ] {
+        if kind == known {
+            return known.to_string();
+        }
+    }
+    CODEX_NEW_FACT.to_string()
+}
+
+/// 窗口清洗：必须是**对象**，且必须能被 threads::ResurfaceWindow::from_value 认出
+/// （认不出的窗口宿主也没法用，留着只会让「可提及窗口」变成一句空话）；按 JSON 文本去重
+/// （serde_json 默认 Map 是 BTreeMap，键序稳定 → 判重确定）。
+fn clean_windows(windows: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for w in windows {
+        if !w.is_object() || threads::ResurfaceWindow::from_value(&w).is_none() {
+            continue;
+        }
+        let key = w.to_string();
+        if seen.iter().any(|s| s == &key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(w);
+    }
+    out
+}
+
+// ---------- 单测（覆盖 m2.md M2.6 的引擎侧验收口径）----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::threads;
+    use serde_json::json;
+
+    // ---------- 脚手架 ----------
+
+    /// 浮点近似相等（LLM 来的数值走 f64 → f32，别用 == 较真）。
+    fn approx(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-6, "期望 {b}，实际 {a}");
+    }
+
+    fn words(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn ctx_of<'a>(
+        card: &'a str,
+        persona: Option<&'a str>,
+        premise: Option<&'a str>,
+        clock: &'a str,
+        summary: &'a str,
+        active_threads: &'a [String],
+        needs: &'a [String],
+    ) -> SummaryContext<'a> {
+        SummaryContext {
+            card_name: card,
+            persona_name: persona,
+            premise,
+            story_clock: clock,
+            rolling_summary: summary,
+            active_threads,
+            needs,
+        }
+    }
+
+    fn prompt_with(threads_list: &[String], needs: &[String], batch: &[BatchMessage]) -> String {
+        build_prompt(
+            &ctx_of(
+                "小雨",
+                Some("阿澈"),
+                Some("雨夜躲进图书馆"),
+                "第3天 23:40",
+                "前两天两人在图书馆认识。",
+                threads_list,
+                needs,
+            ),
+            batch,
+        )
+    }
+
+    fn batch() -> Vec<BatchMessage> {
+        vec![
+            BatchMessage {
+                turn: 14,
+                role: "user".into(),
+                content: "我把借书卡忘在家里了。".into(),
+            },
+            BatchMessage {
+                turn: 15,
+                role: "char".into(),
+                content: "那我先给你记着，周五记得来还。".into(),
+            },
+        ]
+    }
+
+    fn draft_with(content: &str, salience: f32) -> EpisodeDraft {
+        EpisodeDraft {
+            content: content.to_string(),
+            salience,
+            emotion: None,
+            place: None,
+            actors: Vec::new(),
+            witnesses: Vec::new(),
+            links: Vec::new(),
+            thread: None,
+            turns: Vec::new(),
+        }
+    }
+
+    fn thread_draft(title: &str) -> ThreadDraft {
+        ThreadDraft {
+            title: title.to_string(),
+            cause: String::new(),
+            actors: Vec::new(),
+            importance: threads::DEFAULT_IMPORTANCE,
+            grade: String::new(),
+            windows: Vec::new(),
+            deadline_day: None,
+            cooldown: 0,
+            framing: String::new(),
+        }
+    }
+
+    fn codex_draft(kind: &str, target: &str) -> CodexDraft {
+        CodexDraft {
+            kind: kind.to_string(),
+            target: target.to_string(),
+            value: Value::Null,
+            reason: String::new(),
+        }
+    }
+
+    /// 一份「像模型真的会吐出来」的回复：前后有杂文、外面有围栏、六类产物齐全。
+    fn sample_reply() -> &'static str {
+        r#"好的，本批的总结如下：
+```json
+{
+  "summary_delta": "  小雨把画着猫的便签交给玩家，两人约好周五还书。  ",
+  "episodes": [
+    {
+      "content": "深夜闭馆时，小雨把画着猫的便签递给了玩家",
+      "salience": 0.82,
+      "emotion": "温暖",
+      "place": "图书馆",
+      "actors": ["小雨", "玩家", "小雨"],
+      "witnesses": ["小雨", "玩家"],
+      "links": ["topic:便签", "person:小雨", "place:图书馆"],
+      "thread": "thread.周五还书",
+      "turns": [15, 14]
+    }
+  ],
+  "facts": [
+    { "key": "玩家名字", "value": "阿澈" },
+    { "key": "约定.还书", "value": "周五" }
+  ],
+  "threads": [
+    {
+      "title": "周五还书的约定",
+      "cause": "玩家忘带借书卡，小雨破例让他先把书带走，约定周五来还。",
+      "actors": ["小雨", "玩家"],
+      "importance": 0.7,
+      "grade": "natural",
+      "windows": [
+        { "blackboard": { "day": 5 } },
+        { "mention": ["还书", "借书卡"] }
+      ],
+      "deadline_day": 6,
+      "cooldown": 5,
+      "framing": "她在意但不好意思催；若对方主动提起，会松一口气。"
+    }
+  ],
+  "psyche": [
+    { "kind": "feel", "name": "忐忑", "intensity": 0.6, "source": "需要「被信任」受挫" },
+    { "kind": "intend", "name": "想解释", "intensity": 0.4, "source": "被误解" }
+  ],
+  "codex": [
+    {
+      "kind": "new_entity",
+      "target": "char.墨墨",
+      "value": { "type": "char", "name": "墨墨" },
+      "reason": "第 14 轮即兴提到"
+    }
+  ]
+}
+```
+以上。"#
+    }
+
+    fn sample_outcome() -> SummaryOutcome {
+        sanitize(parse_outcome(sample_reply()).expect("样例回复可解析"))
+    }
+
+    // ---------- 提示词（§5.3 逐条要账）----------
+
+    #[test]
+    fn prompt_lists_all_six_products() {
+        let p = prompt_with(&[], &[], &batch());
+        for key in [
+            "summary_delta",
+            "episodes",
+            "facts",
+            "threads",
+            "psyche",
+            "codex",
+        ] {
+            assert!(p.contains(key), "提示词漏了产物 {key}");
+        }
+        for must in [
+            "编年史体",
+            "第三人称",
+            "宁少勿滥",
+            "salience",
+            "emotion",
+            "links",
+            "提及时机",
+            "克制梯度",
+            "windows",
+            "framing",
+            "needs",
+            "受挫",
+            "new_entity",
+            "new_fact",
+            "fact_change",
+            "relation",
+            "anchors",
+        ] {
+            assert!(p.contains(must), "提示词漏了要求 {must}");
+        }
+    }
+
+    #[test]
+    fn prompt_embeds_batch_and_context() {
+        let threads_list = words(&["thread.周五还书（周五还书的约定）"]);
+        let needs = words(&["被信任", "不再孤单"]);
+        let p = prompt_with(&threads_list, &needs, &batch());
+        assert!(p.contains("角色卡：小雨"));
+        assert!(p.contains("玩家角色：阿澈"));
+        assert!(p.contains("起因（premise）：雨夜躲进图书馆"));
+        assert!(p.contains("故事时钟：第3天 23:40"));
+        assert!(p.contains("前两天两人在图书馆认识。"));
+        assert!(p.contains("- thread.周五还书（周五还书的约定）"));
+        assert!(p.contains("被信任、不再孤单"));
+        assert!(p.contains("【本批消息】（共 2 条，turn 14–15）"));
+        assert!(p.contains("[turn 14 · user] 我把借书卡忘在家里了。"));
+        assert!(p.contains("[turn 15 · char] 那我先给你记着，周五记得来还。"));
+    }
+
+    #[test]
+    fn prompt_demands_one_json_object_with_skeleton() {
+        let p = prompt_with(&[], &[], &batch());
+        assert!(p.contains("只输出一个 JSON 对象"));
+        assert!(p.contains(OUTCOME_SCHEMA_HINT));
+        // 骨架自己是合法 JSON，且六类产物一个不少（提示词与解析器的契约）
+        let parsed: Value = serde_json::from_str(OUTCOME_SCHEMA_HINT).expect("骨架是合法 JSON");
+        let map = parsed.as_object().expect("骨架是对象");
+        for key in [
+            "summary_delta",
+            "episodes",
+            "facts",
+            "threads",
+            "psyche",
+            "codex",
+        ] {
+            assert!(map.contains_key(key), "骨架缺少 {key}");
+        }
+        // 骨架还能被自己的解析器吃下去 —— 提示词与 parse_outcome 不脱节
+        assert!(!parse_outcome(OUTCOME_SCHEMA_HINT)
+            .expect("骨架可解析")
+            .is_empty());
+    }
+
+    #[test]
+    fn prompt_handles_empty_batch() {
+        let p = prompt_with(&[], &[], &[]);
+        assert!(p.contains("【本批消息】（空批次：没有消息滑出最近窗口）"));
+        assert!(p.contains(EMPTY_BATCH_NOTE));
+        assert!(p.contains(OUTCOME_SCHEMA_HINT));
+        assert!(!p.contains("【本批消息】（共"));
+    }
+
+    #[test]
+    fn prompt_marks_missing_context_fields() {
+        let p = build_prompt(&ctx_of("", None, None, "", "", &[], &[]), &[]);
+        assert!(p.contains("角色卡：（未给）"));
+        assert!(p.contains("故事时钟：（未给）"));
+        assert!(p.contains("已有滚动摘要（L1）：（还没有，这是开头）"));
+        assert!(!p.contains("玩家角色："));
+        assert!(!p.contains("起因（premise）："));
+        assert!(!p.contains("活跃剧情线"));
+        assert!(!p.contains("角色的需要"));
+    }
+
+    #[test]
+    fn prompt_is_deterministic() {
+        let threads_list = words(&["thread.周五还书"]);
+        let needs = words(&["被信任"]);
+        let a = prompt_with(&threads_list, &needs, &batch());
+        let b = prompt_with(&threads_list, &needs, &batch());
+        assert_eq!(a, b);
+        // 同一次调用里连拼两遍也一样（没有时间戳 / 随机 / 迭代顺序参与）
+        assert_eq!(
+            build_prompt(&ctx_of("小雨", None, None, "第3天", "", &[], &[]), &batch()),
+            build_prompt(&ctx_of("小雨", None, None, "第3天", "", &[], &[]), &batch())
+        );
+    }
+
+    // ---------- 解析：形状与容错 ----------
+
+    #[test]
+    fn parse_reads_a_clean_object() {
+        let raw = r#"{
+          "summary_delta": "小雨把便签给了玩家。",
+          "episodes": [{
+            "content": "深夜闭馆时她把画着猫的便签递给玩家",
+            "salience": 0.82,
+            "emotion": "温暖",
+            "place": "图书馆",
+            "actors": ["小雨", "玩家"],
+            "witnesses": ["小雨", "玩家"],
+            "links": ["topic:便签"],
+            "thread": "thread.周五还书",
+            "turns": [14]
+          }],
+          "facts": [{ "key": "玩家名字", "value": "阿澈" }],
+          "threads": [{
+            "title": "周五还书的约定",
+            "cause": "忘带借书卡",
+            "actors": ["小雨", "玩家"],
+            "importance": 0.7,
+            "grade": "natural",
+            "windows": [{ "blackboard": { "day": 5 } }],
+            "deadline_day": 6,
+            "cooldown": 5,
+            "framing": "她在意但不好意思催"
+          }],
+          "psyche": [{ "kind": "feel", "name": "忐忑", "intensity": 0.6, "source": "被信任受挫" }],
+          "codex": [{ "kind": "new_entity", "target": "char.墨墨", "value": { "type": "char" }, "reason": "第 14 轮提到" }]
+        }"#;
+        let o = parse_outcome(raw).expect("干净对象应当解析成功");
+        assert_eq!(o.summary_delta, "小雨把便签给了玩家。");
+        assert_eq!(o.episodes.len(), 1);
+        approx(o.episodes[0].salience, 0.82);
+        assert_eq!(o.episodes[0].emotion.as_deref(), Some("温暖"));
+        assert_eq!(o.episodes[0].place.as_deref(), Some("图书馆"));
+        assert_eq!(o.episodes[0].thread.as_deref(), Some("thread.周五还书"));
+        assert_eq!(o.episodes[0].turns, vec![14]);
+        assert_eq!(o.facts[0].key, "玩家名字");
+        assert_eq!(o.facts[0].value, json!("阿澈"));
+        assert_eq!(o.threads[0].deadline_day, Some(6));
+        assert_eq!(o.threads[0].cooldown, 5);
+        assert_eq!(
+            o.threads[0].windows,
+            vec![json!({"blackboard": {"day": 5}})]
+        );
+        assert_eq!(o.psyche[0].kind, PSYCHE_FEEL);
+        assert_eq!(o.codex[0].kind, CODEX_NEW_ENTITY);
+        assert_eq!(o.codex[0].value, json!({"type": "char"}));
+    }
+
+    #[test]
+    fn parse_strips_json_fence() {
+        let raw = "```json\n{\"summary_delta\":\"她哭了。\"}\n```";
+        let o = parse_outcome(raw).unwrap();
+        assert_eq!(o.summary_delta, "她哭了。");
+        assert!(o.episodes.is_empty() && o.threads.is_empty() && o.codex.is_empty());
+    }
+
+    #[test]
+    fn parse_strips_prose_around_object() {
+        let raw =
+            "好的，这是本批结果：\n{\"summary_delta\":\"两人和好。\",\"facts\":[]}\n以上，请查收。";
+        let o = parse_outcome(raw).unwrap();
+        assert_eq!(o.summary_delta, "两人和好。");
+        assert!(o.facts.is_empty());
+    }
+
+    #[test]
+    fn parse_tolerates_braces_inside_strings() {
+        let o = parse_outcome(r#"{"summary_delta":"她说：{好}。"}"#).unwrap();
+        assert_eq!(o.summary_delta, "她说：{好}。");
+    }
+
+    #[test]
+    fn parse_accepts_array_wrapper() {
+        // 模型偶尔把结果包成数组：第一个 { 到最后一个 } 的片段恰好是那个对象
+        let o = parse_outcome(r#"[{"summary_delta":"两人和好。"}]"#).unwrap();
+        assert_eq!(o.summary_delta, "两人和好。");
+    }
+
+    #[test]
+    fn parse_missing_fields_give_empty() {
+        let o = parse_outcome("{}").unwrap();
+        assert!(o.is_empty());
+        assert_eq!(o.summary_delta, "");
+        assert!(o.episodes.is_empty() && o.facts.is_empty() && o.psyche.is_empty());
+
+        // 缺数值字段取缺省（与 palace / threads / psyche 同口径）
+        let raw = r#"{
+          "episodes": [{ "content": "x" }],
+          "threads": [{ "title": "t" }],
+          "psyche": [{ "name": "忐忑" }],
+          "codex": [{ "target": "char.小雨" }]
+        }"#;
+        let o = parse_outcome(raw).unwrap();
+        approx(o.episodes[0].salience, palace::DEFAULT_SALIENCE);
+        assert_eq!(o.episodes[0].emotion, None);
+        assert_eq!(o.episodes[0].thread, None);
+        assert!(o.episodes[0].turns.is_empty());
+        approx(o.threads[0].importance, threads::DEFAULT_IMPORTANCE);
+        assert_eq!(o.threads[0].grade, "");
+        // 解析侧给 0（= 模型没给），缺省成 5 是 sanitize 的事
+        assert_eq!(o.threads[0].cooldown, 0);
+        assert_eq!(o.threads[0].deadline_day, None);
+        assert_eq!(o.psyche[0].kind, PSYCHE_FEEL);
+        approx(o.psyche[0].intensity, psyche::DEFAULT_AFFECT_INTENSITY);
+        assert_eq!(o.codex[0].kind, CODEX_NEW_FACT);
+        assert_eq!(o.codex[0].value, Value::Null);
+    }
+
+    #[test]
+    fn parse_type_mismatch_treated_as_missing() {
+        let raw = r#"{
+          "summary_delta": 42,
+          "episodes": "无",
+          "facts": {},
+          "threads": [{ "title": 7, "windows": "x", "cooldown": "5" }],
+          "psyche": [{ "kind": [], "name": {}, "intensity": "0.9" }],
+          "codex": [{ "target": false }]
+        }"#;
+        let o = parse_outcome(raw).unwrap();
+        assert_eq!(o.summary_delta, "");
+        assert!(o.episodes.is_empty());
+        assert!(o.facts.is_empty());
+        assert_eq!(o.threads.len(), 1);
+        assert_eq!(o.threads[0].title, ""); // 类型不符 → 空（sanitize 会丢掉它）
+        assert!(o.threads[0].windows.is_empty());
+        assert_eq!(o.threads[0].cooldown, 0); // 数字字符串不认
+        assert_eq!(o.psyche[0].name, "");
+        assert_eq!(o.psyche[0].kind, PSYCHE_FEEL); // kind 类型不符 → 默认 feel
+        approx(o.psyche[0].intensity, psyche::DEFAULT_AFFECT_INTENSITY);
+        assert_eq!(o.codex[0].target, "");
+    }
+
+    #[test]
+    fn parse_accepts_float_turns_and_single_object_windows() {
+        let raw = r#"{
+          "episodes": [{ "content": "x", "turns": [15.0, 14, -1, "15", null] }],
+          "threads": [{ "title": "t", "windows": { "mention": ["还书"] } }]
+        }"#;
+        let o = parse_outcome(raw).unwrap();
+        // 只收数字（浮点整值认，负数 / 字符串 / null 跳过），排序归一留给 sanitize
+        assert_eq!(o.episodes[0].turns, vec![15, 14]);
+        assert_eq!(o.threads[0].windows.len(), 1);
+        assert!(o.threads[0].windows[0].is_object());
+    }
+
+    #[test]
+    fn parse_non_json_is_a_readable_error() {
+        let err = parse_outcome("模型今天不想说话").unwrap_err();
+        assert!(err.contains("JSON"), "错误信息应当说明 JSON 的问题：{err}");
+        assert!(
+            err.contains("模型今天不想说话"),
+            "错误信息应当带上片段：{err}"
+        );
+
+        let err = parse_outcome("{ \"summary_delta\": \"没关引号 }").unwrap_err();
+        assert!(err.contains("不是合法 JSON"), "{err}");
+        assert!(err.contains("片段"), "{err}");
+    }
+
+    #[test]
+    fn parse_never_panics_on_garbage() {
+        let mut cases: Vec<String> = vec![
+            "".into(),
+            "   ".into(),
+            "{".into(),
+            "}".into(),
+            "{]".into(),
+            "{}".into(),
+            "[]".into(),
+            "{{{{".into(),
+            "{}{}".into(),
+            "｛全角括号｝".into(),
+            "```json".into(),
+            r#"{"a":1} 尾巴 {"b":2}"#.into(),
+            "第 14 轮：她笑了（但没说话）。".into(),
+        ];
+        cases.push("很长的噪声".repeat(2_000));
+        for raw in &cases {
+            // 解析的成败都不重要，只要不 panic 且错误信息可读
+            if let Err(e) = parse_outcome(raw) {
+                assert!(!e.is_empty());
+            }
+        }
+    }
+
+    // ---------- 归一：夹紧 / 去重 / 限额 ----------
+
+    #[test]
+    fn sanitize_clamps_numbers() {
+        let out = sanitize(SummaryOutcome {
+            summary_delta: "  她哭了。  ".into(),
+            episodes: vec![
+                draft_with("a", 1.7),
+                draft_with("b", -3.0),
+                draft_with("c", f32::NAN),
+                draft_with("d", f32::INFINITY),
+            ],
+            threads: vec![ThreadDraft {
+                importance: f32::NAN,
+                ..thread_draft("t")
+            }],
+            psyche: vec![
+                PsycheDraft {
+                    kind: PSYCHE_FEEL.into(),
+                    name: "忐忑".into(),
+                    intensity: 9.0,
+                    source: String::new(),
+                },
+                PsycheDraft {
+                    kind: PSYCHE_INTEND.into(),
+                    name: "想解释".into(),
+                    intensity: -9.0,
+                    source: String::new(),
+                },
+                PsycheDraft {
+                    kind: PSYCHE_INTEND.into(),
+                    name: "想逃".into(),
+                    intensity: f32::NAN,
+                    source: String::new(),
+                },
+            ],
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.summary_delta, "她哭了。");
+        approx(out.episodes[0].salience, 1.0);
+        approx(out.episodes[1].salience, 0.0);
+        approx(out.episodes[2].salience, 0.5); // NaN → 0.5（§5.2 的中位值）
+        approx(out.episodes[3].salience, 0.5);
+        approx(out.threads[0].importance, threads::DEFAULT_IMPORTANCE);
+        approx(out.psyche[0].intensity, 1.0);
+        approx(out.psyche[1].intensity, -1.0); // 意图增减可为负（§9.2）
+        approx(out.psyche[2].intensity, 0.5);
+    }
+
+    #[test]
+    fn sanitize_drops_empty_identity_fields() {
+        let out = sanitize(SummaryOutcome {
+            summary_delta: "   ".into(),
+            episodes: vec![draft_with("   ", 0.5), draft_with("有效记忆", 0.5)],
+            facts: vec![
+                FactDraft {
+                    key: "  ".into(),
+                    value: json!(1),
+                },
+                FactDraft {
+                    key: "ok".into(),
+                    value: json!(1),
+                },
+            ],
+            threads: vec![thread_draft("  "), thread_draft("有效线")],
+            psyche: vec![
+                PsycheDraft {
+                    kind: PSYCHE_FEEL.into(),
+                    name: " ".into(),
+                    intensity: 0.5,
+                    source: String::new(),
+                },
+                PsycheDraft {
+                    kind: PSYCHE_FEEL.into(),
+                    name: "忐忑".into(),
+                    intensity: 0.5,
+                    source: String::new(),
+                },
+            ],
+            codex: vec![
+                codex_draft(CODEX_NEW_FACT, " "),
+                codex_draft(CODEX_NEW_FACT, "char.小雨"),
+            ],
+        });
+        assert_eq!(out.summary_delta, "");
+        assert!(!out.is_empty());
+        assert_eq!(out.episodes.len(), 1);
+        assert_eq!(out.episodes[0].content, "有效记忆");
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(out.threads.len(), 1);
+        assert_eq!(out.threads[0].title, "有效线");
+        assert_eq!(out.psyche.len(), 1);
+        assert_eq!(out.codex.len(), 1);
+    }
+
+    #[test]
+    fn sanitize_dedups_words_and_sorts_turns() {
+        let mut e = draft_with("她把便签递给他", 0.8);
+        e.actors = words(&["小雨", " 小雨 ", "玩家", "小雨"]);
+        e.witnesses = words(&["Alice", "alice", "玩家"]); // 拉丁大小写不敏感
+        e.links = words(&["topic:便签", "topic:便签", " person:小雨 "]);
+        e.turns = vec![15, 14, 15, 14, 3];
+        let out = sanitize(SummaryOutcome {
+            episodes: vec![e],
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.episodes[0].actors, words(&["小雨", "玩家"]));
+        assert_eq!(out.episodes[0].witnesses, words(&["Alice", "玩家"]));
+        assert_eq!(out.episodes[0].links, words(&["topic:便签", "person:小雨"]));
+        assert_eq!(out.episodes[0].turns, vec![3, 14, 15]);
+    }
+
+    #[test]
+    fn sanitize_truncates_keeping_order() {
+        let episodes: Vec<EpisodeDraft> = (0..MAX_EPISODES + 3)
+            .map(|i| draft_with(&format!("记忆{i}"), 0.5))
+            .collect();
+        let threads: Vec<ThreadDraft> = (0..MAX_THREADS + 3)
+            .map(|i| thread_draft(&format!("线{i}")))
+            .collect();
+        let codex: Vec<CodexDraft> = (0..MAX_CODEX_DRAFTS + 3)
+            .map(|i| codex_draft(CODEX_NEW_FACT, &format!("char.{i}")))
+            .collect();
+        let out = sanitize(SummaryOutcome {
+            episodes,
+            threads,
+            codex,
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.episodes.len(), MAX_EPISODES);
+        assert_eq!(out.episodes[0].content, "记忆0");
+        assert_eq!(
+            out.episodes[MAX_EPISODES - 1].content,
+            format!("记忆{}", MAX_EPISODES - 1)
+        );
+        assert_eq!(out.threads.len(), MAX_THREADS);
+        assert_eq!(out.threads[0].title, "线0");
+        assert_eq!(out.codex.len(), MAX_CODEX_DRAFTS);
+        assert_eq!(out.codex[0].target, "char.0");
+    }
+
+    #[test]
+    fn sanitize_normalizes_grade_and_cooldown() {
+        let out = sanitize(SummaryOutcome {
+            threads: vec![
+                ThreadDraft {
+                    grade: " EAGER ".into(),
+                    cooldown: 0,
+                    ..thread_draft("a")
+                },
+                ThreadDraft {
+                    grade: "urgent".into(),
+                    cooldown: 3,
+                    ..thread_draft("b")
+                },
+            ],
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.threads[0].grade, threads::GRADE_EAGER);
+        assert_eq!(out.threads[0].cooldown, threads::DEFAULT_COOLDOWN); // 0 = 没给 → 5
+        assert_eq!(out.threads[1].grade, threads::GRADE_NATURAL); // 未知 → natural
+        assert_eq!(out.threads[1].cooldown, 3); // 显式冷却原样保留
+    }
+
+    #[test]
+    fn sanitize_keeps_only_usable_windows() {
+        let t = ThreadDraft {
+            windows: vec![
+                json!({"mention": ["还书", "借书卡"]}),
+                json!({}),        // 空对象：没有任何可识别条件
+                json!("mention"), // 不是对象
+                json!({"state_path": ["图书馆"]}),
+                json!({"无关键": 1}),                   // 认不出的键
+                json!({"mention": ["还书", "借书卡"]}), // 与首条重复
+            ],
+            ..thread_draft("周五还书的约定")
+        };
+        let out = sanitize(SummaryOutcome {
+            threads: vec![t],
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.threads[0].windows.len(), 2);
+        assert_eq!(
+            out.threads[0].windows[0],
+            json!({"mention": ["还书", "借书卡"]})
+        );
+        assert_eq!(out.threads[0].windows[1], json!({"state_path": ["图书馆"]}));
+    }
+
+    #[test]
+    fn sanitize_trims_text_and_blanks_optionals() {
+        let mut e = draft_with("  她把便签给他  ", 0.8);
+        e.emotion = Some("  温暖 ".into());
+        e.place = Some("   ".into());
+        e.thread = Some("".into());
+        let out = sanitize(SummaryOutcome {
+            summary_delta: "  梗概  ".into(),
+            episodes: vec![e],
+            facts: vec![FactDraft {
+                key: "  玩家名字 ".into(),
+                value: json!("  阿澈  "),
+            }],
+            threads: vec![ThreadDraft {
+                cause: "  起因 ".into(),
+                framing: "  指引 ".into(),
+                ..thread_draft(" 线 ")
+            }],
+            codex: vec![CodexDraft {
+                kind: " relation ".into(),
+                target: " char.小雨 ".into(),
+                value: json!({"to": "char.墨墨"}),
+                reason: " 理由 ".into(),
+            }],
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.summary_delta, "梗概");
+        assert_eq!(out.episodes[0].content, "她把便签给他");
+        assert_eq!(out.episodes[0].emotion.as_deref(), Some("温暖"));
+        assert_eq!(out.episodes[0].place, None);
+        assert_eq!(out.episodes[0].thread, None);
+        assert_eq!(out.facts[0].key, "玩家名字");
+        assert_eq!(out.facts[0].value, json!("阿澈"));
+        assert_eq!(out.threads[0].title, "线");
+        assert_eq!(out.threads[0].cause, "起因");
+        assert_eq!(out.threads[0].framing, "指引");
+        assert_eq!(out.codex[0].kind, CODEX_RELATION);
+        assert_eq!(out.codex[0].target, "char.小雨");
+        assert_eq!(out.codex[0].reason, "理由");
+    }
+
+    #[test]
+    fn sanitize_normalizes_unknown_kinds() {
+        let out = sanitize(SummaryOutcome {
+            psyche: vec![PsycheDraft {
+                kind: "心情".into(),
+                name: "忐忑".into(),
+                intensity: 0.5,
+                source: String::new(),
+            }],
+            codex: vec![codex_draft("随便写的", "char.小雨")],
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.psyche[0].kind, PSYCHE_FEEL);
+        assert_eq!(out.codex[0].kind, CODEX_NEW_FACT);
+    }
+
+    #[test]
+    fn sanitize_is_idempotent() {
+        let once = sample_outcome();
+        let twice = sanitize(once.clone());
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn sanitize_empty_outcome_stays_empty() {
+        let out = sanitize(SummaryOutcome::default());
+        assert!(out.is_empty());
+        assert_eq!(out, SummaryOutcome::default());
+    }
+
+    // ---------- 跨模块：提案形态必须能直接喂给 threads / palace ----------
+
+    #[test]
+    fn windows_feed_threads_resurface_window_directly() {
+        let out = sample_outcome();
+        let draft = &out.threads[0];
+        assert!(draft.windows.len() >= 2);
+        let mut blackboard = std::collections::BTreeMap::new();
+        blackboard.insert("day".to_string(), json!(5));
+        let q = threads::ThreadQuery::new(40, 5, "第5天 18:00", &blackboard);
+
+        let mut live = 0;
+        for w in &draft.windows {
+            let window = threads::ResurfaceWindow::from_value(w).expect("宿主能直接解析这个窗口");
+            if window.hit(&q).is_some() {
+                live += 1;
+            }
+        }
+        assert!(live >= 1, "黑板 day=5 的窗口应当在第 5 天命中");
+    }
+
+    #[test]
+    fn thread_draft_resurface_value_round_trips_through_threads() {
+        let draft = sample_outcome().threads[0].clone();
+        let value = draft.resurface_value();
+        let resurface = threads::Resurface::from_value(&value);
+        assert_eq!(resurface.grade, threads::GRADE_NATURAL);
+        assert_eq!(resurface.windows.len(), draft.windows.len());
+        assert_eq!(resurface.cooldown, threads::DEFAULT_COOLDOWN);
+        assert_eq!(resurface.framing, draft.framing);
+        assert_eq!(resurface.deadline.as_ref().map(|d| d.day), Some(6));
+        assert_eq!(
+            resurface.deadline.as_ref().map(|d| d.escalate.as_str()),
+            Some(threads::DEFAULT_ESCALATE)
+        );
+        // 宿主落事件用 to_value，读回来仍一致
+        assert_eq!(
+            threads::Resurface::from_value(&resurface.to_value()),
+            resurface
+        );
+
+        // 开线：把提案起草的时机装进线，窗口该中时中、不该中时不中（§8.4 的克制）
+        let mut t = threads::Thread::open(
+            "",
+            &draft.title,
+            &draft.cause,
+            &draft.actors,
+            draft.importance,
+            threads::ThreadStamp {
+                turn: 15,
+                story_day: 3,
+                story_clock: "第3天 23:40".into(),
+            },
+        );
+        assert_eq!(t.id, "thread.周五还书的约定");
+        t.resurface = resurface;
+
+        let mut bb5 = std::collections::BTreeMap::new();
+        bb5.insert("day".to_string(), json!(5));
+        let at_friday = threads::ThreadQuery::new(40, 5, "第5天 09:00", &bb5);
+        assert!(t.window_hit(&at_friday).is_some(), "约定期限当天应当进窗口");
+
+        let mut bb4 = std::collections::BTreeMap::new();
+        bb4.insert("day".to_string(), json!(4));
+        let before = threads::ThreadQuery::new(38, 4, "第4天 09:00", &bb4);
+        assert!(t.window_hit(&before).is_none(), "时机未到就不该进现状卡");
+    }
+
+    #[test]
+    fn episode_draft_feeds_a_palace_memory() {
+        let e = sample_outcome().episodes[0].clone();
+        let mem = palace::MemObject {
+            id: palace::next_id(192),
+            kind: palace::KIND_EPISODE.to_string(),
+            content: e.content.clone(),
+            turn: e.turns.first().copied().unwrap_or(0),
+            story_day: 3,
+            story_clock: "第3天 23:40".to_string(),
+            place: e.place.clone(),
+            actors: e.actors.clone(),
+            witnesses: e.witnesses.clone(),
+            salience: e.salience,
+            emotion: e.emotion.clone(),
+            links: e.links.clone(),
+            thread: e.thread.clone(),
+            source: "pipeline".to_string(),
+            ts: 0,
+            rehearsals: 0,
+        };
+        assert_eq!(mem.id, "mem_0192");
+        assert_eq!(mem.turn, 14); // turns 升序 → 首个是最早的那一轮
+        assert_eq!(mem.kind, palace::KIND_EPISODE);
+        assert!(
+            mem.links_match("topic:便签"),
+            "管线给的 links 要能被宫殿召回命中"
+        );
+        assert!(mem.links_match("便签"));
+        assert_eq!(mem.witnesses_or_actors(), e.witnesses);
+
+        // witnesses 空 = 默认 actors（§5.2）
+        let mut bare = mem.clone();
+        bare.witnesses.clear();
+        assert_eq!(bare.witnesses_or_actors(), bare.actors);
+    }
+
+    #[test]
+    fn batch_message_converts_from_store_message() {
+        let m = crate::store::Message {
+            turn: 7,
+            role: "char".into(),
+            content: "她笑了笑。".into(),
+            ts: 0,
+            scene_id: None,
+        };
+        let b = BatchMessage::from_message(&m);
+        assert_eq!(b.turn, 7);
+        assert_eq!(b.role, "char");
+        assert_eq!(b.content, "她笑了笑。");
+    }
+
+    // ---------- 端到端：从模型回复到可落库的产物 ----------
+
+    #[test]
+    fn end_to_end_parse_and_sanitize() {
+        let parsed = parse_outcome(sample_reply()).expect("带围栏与前后杂文的回复应当能解析");
+        assert_eq!(parsed.episodes[0].turns, vec![15, 14]); // 解析只管形状
+        assert_eq!(parsed.episodes[0].actors.len(), 3);
+
+        let out = sanitize(parsed);
+        assert_eq!(
+            out.summary_delta,
+            "小雨把画着猫的便签交给玩家，两人约好周五还书。"
+        );
+        assert_eq!(out.episodes[0].turns, vec![14, 15]); // 归一后升序
+        assert_eq!(out.episodes[0].actors, words(&["小雨", "玩家"]));
+        assert_eq!(out.facts.len(), 2);
+        assert_eq!(out.threads.len(), 1);
+        assert_eq!(out.psyche.len(), 2);
+        assert_eq!(out.codex.len(), 1);
+    }
+
+    #[test]
+    fn parse_and_sanitize_are_deterministic() {
+        let a = sanitize(parse_outcome(sample_reply()).expect("可解析"));
+        let b = sanitize(parse_outcome(sample_reply()).expect("可解析"));
+        assert_eq!(a, b);
+        // 空批次同样确定（提示词一模一样）
+        let threads_list = words(&["thread.周五还书"]);
+        let needs = words(&["被信任"]);
+        assert_eq!(
+            prompt_with(&threads_list, &needs, &[]),
+            prompt_with(&threads_list, &needs, &[])
+        );
+    }
+
+    #[test]
+    fn outcome_is_empty_only_when_nothing_came_back() {
+        assert!(SummaryOutcome::default().is_empty());
+        let only_summary = SummaryOutcome {
+            summary_delta: "  有进展  ".to_string(),
+            ..SummaryOutcome::default()
+        };
+        assert!(!sanitize(only_summary).is_empty());
+    }
+}

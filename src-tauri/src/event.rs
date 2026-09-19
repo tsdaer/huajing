@@ -418,6 +418,8 @@ pub struct Projection {
     pub codex_log: Vec<CodexEvent>,
     /// L1 滚动摘要（summary 事件按序拼接，设计 §5.3）
     pub summary: String,
+    /// 摘要已覆盖到哪一轮（批次从它之后取；0 = 还没总结过）
+    pub summary_upto: u64,
     /// 设定收件箱：提案 id → 当前状态（propose/accept/reject 后写覆盖）
     pub proposals: BTreeMap<String, serde_json::Value>,
     /// 结构化记忆对象（M2.6 管线写入的情景记忆；键值事实仍在 memory 里）
@@ -523,6 +525,7 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
                 }
                 p.summary.push_str(delta);
             }
+            p.summary_upto = p.summary_upto.max(s.to_turn);
         }
         LogBody::Memory(m) => p.episodes.push(m.object.clone()),
         LogBody::Proposal(pr) => {

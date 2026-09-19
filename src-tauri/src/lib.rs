@@ -14,6 +14,7 @@ mod threads;  // 剧情线：生命周期与提及时机（M2.4 · 设计 §8）
 mod statetree; // 状态树：剧情状态机的纯数据与算法（M2.3 · 设计 §7）
 mod stimport; // SillyTavern 角色卡导入（M1.8 · 设计 §13）
 mod store;    // DataHub 明文数据层（设计 §12）
+mod summarize; // 自动总结管线：批次 → 六类产物（M2.6 · 设计 §5.3）
 mod watch;    // DataHub 热加载监听（M1.7）
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -26,6 +27,7 @@ pub fn run() {
         .manage(commands::CodexCache::default())
         .manage(commands::SessionRuntime::default())
         .manage(commands::TreeCache::default())
+        .manage(commands::SummaryFlags::default())
         .manage(watch::CardWatch::default())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
@@ -55,6 +57,7 @@ pub fn run() {
             commands::last_prompt,
             commands::inspector_data,
             commands::decide_proposal,
+            commands::summarize_now,
             commands::get_card_state,
             commands::list_card_memory,
             watch::watch_cards,

@@ -9,14 +9,48 @@
 //! 每轮强制保底，`<scene>` 标签包裹）、B5 hook 注入、C3 消息窗口。
 //! 空层省略不产生空标签（设计 §4.3）。组装结果逐层带 token 估算，
 //! 供记忆检查器展示（设计 §4.2）。
+//!
+//! M2.7 范围：§4.2 预算表落地为 `Budget`（输入预算 = 模型上下文 × 75%，逐层占比向下取整、
+//! C3 取剩余），每层按层预算做**确定性降级**：B1 无条件保底；B3 从尾部（激活最弱者）先降为
+//! 辨识点行再裁撤，anchors 行最后被裁；B4 按召回序裁尾；C1 未决事项优先于摘要正文；
+//! C3 从前端整条丢且至少保留最近 6 条；A/B2/B5/C2 截断文本并标注省略号。
+//! 逐层用量与裁剪说明记进 `BudgetReport`。
 
 use crate::card::{Card, ExampleTurn, InjectedText};
 use crate::llm::ChatMessage;
 use crate::store::{Blackboard, Message, Persona, Settings};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-/// C3 最近消息窗口条数（M1 v0 固定条数占位；M2 预算分配 + 场景边界裁剪替换）
+/// C3 消息窗口的 L0 上限条数；实际条数再由层预算从**前端整条**裁到预算内
+/// （至少保留 `MIN_WINDOW_MESSAGES` 条——设计 §4.2 硬性规则）
 pub const WINDOW_MESSAGES: usize = 40;
+
+// ---------- 预算表（设计 §4.2）----------
+
+/// §4.2 默认预算分配（全部可配）：层 → 占输入预算的百分比。
+///
+/// 输入预算 = 模型上下文 × 75%（输出预留另计，见 `Settings::input_budget`）。
+/// 逐层按 `input_tokens × pct / 100` **向下取整**，**C3 取剩余**（表内其余层合计 50%，
+/// 于是 C3 = 50%，正落在设计的 45–50%）。两个「组」的含义：
+/// - `A`：A1 契约 + A2 人格 + A3 身份锚共享，按 A1→A2→A3 顺序分配（排最后的 A3 先被截断）；
+/// - `B5`：内心一行 + hook 注入共享，按此顺序分配。
+pub const BUDGET_TABLE: &[(&str, usize)] = &[
+    ("A", 8),
+    ("B1", 2),
+    ("B2", 3),
+    ("B3", 12),
+    ("B4", 8),
+    ("B5", 2),
+    ("C1", 10),
+    ("C2", 5),
+];
+
+/// C3 消息窗口的层位（拿剩余预算）
+pub const BUDGET_C3_ID: &str = "C3";
+
+/// C3 硬性规则：至少保留最近 6 条消息（设计 §4.2）
+pub const MIN_WINDOW_MESSAGES: usize = 6;
 
 /// 黑板时钟每轮步进（分钟；轮 = 一条用户消息得到一条角色回复）
 pub const CLOCK_STEP_MINUTES: i64 = 10;
@@ -127,12 +161,73 @@ pub struct SourceCard {
     pub tokens: usize,
 }
 
+// ---------- 预算与记账（设计 §4.2）----------
+
+/// §4.2 预算：输入预算 + 逐层 token 上限
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Budget {
+    pub input_tokens: usize,
+    /// 层位 → token 上限（BTreeMap：遍历与序列化次序确定，组装可回放）
+    pub layers: BTreeMap<&'static str, usize>,
+}
+
+impl Budget {
+    /// 按 §4.2 比例分配：逐层向下取整，C3 取剩余（各层上限之和 = 输入预算）
+    pub fn from_input(input_tokens: usize) -> Budget {
+        let mut layers: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut used = 0usize;
+        for (id, pct) in BUDGET_TABLE {
+            let tokens = input_tokens * pct / 100;
+            layers.insert(*id, tokens);
+            used += tokens;
+        }
+        layers.insert(BUDGET_C3_ID, input_tokens.saturating_sub(used));
+        Budget {
+            input_tokens,
+            layers,
+        }
+    }
+
+    /// 某层（预算组）的上限；未知层 → 0
+    pub fn limit(&self, id: &str) -> usize {
+        self.layers.get(id).copied().unwrap_or(0)
+    }
+}
+
+/// 单层用量（记忆检查器的「预算条」）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LayerUsage {
+    /// 层位：A1/A2/A3/B1/B2/B3/B4/B5/C1/C2/C3
+    pub id: &'static str,
+    pub name: String,
+    /// 实际占用（该层最终内容 / 实际发送内容的估算 token）
+    pub tokens: usize,
+    /// 该层所属**预算组**的上限（A 组的 A1/A2/A3 共享，B5 的内心与 hook 共享）
+    pub limit: usize,
+    /// 本层被裁/被截断的中文说明（没被动过 → 不序列化）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trimmed: Option<String>,
+}
+
+/// 一轮组装的预算总账：逐层可见、账目可加总（设计 §4.2 / M2.7 验收）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BudgetReport {
+    /// 输入预算 = 模型上下文 × 75%
+    pub input_tokens: usize,
+    /// 各层实际之和
+    pub used_tokens: usize,
+    pub layers: Vec<LayerUsage>,
+}
+
 /// 一次组装的完整结果：分层明细 + 最终发给 LLM 的消息序列
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptAssembly {
     pub layers: Vec<PromptLayer>,
     pub messages: Vec<ChatMessage>,
     pub total_tokens: usize,
+    /// 预算总账（M2.7 · 设计 §4.2）；老前端不认识这个字段就忽略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetReport>,
 }
 
 /// 组装输入
@@ -167,135 +262,313 @@ pub struct BuildInputs<'a> {
     pub user_content: Option<&'a str>,
 }
 
-/// 双槽位组装（设计 §4.1）
+/// 双槽位组装（设计 §4.1）+ 预算与确定性降级（设计 §4.2）。
+///
+/// 降级顺序（确定、可回放）：
+/// 1. **B1 无条件保底**：任何裁剪都不得动它（即使超层预算也照发，只记账）；
+/// 2. A/B2/B5/C2：超预算 → 按层预算**截断文本**（保留前缀 + 省略标记 + 记账）；
+///    A 组先按在场子层数均分保底份额，余量按 A1→A2→A3 回补；
+/// 3. B3：从列表尾部（激活最弱者）先降为「辨识点行」再裁撤，**anchors 行最后被裁**；
+///    裁到只剩 1 条时停手——保留排序最前那条的完整文本（codex 的 `CodexBudget` 已先在层内
+///    做过深卡→卡片→1 行的降级，这里只管按层预算裁条目）；
+/// 4. B4：按召回序裁尾（recall 输出已按分数排序）；
+/// 5. C1：**未决事项优先于摘要正文**——先保未决清单（超预算从尾部裁行），剩下的层预算给
+///    摘要正文（不够就截断 + 省略号）；
+/// 6. C3：从前端整条丢（消息是整条，不切在一句话中间），至少保留最近 6 条（硬性规则，
+///    可能因此略超层预算——与 B1 同属设计允许的例外）。
 pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
+    let budget = Budget::from_input(inputs.settings.input_budget());
     let mut layers: Vec<PromptLayer> = Vec::new();
+    let mut usage: Vec<LayerUsage> = Vec::new();
+    let mut b_messages: Vec<ChatMessage> = Vec::new();
 
     // ---- 槽位 A：系统头部 ----
-    let a1 = global_contract(&inputs.settings.narrative_mode);
+    // A 组（契约 + 人格 + 身份锚，§4.2 的 ~8%）分配规则（确定、可回放）：
+    // ① **均分保底份额**——极端预算下不让某一层把整组吃光、把别的子层整层裁空；
+    // ② 余量按头部顺序（A1 → A2 → A3）回补，于是排最后的 A3 是第一个被截断的
+    //    （§4.1「示例对话……截断至预算」）。
+    let a_limit = budget.limit("A");
+    let mut a_parts: Vec<(&'static str, &'static str, String)> = vec![(
+        "A1",
+        "全局契约",
+        global_contract(&inputs.settings.narrative_mode),
+    )];
     let a2 = inputs
         .persona
         .filter(|p| !p.name.is_empty())
         .map(|p| format!("【用户人格】\n{}：{}", p.name, p.description));
-    let a3 = identity_anchor(inputs.card, inputs.card_state);
-
-    let mut head_parts = vec![a1.clone()];
-    if let Some(a2) = &a2 {
-        head_parts.push(a2.clone());
-        layers.push(layer("A2", "用户人格", a2));
+    if let Some(a2) = a2 {
+        a_parts.push(("A2", "用户人格", a2));
     }
-    head_parts.push(a3.clone());
-    layers.insert(0, layer("A1", "全局契约", &a1));
-    layers.push(layer("A3", "身份锚", &a3));
+    a_parts.push((
+        "A3",
+        "身份锚",
+        identity_anchor(inputs.card, inputs.card_state),
+    ));
 
-    // ---- 槽位 C：历史区（先切窗口，B 槽插在窗口与用户消息之间）----
+    let share = a_limit / a_parts.len();
+    let wants: Vec<usize> = a_parts
+        .iter()
+        .map(|(_, _, text)| estimate_tokens(text))
+        .collect();
+    let mut alloc: Vec<usize> = wants.iter().map(|w| (*w).min(share)).collect();
+    let mut extra = a_limit.saturating_sub(alloc.iter().sum());
+    for i in 0..alloc.len() {
+        let give = wants[i].saturating_sub(alloc[i]).min(extra);
+        alloc[i] += give;
+        extra -= give;
+    }
+
+    let mut head_parts: Vec<String> = Vec::new();
+    for (i, (id, name, text)) in a_parts.iter().enumerate() {
+        let (content, cut) = fit_text(text, alloc[i]);
+        head_parts.push(content.clone());
+        emit(
+            &mut layers,
+            &mut usage,
+            id,
+            name,
+            a_limit,
+            content,
+            cut.map(|t| cut_note("A", a_limit, t)),
+            Vec::new(),
+        );
+    }
+
+    // ---- 槽位 C3：消息窗口（先切 L0 上限，再按层预算从**前端整条丢**）----
+    let c3_limit = budget.limit(BUDGET_C3_ID);
     let start = inputs.history.len().saturating_sub(WINDOW_MESSAGES);
     let window = &inputs.history[start..];
-    let window_messages: Vec<ChatMessage> = window.iter().map(to_openai).collect();
-    if !window_messages.is_empty() {
-        let content = window
-            .iter()
-            .map(|m| format!("{}：{}", display_role(&m.role, &inputs.card.name), m.content))
-            .collect::<Vec<_>>()
-            .join("\n");
-        layers.push(layer("C3", "消息窗口", &content));
+    let lines: Vec<String> = window
+        .iter()
+        .map(|m| format!("{}：{}", display_role(&m.role, &inputs.card.name), m.content))
+        .collect();
+    let n = window.len();
+    let keep_min = MIN_WINDOW_MESSAGES.min(n);
+    let mut keep = 0usize;
+    // 从尾部往前收：装得下就再收一条；装不下时只有「还没到硬性保底」才继续收。
+    // 消息是整条——丢就整条丢，绝不切在一句话中间（设计 §4.2）。
+    while keep < n {
+        let candidate = lines[n - keep - 1..].join("\n");
+        if estimate_tokens(&candidate) > c3_limit && keep + 1 > keep_min {
+            break;
+        }
+        keep += 1;
     }
-
-    // ---- 槽位 C1：未决事项清单（历史区的低注意力位：全量欠账随时查得到，
-    //      但每轮只在 B1 的注意力位看到「此刻该提的」——设计 §8.4 的完备性不牺牲）----
-    // C1 = 滚动摘要正文 + 未决事项清单（设计 §4.1）。未决事项优先于摘要正文：
-    // 预算不够时先裁摘要、再裁清单（§4.2 的硬性规则）。
-    let summary_text = inputs.summary.map(str::trim).filter(|s| !s.is_empty());
-    let c1 = if summary_text.is_none() && inputs.pending_threads.is_empty() {
-        None
-    } else {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(s) = summary_text {
-            parts.push(format!("<summary>\n{s}\n</summary>"));
+    let c3_content = lines[n - keep..].join("\n");
+    let c3_trimmed = {
+        let dropped = n - keep;
+        let mut notes: Vec<String> = Vec::new();
+        if dropped > 0 {
+            notes.push(format!("裁 {dropped} 条"));
         }
-        if !inputs.pending_threads.is_empty() {
-            parts.push(format!(
-                "<pending>\n{}\n</pending>",
-                inputs.pending_threads.join("\n")
-            ));
+        if estimate_tokens(&c3_content) > c3_limit {
+            notes.push(format!("硬性保底最近 {keep} 条"));
         }
-        Some(parts.join("\n"))
+        if notes.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "{}（预算 {}）",
+                notes.join("；"),
+                limit_note(BUDGET_C3_ID, c3_limit)
+            ))
+        }
     };
-    if let Some(c1) = &c1 {
-        layers.push(layer("C1", "摘要与未决事项", c1));
-    }
+    emit(
+        &mut layers,
+        &mut usage,
+        BUDGET_C3_ID,
+        "消息窗口",
+        c3_limit,
+        c3_content,
+        c3_trimmed,
+        Vec::new(),
+    );
+
+    // ---- 槽位 C1：滚动摘要 + 未决事项清单（历史区的低注意力位：全量欠账随时查得到，
+    //      但每轮只在 B1 的注意力位看到「此刻该提的」——设计 §8.4 的完备性不牺牲）----
+    // §4.2 硬性规则「未决事项优先于摘要正文」：未决清单先分预算，摘要吃剩下的。
+    let c1_limit = budget.limit("C1");
+    let (c1, c1_trimmed) = summary_and_pending(inputs.summary, inputs.pending_threads, c1_limit);
+    emit(
+        &mut layers,
+        &mut usage,
+        "C1",
+        "摘要与未决事项",
+        c1_limit,
+        c1.clone(),
+        c1_trimmed,
+        Vec::new(),
+    );
 
     // ---- 槽位 B：动态锚（紧邻最新用户消息之前）----
+    // B1 故事现状卡：**无条件保底**（设计 §4.2）——超层预算也一字不动，只在账目里说明
+    let b1_limit = budget.limit("B1");
     let snapshot = SceneSnapshot::from_blackboard(inputs.blackboard)
         .with_threads(inputs.concerns, inputs.resolutions);
     let b1 = format!("<scene>\n{}\n</scene>", snapshot.render());
-    layers.push(layer("B1", "场景快照", &b1));
-    let mut b_messages = vec![ChatMessage { role: "system".into(), content: b1 }];
+    let b1_trimmed = (estimate_tokens(&b1) > b1_limit)
+        .then(|| format!("保底不裁（超预算 {}）", limit_note("B1", b1_limit)));
+    emit(
+        &mut layers,
+        &mut usage,
+        "B1",
+        "场景快照",
+        b1_limit,
+        b1.clone(),
+        b1_trimmed,
+        Vec::new(),
+    );
+    b_messages.push(ChatMessage {
+        role: "system".into(),
+        content: b1,
+    });
 
     // B2 指令层（设计 §4.1：状态树 directive 根→叶，子覆盖父；「输出约束」的落点——
     // 把开放生成收窄到当前状态允许的表演空间，§7.4）
+    let b2_limit = budget.limit("B2");
     if let Some(d) = inputs.directive.filter(|d| !d.trim().is_empty()) {
-        let content = format!("<directive>\n{d}\n</directive>");
-        layers.push(layer("B2", "导演指令", &content));
-        b_messages.push(ChatMessage {
-            role: "system".into(),
+        let (content, cut) = fit_tagged("directive", d, b2_limit);
+        if !content.is_empty() {
+            b_messages.push(ChatMessage {
+                role: "system".into(),
+                content: content.clone(),
+            });
+        }
+        emit(
+            &mut layers,
+            &mut usage,
+            "B2",
+            "导演指令",
+            b2_limit,
             content,
-        });
+            cut.map(|t| cut_note("B2", b2_limit, t)),
+            Vec::new(),
+        );
     }
 
     // B3 设定集激活实体卡（设计 §6.3：分级注入 + anchors 恒注入；空层省略）
-    if let Some(b3) = card_layer("B3", "设定集", "world", inputs.entity_cards) {
-        b_messages.push(ChatMessage {
-            role: "system".into(),
-            content: b3.content.clone(),
-        });
-        layers.push(b3);
-    }
-    // B4 记忆宫殿召回（设计 §4.1：统一「回忆」框架 + 故事时间戳，防止把旧事当正在发生）
-    if let Some(b4) = card_layer("B4", "回忆", "memory", inputs.memory_cards) {
-        b_messages.push(ChatMessage {
-            role: "system".into(),
-            content: b4.content.clone(),
-        });
-        layers.push(b4);
-    }
-    // B5 内心（心理运行时摘要）：与 hook 注入同槽，空则省略（设计 §4.3）
-    if let Some(line) = inputs.psyche_line.filter(|l| !l.trim().is_empty()) {
-        b_messages.push(ChatMessage {
-            role: "system".into(),
-            content: line.to_string(),
-        });
-        layers.push(layer("B5", "内心", line));
-    }
-    if !inputs.hook_injections.is_empty() {
-        let content = inputs
-            .hook_injections
-            .iter()
-            .map(|i| format!("[{}] {}", i.role, i.text))
-            .collect::<Vec<_>>()
-            .join("\n");
-        layers.push(layer("B5", "hook 注入", &content));
-        for inj in inputs.hook_injections {
+    let b3_limit = budget.limit("B3");
+    if let Some(b3) = entity_layer(inputs.entity_cards, b3_limit) {
+        if !b3.content.is_empty() {
             b_messages.push(ChatMessage {
-                role: normalize_role(&inj.role),
-                content: inj.text.clone(),
+                role: "system".into(),
+                content: b3.content.clone(),
             });
         }
+        emit(
+            &mut layers,
+            &mut usage,
+            "B3",
+            "设定集",
+            b3_limit,
+            b3.content,
+            b3.trimmed,
+            b3.sources,
+        );
+    }
+    // B4 记忆宫殿召回（设计 §4.1：统一「回忆」框架 + 故事时间戳，防止把旧事当正在发生）
+    let b4_limit = budget.limit("B4");
+    if let Some(b4) = recall_layer(inputs.memory_cards, b4_limit) {
+        if !b4.content.is_empty() {
+            b_messages.push(ChatMessage {
+                role: "system".into(),
+                content: b4.content.clone(),
+            });
+        }
+        emit(
+            &mut layers,
+            &mut usage,
+            "B4",
+            "回忆",
+            b4_limit,
+            b4.content,
+            b4.trimmed,
+            b4.sources,
+        );
+    }
+    // B5 内心（心理运行时摘要）+ hook 注入：同槽共享 B5 组预算（先内心、后注入），空则省略
+    let b5_limit = budget.limit("B5");
+    let mut b5_left = b5_limit;
+    if let Some(line) = inputs.psyche_line.filter(|l| !l.trim().is_empty()) {
+        let (text, cut) = fit_text(line, b5_left);
+        b5_left = b5_left.saturating_sub(estimate_tokens(&text));
+        if !text.is_empty() {
+            b_messages.push(ChatMessage {
+                role: "system".into(),
+                content: text.clone(),
+            });
+        }
+        emit(
+            &mut layers,
+            &mut usage,
+            "B5",
+            "内心",
+            b5_limit,
+            text,
+            cut.map(|t| cut_note("B5", b5_limit, t)),
+            Vec::new(),
+        );
+    }
+    if !inputs.hook_injections.is_empty() {
+        let mut preview: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let mut dropped = 0usize;
+        // 逐条按剩余预算截断（B5 是「截断」层，不做层内裁撤；预算耗尽才整条丢并记账）。
+        // 记账算的是检查器里那行预览（`[role] 文本`），所以前缀与分隔符也占预算
+        for inj in inputs.hook_injections {
+            let prefix = format!("[{}] ", inj.role);
+            let overhead = estimate_tokens(&prefix) + usize::from(!preview.is_empty());
+            let (text, cut) = fit_text(&inj.text, b5_left.saturating_sub(overhead));
+            if text.is_empty() {
+                dropped += 1;
+                continue;
+            }
+            b5_left = b5_left.saturating_sub(estimate_tokens(&text) + overhead);
+            if let Some(t) = cut {
+                if notes.is_empty() {
+                    notes.push(cut_note("B5", b5_limit, t));
+                }
+            }
+            preview.push(format!("[{}] {}", inj.role, text.clone()));
+            b_messages.push(ChatMessage {
+                role: normalize_role(&inj.role),
+                content: text,
+            });
+        }
+        if dropped > 0 {
+            notes.push(format!("裁 {dropped} 条注入"));
+        }
+        emit(
+            &mut layers,
+            &mut usage,
+            "B5",
+            "hook 注入",
+            b5_limit,
+            preview.join("\n"),
+            if notes.is_empty() {
+                None
+            } else {
+                Some(notes.join("；"))
+            },
+            Vec::new(),
+        );
     }
 
-    // ---- 最终消息序列：A(1) + C3(n) + B(n) + user(0..1) ----
-    let mut messages = Vec::with_capacity(3 + window_messages.len() + b_messages.len());
+    // ---- 最终消息序列：A(1) + C1(0..1) + C3(n) + B(n) + user(0..1) ----
+    let mut messages = Vec::with_capacity(4 + keep + b_messages.len());
     messages.push(ChatMessage {
         role: "system".into(),
         content: head_parts.join("\n\n"),
     });
-    if let Some(c1) = c1 {
+    if !c1.is_empty() {
         messages.push(ChatMessage {
             role: "system".into(),
             content: c1,
         });
     }
-    messages.extend(window_messages);
+    messages.extend(window[n - keep..].iter().map(to_openai));
     messages.extend(b_messages);
     if let Some(u) = inputs.user_content {
         messages.push(ChatMessage {
@@ -304,11 +577,18 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
         });
     }
 
+    // 账目：used = 各层实际之和（= total_tokens），逐层可加总（M2.7 验收）
     let total_tokens: usize = layers.iter().map(|l| l.tokens).sum();
+    let used_tokens: usize = usage.iter().map(|u| u.tokens).sum();
     PromptAssembly {
         layers,
         messages,
         total_tokens,
+        budget: Some(BudgetReport {
+            input_tokens: budget.input_tokens,
+            used_tokens,
+            layers: usage,
+        }),
     }
 }
 
@@ -322,37 +602,343 @@ fn layer(id: &'static str, name: &str, content: &str) -> PromptLayer {
     }
 }
 
-/// 分层带激活原因（设定集/宫殿这类「逐卡」层用）
-fn card_layer(
+// ---------- 预算裁剪（设计 §4.2；确定、可回放）----------
+
+/// 收尾：把一层同时记进检查器（layers）与预算账目（usage）。
+/// 空内容不产生空标签（设计 §4.3）；被预算裁空的层只留一条账目说明。
+fn emit(
+    layers: &mut Vec<PromptLayer>,
+    usage: &mut Vec<LayerUsage>,
     id: &'static str,
     name: &str,
-    tag: &str,
-    cards: &[SourceCard],
-) -> Option<PromptLayer> {
+    limit: usize,
+    content: String,
+    trimmed: Option<String>,
+    sources: Vec<String>,
+) {
+    if content.trim().is_empty() {
+        if let Some(trimmed) = trimmed {
+            usage.push(LayerUsage {
+                id,
+                name: name.into(),
+                tokens: 0,
+                limit,
+                trimmed: Some(trimmed),
+            });
+        }
+        return;
+    }
+    let mut l = layer(id, name, &content);
+    l.sources = sources;
+    usage.push(LayerUsage {
+        id,
+        name: l.name.clone(),
+        tokens: l.tokens,
+        limit,
+        trimmed,
+    });
+    layers.push(l);
+}
+
+/// 逐卡层（B3/B4）的裁剪结果
+struct CardLayerText {
+    content: String,
+    sources: Vec<String>,
+    trimmed: Option<String>,
+}
+
+/// 层预算的中文说明（记账文案）：`12% · 3932 token`
+fn limit_note(id: &str, limit: usize) -> String {
+    match BUDGET_TABLE.iter().find(|(k, _)| *k == id) {
+        Some((_, pct)) => format!("{pct}% · {limit} token"),
+        _ => format!("余量 · {limit} token"), // C3 拿剩余
+    }
+}
+
+/// 「截断」的记账说明（§4.2：截断要标注，不静默丢）
+fn cut_note(id: &str, limit: usize, tokens: usize) -> String {
+    format!("截断至 {tokens} token（预算 {}）", limit_note(id, limit))
+}
+
+/// 省略标记：截断必须显式标注
+fn trunc_mark(omitted: usize) -> String {
+    format!("\n…（预算截断，省略 {omitted} 字）")
+}
+
+/// 按 token 上限截断：`render(n)` = 保留前 n 个字符时的最终文本。
+/// 二分出最大的 n，再回退保证一定装得下（`div_ceil` 下 token 计数不是严格单调）。
+fn truncate_by(n_chars: usize, limit: usize, render: &dyn Fn(usize) -> String) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    let (mut lo, mut hi) = (0usize, n_chars);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if estimate_tokens(&render(mid)) <= limit {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    while lo > 0 && estimate_tokens(&render(lo)) > limit {
+        lo -= 1;
+    }
+    if estimate_tokens(&render(lo)) > limit {
+        return "…".into(); // 连省略标记都装不下的极小预算
+    }
+    render(lo)
+}
+
+/// 无标签文本的层预算裁剪：装得下原样返回；装不下 → 前缀 + 省略标记。
+/// 返回 `Some(截断后 token)` 供记账。
+fn fit_text(text: &str, limit: usize) -> (String, Option<usize>) {
+    if estimate_tokens(text) <= limit {
+        return (text.to_string(), None);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let render = |n: usize| {
+        format!(
+            "{}{}",
+            chars[..n].iter().collect::<String>(),
+            trunc_mark(chars.len() - n)
+        )
+    };
+    let out = truncate_by(chars.len(), limit, &render);
+    let tokens = estimate_tokens(&out);
+    (out, Some(tokens))
+}
+
+/// 带标签层（`<tag>…</tag>`）的层预算裁剪：截的是标签体，**收尾标签必须补回**
+/// （模型靠标签分辨资料块，设计 §4.1）
+fn fit_tagged(tag: &str, body: &str, limit: usize) -> (String, Option<usize>) {
+    let wrap = |b: &str| format!("<{tag}>\n{b}\n</{tag}>");
+    if estimate_tokens(&wrap(body)) <= limit {
+        return (wrap(body), None);
+    }
+    let budget = limit.saturating_sub(estimate_tokens(&format!("<{tag}>\n\n</{tag}>")));
+    let chars: Vec<char> = body.chars().collect();
+    let render = |n: usize| {
+        format!(
+            "{}{}",
+            chars[..n].iter().collect::<String>(),
+            trunc_mark(chars.len() - n)
+        )
+    };
+    let inner = truncate_by(chars.len(), budget, &render);
+    if inner.is_empty() {
+        return (String::new(), Some(0)); // 预算耗尽 → 空层省略（不产生空标签），但账目留痕
+    }
+    let out = wrap(&inner);
+    let tokens = estimate_tokens(&out);
+    (out, Some(tokens))
+}
+
+/// C1 摘要 + 未决事项：**未决事项优先于摘要正文**（设计 §4.2 硬性规则）——
+/// 先给未决清单分配（不够就从尾部裁行），剩下的层预算给摘要正文（不够就截断 + 省略号）。
+fn summary_and_pending(
+    summary: Option<&str>,
+    pending: &[String],
+    limit: usize,
+) -> (String, Option<String>) {
+    let summary = summary.map(str::trim).filter(|s| !s.is_empty());
+    if summary.is_none() && pending.is_empty() {
+        return (String::new(), None);
+    }
+    let mut notes: Vec<String> = Vec::new();
+
+    // ① 未决事项（优先）：整块先分预算，超预算从尾部裁行
+    let pending_block = {
+        let wrap = |ls: &[String]| format!("<pending>\n{}\n</pending>", ls.join("\n"));
+        let mut keep = pending.len();
+        while keep > 0 && estimate_tokens(&wrap(&pending[..keep])) > limit {
+            keep -= 1;
+        }
+        if keep < pending.len() {
+            notes.push(format!("裁 {} 行未决事项", pending.len() - keep));
+        }
+        if keep == 0 {
+            String::new()
+        } else {
+            wrap(&pending[..keep])
+        }
+    };
+
+    // ② 摘要正文：吃剩下的层预算（正文先于未决清单被裁）
+    let mut summary_block = String::new();
+    if let Some(s) = summary {
+        let wrap = |body: &str| format!("<summary>\n{body}\n</summary>");
+        let sep = usize::from(!pending_block.is_empty());
+        let left = limit.saturating_sub(estimate_tokens(&pending_block) + sep);
+        let overhead = estimate_tokens(&format!("<summary>\n\n</summary>"));
+        if left <= overhead {
+            notes.push("裁摘要正文（未决事项优先）".into());
+        } else if estimate_tokens(&wrap(s)) > left {
+            let chars: Vec<char> = s.chars().collect();
+            let render = |n: usize| {
+                format!(
+                    "{}{}",
+                    chars[..n].iter().collect::<String>(),
+                    trunc_mark(chars.len() - n)
+                )
+            };
+            let inner = truncate_by(chars.len(), left - overhead, &render);
+            if inner.is_empty() {
+                notes.push("裁摘要正文（未决事项优先）".into());
+            } else {
+                summary_block = wrap(&inner);
+                notes.push(format!("摘要截断至 {} token", estimate_tokens(&summary_block)));
+            }
+        } else {
+            summary_block = wrap(s);
+        }
+    }
+
+    // ③ 组装：摘要正文在前、未决清单在后（设计 §4.1 的 C1 顺序）
+    let content = [summary_block, pending_block]
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = if notes.is_empty() {
+        None
+    } else {
+        Some(format!("{}（预算 {}）", notes.join("；"), limit_note("C1", limit)))
+    };
+    (content, trimmed)
+}
+
+/// 卡片文本里的 anchors 行（codex 渲染为 `辨识点:…`，设计 §6.3）；没有 → None
+fn anchors_line(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("辨识点:") || l.starts_with("锚点:"))
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// 检查器里的一行激活原因：`小雨·人 ← 在场:图书馆 / 滞回`
+fn source_line(id: &str, reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        format!("{id} ← 激活")
+    } else {
+        format!("{id} ← {}", reasons.join(" / "))
+    }
+}
+
+/// 逐卡层的「裁/降级」记账说明
+fn card_trim_note(
+    id: &str,
+    culled: usize,
+    demoted: usize,
+    over_budget: bool,
+    limit: usize,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if culled > 0 {
+        parts.push(format!("裁 {culled} 条"));
+    }
+    if demoted > 0 {
+        parts.push(format!("{demoted} 条降为辨识点行"));
+    }
+    if over_budget {
+        parts.push("仅剩 1 条，超层预算".into());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("{}（预算 {}）", parts.join("；"), limit_note(id, limit)))
+    }
+}
+
+/// B3 实体卡：按层预算**裁条目**。列表由 codex 按激活强度排序 → 从尾部裁 = 从最弱者裁。
+///
+/// 尾部条目先「降级」为只留 anchors/辨识点行（**anchors 行最后被裁**），仍超预算才整条
+/// 「裁撤」；裁到只剩 1 条时停手——保留排序最前那条的完整文本（设计 §4.2/§6.3）。
+fn entity_layer(cards: &[SourceCard], limit: usize) -> Option<CardLayerText> {
     if cards.is_empty() {
         return None; // 空层省略，不产生空标签（设计 §4.3）
     }
-    let content = format!(
-        "<{tag}>\n{}\n</{tag}>",
-        cards
-            .iter()
-            .map(|c| c.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    let sources = cards
-        .iter()
-        .map(|c| {
-            if c.reasons.is_empty() {
-                format!("{} ← 激活", c.id)
-            } else {
-                format!("{} ← {}", c.id, c.reasons.join(" / "))
+    let render = |kept: &[SourceCard]| -> String {
+        if kept.is_empty() {
+            return String::new();
+        }
+        format!(
+            "<world>\n{}\n</world>",
+            kept.iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let mut kept: Vec<SourceCard> = cards.to_vec();
+    let mut demoted = 0usize;
+    let mut culled = 0usize;
+    // ① 降级：从尾部逐条降为「辨识点行」（第 1 条不降级——排序最前那条完整保留）
+    let mut i = kept.len();
+    while i > 1 && estimate_tokens(&render(&kept)) > limit {
+        i -= 1;
+        if let Some(line) = anchors_line(&kept[i].text) {
+            if line != kept[i].text {
+                kept[i].tokens = estimate_tokens(&line);
+                kept[i].text = line;
+                demoted += 1;
             }
-        })
-        .collect();
-    let mut l = layer(id, name, &content);
-    l.sources = sources;
-    Some(l)
+        }
+    }
+    // ② 裁撤：仍超预算 → 从尾部整条裁掉（裁到只剩 1 条为止）
+    while kept.len() > 1 && estimate_tokens(&render(&kept)) > limit {
+        kept.pop();
+        culled += 1;
+    }
+    let content = render(&kept);
+    let over_budget = estimate_tokens(&content) > limit;
+    Some(CardLayerText {
+        sources: kept
+            .iter()
+            .map(|c| source_line(&c.id, &c.reasons))
+            .collect(),
+        content,
+        trimmed: card_trim_note("B3", culled, demoted, over_budget, limit),
+    })
+}
+
+/// B4 记忆宫殿召回：按召回序（分数降序）**裁尾**；整层被裁空则省略（不产生空标签），
+/// 但账目里留一条说明。
+fn recall_layer(cards: &[SourceCard], limit: usize) -> Option<CardLayerText> {
+    if cards.is_empty() {
+        return None;
+    }
+    let render = |kept: &[SourceCard]| -> String {
+        if kept.is_empty() {
+            return String::new();
+        }
+        format!(
+            "<memory>\n{}\n</memory>",
+            kept.iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let mut kept: Vec<SourceCard> = cards.to_vec();
+    let mut culled = 0usize;
+    while !kept.is_empty() && estimate_tokens(&render(&kept)) > limit {
+        kept.pop();
+        culled += 1;
+    }
+    Some(CardLayerText {
+        sources: kept
+            .iter()
+            .map(|c| source_line(&c.id, &c.reasons))
+            .collect(),
+        content: render(&kept),
+        trimmed: card_trim_note("B4", culled, 0, false, limit),
+    })
 }
 
 /// 本地消息角色 → OpenAI 角色（char → assistant）
@@ -751,5 +1337,475 @@ mod tests {
         // 未设置时钟：不动
         assert_eq!(advance_clock(1, ""), (1, "".to_string()));
         assert_eq!(advance_clock(1, "25:99"), (1, "25:99".to_string()));
+    }
+
+    // ---------- M2.7 预算分配与确定性降级 ----------
+
+    fn windowed(context_window: usize) -> Settings {
+        let mut s = Settings::default();
+        s.context_window = Some(context_window);
+        s
+    }
+
+    fn sample_bb() -> Blackboard {
+        Blackboard {
+            day: 3,
+            clock: "21:30".into(),
+            place: "图书馆自习区".into(),
+            actors: vec!["小雨".into(), "玩家".into()],
+            extra: Default::default(),
+        }
+    }
+
+    fn src_card(id: &str, text: &str) -> SourceCard {
+        SourceCard {
+            id: id.into(),
+            text: text.into(),
+            reasons: vec!["测试".into()],
+            tokens: estimate_tokens(text),
+        }
+    }
+
+    fn layer_of<'a>(asm: &'a PromptAssembly, id: &str) -> &'a PromptLayer {
+        asm.layers
+            .iter()
+            .find(|l| l.id == id)
+            .unwrap_or_else(|| panic!("注入层里缺少 {id}"))
+    }
+
+    fn usage_of<'a>(asm: &'a PromptAssembly, id: &str) -> &'a LayerUsage {
+        asm.budget
+            .as_ref()
+            .expect("组装结果必须带预算总账")
+            .layers
+            .iter()
+            .find(|u| u.id == id)
+            .unwrap_or_else(|| panic!("账目里缺少 {id}"))
+    }
+
+    /// 各层都塞满的富输入（总账与确定性用例共用）
+    fn build_rich() -> PromptAssembly {
+        let settings = Settings::default(); // 上下文 32768 → 输入预算 24576
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let persona = Persona {
+            name: "夜读者".into(),
+            description: "深夜常来的读者。".into(),
+        };
+        let directive = "令".repeat(2000);
+        let hook: Vec<InjectedText> = (0..3)
+            .map(|i| InjectedText {
+                role: "system".into(),
+                text: format!("注入{i}:{}", "注".repeat(300)),
+            })
+            .collect();
+        let entities: Vec<SourceCard> = (0..20)
+            .map(|i| src_card(&format!("实体{i}"), &format!("实体{i}{}", "甲".repeat(400))))
+            .collect();
+        let memories: Vec<SourceCard> = (0..20)
+            .map(|i| src_card(&format!("回忆{i}"), &"乙".repeat(400)))
+            .collect();
+        let pending: Vec<String> = (0..60)
+            .map(|i| format!("欠账{i}：{}", "丙".repeat(30)))
+            .collect();
+        let summary = "丁".repeat(5000);
+        let concerns = vec!["心里事——一句 framing".to_string()];
+        let history: Vec<Message> = (0..40)
+            .map(|i| msg("user", &"戊".repeat(200), i as u64 / 2 + 1))
+            .collect();
+
+        let mut inp = inputs(
+            &settings,
+            Some(&persona),
+            &card,
+            &state,
+            &bb,
+            &hook,
+            &history,
+            Some("走吧"),
+        );
+        inp.directive = Some(&directive);
+        inp.entity_cards = &entities;
+        inp.memory_cards = &memories;
+        inp.pending_threads = &pending;
+        inp.summary = Some(&summary);
+        inp.concerns = &concerns;
+        build(&inp)
+    }
+
+    #[test]
+    fn budget_from_input_ratios_and_c3_remainder() {
+        let b = Budget::from_input(32768);
+        assert_eq!(b.input_tokens, 32768);
+        assert_eq!(b.limit("A"), 2621); // 8%
+        assert_eq!(b.limit("B1"), 655); // 2%
+        assert_eq!(b.limit("B2"), 983); // 3%
+        assert_eq!(b.limit("B3"), 3932); // 12%
+        assert_eq!(b.limit("B4"), 2621); // 8%
+        assert_eq!(b.limit("B5"), 655); // 2%
+        assert_eq!(b.limit("C1"), 3276); // 10%
+        assert_eq!(b.limit("C2"), 1638); // 5%
+        assert_eq!(b.limit("C3"), 16387, "C3 取剩余 ≈ 50%");
+        assert_eq!(b.layers.values().sum::<usize>(), 32768, "各层上限可加总");
+        assert!(b.limit("C3") * 100 >= b.input_tokens * 45, "C3 ≥ 45%");
+        // C3 = 50% 的余量 + 各层向下取整的零头（每层最多丢 1 token）
+        assert!(
+            b.limit("C3") <= b.input_tokens * 50 / 100 + BUDGET_TABLE.len(),
+            "C3 ≈ 50%（含取整零头）"
+        );
+
+        // 向下取整（C3 吃余量：10 - 2 = 8）
+        let tiny = Budget::from_input(10);
+        assert_eq!(tiny.limit("A"), 0);
+        assert_eq!(tiny.limit("B3"), 1); // 10 × 12% = 1.2 → 1
+        assert_eq!(tiny.limit("C1"), 1); // 10 × 10% = 1
+        assert_eq!(tiny.limit("C3"), 8);
+        assert_eq!(tiny.layers.values().sum::<usize>(), 10);
+
+        // 输入预算 = 模型上下文 × 75%（context_window 缺省按 32768 计）
+        assert_eq!(Settings::default().input_budget(), 24576);
+        assert_eq!(windowed(8192).input_budget(), 6144);
+    }
+
+    #[test]
+    fn b1_is_kept_whole_even_over_budget() {
+        let settings = windowed(400); // 输入预算 300 → B1 限 6 token
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let asm = build(&inputs(
+            &settings,
+            None,
+            &card,
+            &state,
+            &bb,
+            &[],
+            &[],
+            Some("走吧"),
+        ));
+
+        let full = format!(
+            "<scene>\n{}\n</scene>",
+            SceneSnapshot::from_blackboard(&bb).render()
+        );
+        let b1 = layer_of(&asm, "B1");
+        assert_eq!(b1.content, full, "B1 无条件保底：一字不动");
+        let u = usage_of(&asm, "B1");
+        assert_eq!(u.limit, Budget::from_input(300).limit("B1"));
+        assert!(u.tokens > u.limit, "本用例构造的就是超层预算");
+        assert!(u.trimmed.as_deref().unwrap().contains("保底不裁"));
+        assert!(
+            asm.messages.iter().any(|m| m.content == full),
+            "发出去的也是全文"
+        );
+    }
+
+    #[test]
+    fn b3_culls_tail_entries_and_records() {
+        let settings = windowed(3000); // 输入预算 2250 → B3 限 270
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let cards = vec![
+            src_card("卡1·人", &"甲".repeat(90)),
+            src_card("卡2·人", &"乙".repeat(90)),
+            src_card("卡3·人", &"丙".repeat(90)),
+        ];
+        let mut inp = inputs(&settings, None, &card, &state, &bb, &[], &[], Some("走吧"));
+        inp.entity_cards = &cards;
+        let asm = build(&inp);
+
+        let b3 = layer_of(&asm, "B3");
+        assert!(b3.content.contains(&"甲".repeat(90)));
+        assert!(b3.content.contains(&"乙".repeat(90)));
+        assert!(!b3.content.contains('丙'), "从尾部裁：{}", b3.content);
+        let u = usage_of(&asm, "B3");
+        assert!(b3.tokens <= u.limit, "裁到层预算内：{} > {}", b3.tokens, u.limit);
+        assert_eq!(b3.sources.len(), 2, "被裁的卡不残留激活原因");
+        let note = u.trimmed.as_deref().expect("裁条目要记账");
+        assert!(note.contains("裁 1 条") && note.contains("12%"), "{note}");
+    }
+
+    #[test]
+    fn b3_demotes_tail_to_anchors_line_before_culling() {
+        let settings = windowed(3000); // 输入预算 2250 → B3 限 270
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let cards = vec![
+            src_card("卡1·人", &"甲".repeat(90)),
+            src_card("卡2·人", &"乙".repeat(90)),
+            src_card("卡3·人", &format!("{}\n辨识点:丙的泪痣", "丙".repeat(90))),
+        ];
+        let mut inp = inputs(&settings, None, &card, &state, &bb, &[], &[], Some("走吧"));
+        inp.entity_cards = &cards;
+        let asm = build(&inp);
+
+        let b3 = layer_of(&asm, "B3");
+        assert!(
+            b3.content.contains("辨识点:丙的泪痣"),
+            "anchors 行最后被裁：{}",
+            b3.content
+        );
+        assert!(!b3.content.contains(&"丙".repeat(10)), "正文先降级掉");
+        assert_eq!(b3.sources.len(), 3, "降级的条目仍在（只降级不裁撤）");
+        let note = usage_of(&asm, "B3").trimmed.as_deref().unwrap();
+        assert!(note.contains("1 条降为辨识点行"), "{note}");
+        assert!(!note.contains("裁 1 条"), "这一档只降级：{note}");
+    }
+
+    #[test]
+    fn b4_culls_tail_in_recall_order() {
+        let settings = windowed(3000); // 输入预算 2250 → B4 限 180
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let mems = vec![
+            src_card("回忆1", &"乙".repeat(60)),
+            src_card("回忆2", &"乙".repeat(60)),
+            src_card("回忆3", &"乙".repeat(60)),
+        ];
+        let mut inp = inputs(&settings, None, &card, &state, &bb, &[], &[], Some("走吧"));
+        inp.memory_cards = &mems;
+        let asm = build(&inp);
+
+        let b4 = layer_of(&asm, "B4");
+        assert_eq!(
+            b4.content.matches(&"乙".repeat(60)).count(),
+            2,
+            "按召回序裁尾：{}",
+            b4.content
+        );
+        assert_eq!(b4.sources.len(), 2);
+        assert!(b4.sources[0].starts_with("回忆1") && b4.sources[1].starts_with("回忆2"));
+        let u = usage_of(&asm, "B4");
+        assert!(b4.tokens <= u.limit);
+        assert!(u.trimmed.as_deref().unwrap().contains("裁 1 条"));
+    }
+
+    #[test]
+    fn c3_keeps_at_least_six_whole_messages() {
+        let settings = windowed(600); // 输入预算 450 → C3 限 225
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let history: Vec<Message> = (1..=10)
+            .map(|i| {
+                msg(
+                    if i % 2 == 0 { "char" } else { "user" },
+                    &format!("第{}条{}", i, "啊".repeat(57)),
+                    i as u64,
+                )
+            })
+            .collect();
+        let asm = build(&inputs(
+            &settings,
+            None,
+            &card,
+            &state,
+            &bb,
+            &[],
+            &history,
+            Some("新"),
+        ));
+
+        let c3 = layer_of(&asm, "C3");
+        assert_eq!(
+            c3.content.lines().count(),
+            MIN_WINDOW_MESSAGES,
+            "硬性规则：至少保留最近 6 条"
+        );
+        assert!(!c3.content.contains("第4条"), "前端整条丢：{}", c3.content);
+        assert!(c3.content.contains("第5条") && c3.content.contains("第10条"));
+        assert!(
+            c3.content.lines().all(|l| l.ends_with(&"啊".repeat(57))),
+            "不切在一句话中间：{}",
+            c3.content
+        );
+        // 真的发出去的是这 6 条（逐条整发，不截断）
+        let window_sent: Vec<&str> = asm
+            .messages
+            .iter()
+            .filter(|m| m.content.starts_with('第'))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(window_sent.len(), MIN_WINDOW_MESSAGES);
+        for m in &history[4..] {
+            assert!(
+                asm.messages.iter().any(|s| s.content == m.content),
+                "整条发送：{}",
+                m.content
+            );
+        }
+        let u = usage_of(&asm, "C3");
+        let note = u.trimmed.as_deref().expect("裁消息要记账");
+        assert!(note.contains("裁 4 条"), "{note}");
+        assert!(note.contains("硬性保底最近 6 条"), "保底导致的超预算也要说明：{note}");
+    }
+
+    #[test]
+    fn over_budget_text_layers_truncate_with_ellipsis() {
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let settings = windowed(2000); // 输入预算 1500：A=120 / B2=45 / B5=30
+        let directive = "令".repeat(200);
+        let hook = vec![InjectedText {
+            role: "system".into(),
+            text: "注".repeat(200),
+        }];
+        let mut inp = inputs(&settings, None, &card, &state, &bb, &hook, &[], Some("走吧"));
+        inp.directive = Some(&directive);
+        let asm = build(&inp);
+
+        for id in ["A1", "B2", "B5"] {
+            let l = layer_of(&asm, id);
+            assert!(
+                l.content.contains("…（预算截断，省略 "),
+                "{id} 应显式标注省略号：{}",
+                l.content
+            );
+            let u = usage_of(&asm, id);
+            assert!(l.tokens <= u.limit, "{id} 截到层预算内：{} > {}", l.tokens, u.limit);
+            assert!(u.trimmed.as_deref().unwrap().contains("截断至"), "{id} 要记账");
+        }
+        // 带标签层截断后收尾标签必须补回（模型靠标签分辨资料块）
+        let b2 = layer_of(&asm, "B2");
+        assert!(b2.content.starts_with("<directive>") && b2.content.ends_with("</directive>"));
+        // 发给模型的 hook 文本 = 检查器里那份截断文本（不静默丢）
+        assert!(asm
+            .messages
+            .iter()
+            .any(|m| m.content.contains("…（预算截断，省略 ")));
+
+        // A 组装得下时原样；A 组排最后的 A3 先被截断（§4.1 示例对话截断至预算）
+        let mut big = sample_card();
+        big.personality = "温".repeat(400);
+        let settings = windowed(12000); // 输入预算 9000 → A 限 720
+        let asm2 = build(&inputs(&settings, None, &big, &state, &bb, &[], &[], None));
+        let a1 = layer_of(&asm2, "A1");
+        assert!(a1.content.ends_with("勿急于了结。"), "A1 装得下就原样");
+        assert!(usage_of(&asm2, "A1").trimmed.is_none());
+        let a3 = layer_of(&asm2, "A3");
+        assert!(
+            a3.content.contains("…（预算截断，省略 "),
+            "A3 先被截断：{}",
+            a3.content
+        );
+        assert!(usage_of(&asm2, "A3").trimmed.is_some());
+    }
+
+    #[test]
+    fn c1_pending_before_summary_and_culls_from_tail() {
+        let settings = windowed(3000); // 输入预算 2250 → C1 限 225
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let pending: Vec<String> = (0..10)
+            .map(|i| format!("欠账{i}：{}", "丙".repeat(30)))
+            .collect();
+        let summary = "摘要".repeat(50);
+        let mut inp = inputs(&settings, None, &card, &state, &bb, &[], &[], None);
+        inp.pending_threads = &pending;
+        inp.summary = Some(&summary);
+        let asm = build(&inp);
+
+        let c1 = layer_of(&asm, "C1");
+        assert!(c1.content.contains("<summary>"), "摘要在前");
+        assert!(c1.content.ends_with("</pending>"), "未决清单在后");
+        assert!(c1.content.contains("欠账0") && !c1.content.contains("欠账9"), "从尾部裁");
+        // 摘要正文优先让路（未决事项优先）：正文被截断，清单仍在
+        let note = usage_of(&asm, "C1").trimmed.as_deref().unwrap();
+        assert!(note.contains("裁") && note.contains("未决事项"), "{note}");
+        assert!(note.contains("摘要截断至"), "{note}");
+        assert!(c1.tokens <= usage_of(&asm, "C1").limit);
+    }
+
+    #[test]
+    fn total_usage_within_input_budget_and_ledger_adds_up() {
+        let asm = build_rich();
+        let b = asm.budget.as_ref().expect("组装结果必须带预算总账");
+        assert_eq!(b.input_tokens, 24576);
+        assert_eq!(b.used_tokens, asm.total_tokens, "总账 = 各层之和");
+        assert_eq!(
+            b.used_tokens,
+            b.layers.iter().map(|u| u.tokens).sum::<usize>(),
+            "账目可加总（M2.7 验收）"
+        );
+        assert!(
+            b.used_tokens <= b.input_tokens,
+            "总用量不超过输入预算：{} > {}",
+            b.used_tokens,
+            b.input_tokens
+        );
+        for u in &b.layers {
+            if u.id == "B1" {
+                continue; // 唯一的无条件保底
+            }
+            assert!(u.tokens <= u.limit, "{} 超层预算：{} > {}", u.id, u.tokens, u.limit);
+        }
+        assert!(usage_of(&asm, "C1").trimmed.is_some(), "摘要超预算要被裁并记账");
+        assert!(usage_of(&asm, "B3").trimmed.is_some(), "实体卡超预算要裁条目");
+        assert!(usage_of(&asm, "B4").trimmed.is_some(), "召回超预算要裁尾");
+    }
+
+    #[test]
+    fn empty_layers_make_no_empty_tags() {
+        let settings = windowed(4000);
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = sample_bb();
+        let asm = build(&inputs(&settings, None, &card, &state, &bb, &[], &[], None));
+
+        let ids: Vec<&str> = asm.layers.iter().map(|l| l.id).collect();
+        assert_eq!(ids, vec!["A1", "A3", "B1"], "空层省略");
+        for l in &asm.layers {
+            assert!(!l.content.trim().is_empty(), "空层不该出现在检查器：{}", l.id);
+        }
+        for m in &asm.messages {
+            assert!(!m.content.trim().is_empty(), "空消息不发出");
+            for tag in ["<world>", "<memory>", "<pending>", "<summary>", "<directive>"] {
+                assert!(!m.content.contains(tag), "空层不产生空标签：{tag}");
+            }
+        }
+        let b = asm.budget.as_ref().unwrap();
+        assert!(b.layers.iter().all(|u| u.tokens > 0), "没内容的层不占账目");
+
+        // 被预算整层裁空：不产生空标签，但账目留痕
+        let tiny = windowed(300); // 输入预算 225 → B4 限 18
+        let mem = vec![src_card("回忆1", &"乙".repeat(100))];
+        let mut inp = inputs(&tiny, None, &card, &state, &bb, &[], &[], None);
+        inp.memory_cards = &mem;
+        let asm2 = build(&inp);
+        assert!(!asm2.messages.iter().any(|m| m.content.contains("<memory>")));
+        assert!(!asm2.layers.iter().any(|l| l.id == "B4"), "空标签不发");
+        let u = usage_of(&asm2, "B4");
+        assert_eq!(u.tokens, 0);
+        assert!(u.trimmed.as_deref().unwrap().contains("裁 1 条"));
+    }
+
+    #[test]
+    fn assembly_is_deterministic() {
+        let a = build_rich();
+        let b = build_rich();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+            "两次组装逐字一致"
+        );
+        let ids: Vec<&str> = a
+            .budget
+            .as_ref()
+            .unwrap()
+            .layers
+            .iter()
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["A1", "A2", "A3", "C3", "C1", "B1", "B2", "B3", "B4", "B5"],
+            "层序确定（可回放）"
+        );
     }
 }

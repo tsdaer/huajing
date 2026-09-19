@@ -23,6 +23,11 @@ const error = ref("");
 const messages = ref<Message[]>([]);
 const blackboard = ref<Blackboard | null>(null);
 const assembly = ref<PromptAssembly | null>(null);
+
+/** 预算账目里该层的裁剪说明（M2.7 · 设计 §4.2）；没被动过则 undefined */
+function layerTrimmed(id: string, name: string): string | undefined {
+  return assembly.value?.budget?.layers.find((u) => u.id === id && u.name === name)?.trimmed;
+}
 const assemblySource = ref<"last" | "preview">("preview");
 const cardName = ref(props.meta.characters[0] ?? "角色");
 
@@ -730,6 +735,42 @@ watch(cardGeneration, () => {
           </div>
 
           <template v-if="assembly">
+            <!-- 预算总账（M2.7 · 设计 §4.2）：输入预算 / 实际占用 / 逐层用量 -->
+            <div v-if="assembly.budget" class="rounded-box bg-base-200 px-3 py-2.5">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[11px] text-base-content/45">输入预算（上下文 × 75%）</span>
+                <span class="font-mono text-[11px] text-base-content/60">
+                  {{ assembly.budget.used_tokens }} / {{ assembly.budget.input_tokens }}
+                </span>
+              </div>
+              <progress
+                class="progress progress-primary mt-1.5 h-1.5 w-full"
+                :value="assembly.budget.used_tokens"
+                :max="assembly.budget.input_tokens || 1"
+              ></progress>
+              <div class="mt-2.5 flex flex-col gap-2">
+                <div v-for="u in assembly.budget.layers" :key="u.id + u.name" class="flex flex-col gap-1">
+                  <div class="flex items-center gap-2 text-[11px]">
+                    <span
+                      class="badge badge-xs badge-soft font-mono"
+                      :class="u.trimmed ? 'badge-warning' : 'badge-primary'"
+                      >{{ u.id }}</span
+                    >
+                    <span class="flex-1 truncate text-base-content/60">{{ u.name }}</span>
+                    <span v-if="u.trimmed" class="badge badge-xs badge-soft badge-warning">被裁</span>
+                    <span class="font-mono text-base-content/45">{{ u.tokens }} / {{ u.limit }}</span>
+                  </div>
+                  <progress
+                    class="progress h-1 w-full"
+                    :class="u.trimmed ? 'progress-warning' : 'progress-primary'"
+                    :value="u.tokens"
+                    :max="u.limit || 1"
+                  ></progress>
+                  <p v-if="u.trimmed" class="m-0 text-[11px] text-warning">{{ u.trimmed }}</p>
+                </div>
+              </div>
+            </div>
+
             <div class="grid grid-cols-3 gap-2">
               <div class="rounded-box bg-base-200 px-3 py-2">
                 <p class="m-0 text-[11px] text-base-content/45">注入层</p>
@@ -754,6 +795,13 @@ watch(cardGeneration, () => {
               <div class="collapse-title flex min-h-0 items-center gap-2.5 px-3 py-2 text-[13px]">
                 <span class="badge badge-xs badge-soft badge-primary font-mono">{{ l.id }}</span>
                 <span class="flex-1 truncate">{{ l.name }}</span>
+                <!-- 被预算裁/截断过的层标出来（M2.7；说明在预算总账里） -->
+                <span
+                  v-if="layerTrimmed(l.id, l.name)"
+                  class="badge badge-xs badge-soft badge-warning"
+                  :title="layerTrimmed(l.id, l.name)"
+                  >被裁</span
+                >
                 <span class="font-mono text-[11px] text-base-content/45">≈{{ l.tokens }}</span>
               </div>
               <div class="collapse-content px-3">

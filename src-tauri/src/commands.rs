@@ -14,6 +14,7 @@ use crate::event::{self, LogBody, LogRecord};
 use crate::palace;
 use crate::psyche;
 use crate::statetree;
+use crate::summarize;
 use crate::threads;
 use crate::llm::{self, Provider, StreamEvent};
 use crate::prompt;
@@ -1512,6 +1513,21 @@ fn acquire_flag(flags: &CancelFlags, session_id: &str) -> Result<Arc<AtomicBool>
     Ok(flag)
 }
 
+/// 轮末异步总结（设计 §5.3：不阻塞对话；同一会话并发时跳过）
+fn spawn_summary(root: &std::path::Path, session_id: &str, flags: &SummaryFlags) {
+    if !flags.begin(session_id) {
+        return; // 上一次总结还在跑
+    }
+    let root = root.to_path_buf();
+    let session_id = session_id.to_string();
+    // 后台任务用自己的 EventLog 实例（读盘 + 追加；主缓存靠字节偏移自动跟上）
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = run_summary(root, session_id, false).await {
+            crate::diag::record("summary", format!("总结失败：{e}"));
+        }
+    });
+}
+
 /// 流式生成的后半程（send_message 与 regenerate 共用）：
 /// 中断标记 → 流式补全 → 回复落盘 → 时钟步进 → on_message → 记录组装（记忆检查器）。
 #[allow(clippy::too_many_arguments)]
@@ -1530,6 +1546,8 @@ async fn stream_reply(
     // 轮末状态树求值要用：上一轮激活的实体（codex.active 判据）与状态树结构缓存
     runtime: Option<&SessionRuntime>,
     tree_cache: Option<&TreeCache>,
+    // 轮末异步总结（设计 §5.3）
+    summary_flags: Option<&SummaryFlags>,
     // 用户消息那一步的钩子报告（回复落盘后另有一次，会一起回给前端）
     user_report: llm::HookReport,
 ) -> Result<StreamEvent, String> {
@@ -1577,6 +1595,7 @@ async fn stream_reply(
                     log,
                     runtime,
                     tree_cache,
+                    summary_flags,
                 ) {
                     Ok(next) => {
                         forward_ui_events(on_event, &next);
@@ -1828,6 +1847,7 @@ fn commit_reply(
     log: &store::EventLog,
     runtime: Option<&SessionRuntime>,
     tree_cache: Option<&TreeCache>,
+    summary_flags: Option<&SummaryFlags>,
 ) -> Result<llm::HookReport, String> {
     let reply = Message {
         turn,
@@ -1900,6 +1920,11 @@ fn commit_reply(
             }
         }
     }
+
+    // 轮末异步总结（消息已滑出 L0 窗口时才真的干活；不阻塞本轮返回）
+    if let Some(flags) = summary_flags {
+        spawn_summary(root, &meta.id, flags);
+    }
     Ok(report)
 }
 
@@ -1931,6 +1956,7 @@ pub async fn send_message(
     codex_cache: State<'_, CodexCache>,
     runtime: State<'_, SessionRuntime>,
     tree_cache: State<'_, TreeCache>,
+    summary_flags: State<'_, SummaryFlags>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -2008,6 +2034,7 @@ pub async fn send_message(
         &assemblies,
         Some(&runtime),
         Some(&tree_cache),
+        Some(&summary_flags),
         report,
     )
     .await
@@ -2048,6 +2075,7 @@ pub async fn regenerate(
     codex_cache: State<'_, CodexCache>,
     runtime: State<'_, SessionRuntime>,
     tree_cache: State<'_, TreeCache>,
+    summary_flags: State<'_, SummaryFlags>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -2111,6 +2139,7 @@ pub async fn regenerate(
         &assemblies,
         Some(&runtime),
         Some(&tree_cache),
+        Some(&summary_flags),
         report,
     )
     .await
@@ -2420,6 +2449,397 @@ pub fn inspector_data(
     )
 }
 
+// ---------- M2.6 自动总结管线（设计 §5.3：滑出 L0 窗口的批次 → 六类产物）----------
+
+/// 管线在跑的会话（防同一会话并发总结：两次重叠的调用会总结出重复的记忆）
+#[derive(Default)]
+pub struct SummaryFlags(Mutex<std::collections::HashSet<String>>);
+
+impl SummaryFlags {
+    fn begin(&self, session_id: &str) -> bool {
+        self.0
+            .lock()
+            .map(|mut set| set.insert(session_id.to_string()))
+            .unwrap_or(false)
+    }
+    fn end(&self, session_id: &str) {
+        if let Ok(mut set) = self.0.lock() {
+            set.remove(session_id);
+        }
+    }
+}
+
+/// 取待总结的批次（滑出 L0 窗口、且未被此前摘要覆盖的消息）。
+/// 设计 §5.3：消息滑出窗口即异步触发一次总结（不阻塞对话）。
+fn summary_batch(proj: &event::Projection) -> Option<(Vec<summarize::BatchMessage>, u64)> {
+    let total = proj.messages.len();
+    if total <= prompt::WINDOW_MESSAGES {
+        return None; // 还没滑出窗口
+    }
+    let cutoff = total - prompt::WINDOW_MESSAGES;
+    let batch: Vec<summarize::BatchMessage> = proj.messages[..cutoff]
+        .iter()
+        .filter(|m| m.turn > proj.summary_upto)
+        .filter(|m| m.role == "user" || m.role == "char") // OOC/system 不进剧情记忆（§4.1）
+        .map(summarize::BatchMessage::from_message)
+        .collect();
+    if batch.is_empty() {
+        return None;
+    }
+    let to_turn = batch.iter().map(|m| m.turn).max().unwrap_or(0);
+    Some((batch, to_turn))
+}
+
+/// 角色的 needs/values（设定集 char 实体的倾向性；心理评价的对照清单，设计 §9.2）
+fn codex_needs(cx: &codex::Codex, name: &str) -> Vec<String> {
+    let Some(entity) = cx.entities().iter().find(|e| e.name == name || e.id == name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in ["needs", "values", "motivation", "interests"] {
+        match entity.facts.get(key) {
+            Some(serde_json::Value::String(s)) => out.push(s.clone()),
+            Some(serde_json::Value::Array(list)) => {
+                out.extend(list.iter().filter_map(|v| v.as_str().map(str::to_string)))
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 便宜档接入点（设计 §11：自动总结用 util 档；没配就回退 chat 档）
+fn pick_util_provider(root: &std::path::Path) -> Result<Provider, String> {
+    let providers = store::load_providers(root).map_err(|e| e.to_string())?;
+    providers
+        .iter()
+        .find(|p| p.role == "util")
+        .or_else(|| providers.iter().find(|p| p.role == "chat"))
+        .cloned()
+        .ok_or_else(|| "未配置可用接入点".to_string())
+}
+
+/// 把总结产物落成事件（与 Tauri 无关，便于单测）：摘要增量、情景记忆、L3 事实、设定提案。
+///
+/// 一切 LLM 产物都**先落草稿/提案**，注入只认 canon（设计 §6.9）——唯一的例外是 L3 事实与
+/// 情景记忆：它们是「角色的亲身经历」，本就不进设定注入，而是走宫殿召回（§5.2）。
+fn apply_summary_outcome(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    cx: &codex::Codex,
+    outcome: summarize::SummaryOutcome,
+    from_turn: u64,
+    to_turn: u64,
+    story_day: i64,
+    story_clock: &str,
+) -> Result<usize, String> {
+    let character = first_character(meta)?;
+    let mut applied = 0usize;
+    let ts = store::unix_now();
+
+    if !outcome.summary_delta.trim().is_empty() {
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::Summary(event::SummaryEvent {
+                turn: to_turn,
+                delta: outcome.summary_delta.clone(),
+                from_turn,
+                to_turn,
+                ts,
+            }),
+        )?;
+        applied += 1;
+    }
+
+    // 情景记忆 + L3 事实：都作为记忆对象进宫殿（episode 走召回，fact 也可被 recall 命中）
+    let base = project_session(log, root, meta)
+        .map(|p| p.episodes.len() + p.memory.len())
+        .unwrap_or(0);
+    for (i, ep) in outcome.episodes.iter().enumerate() {
+        let mut obj = palace::MemObject {
+            id: palace::next_id(base + i + 1),
+            kind: palace::KIND_EPISODE.to_string(),
+            content: ep.content.clone(),
+            turn: ep.turns.first().copied().unwrap_or(to_turn),
+            story_day,
+            story_clock: story_clock.to_string(),
+            place: ep.place.clone(),
+            actors: if ep.actors.is_empty() {
+                vec![character.clone()]
+            } else {
+                ep.actors.clone()
+            },
+            witnesses: ep.witnesses.clone(),
+            salience: ep.salience,
+            emotion: ep.emotion.clone(),
+            links: ep.links.clone(),
+            thread: ep.thread.clone(),
+            source: "pipeline.summary".into(),
+            ts,
+            rehearsals: 0,
+        };
+        if obj.witnesses.is_empty() {
+            obj.witnesses = obj.actors.clone();
+        }
+        let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::Memory(event::MemoryEvent {
+                turn: obj.turn,
+                origin: "pipeline".into(),
+                object,
+                ts,
+            }),
+        )?;
+        applied += 1;
+    }
+    for (i, fact) in outcome.facts.iter().enumerate() {
+        let mut obj = palace::MemObject {
+            id: palace::next_id(base + outcome.episodes.len() + i + 1),
+            kind: palace::KIND_FACT.to_string(),
+            content: format!("{}：{}", fact.key, fact.value),
+            turn: to_turn,
+            story_day,
+            story_clock: story_clock.to_string(),
+            place: None,
+            actors: vec![character.clone()],
+            witnesses: vec![character.clone()],
+            salience: 0.6, // L3 事实：跨会话持久的键值，权重高于普通情景（设计 §5.1 分层责任）
+            emotion: None,
+            links: vec![format!("topic:{}", fact.key)],
+            thread: None,
+            source: "pipeline.summary".into(),
+            ts,
+            rehearsals: 0,
+        };
+        obj.id = palace::next_id(base + outcome.episodes.len() + i + 1);
+        let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::Memory(event::MemoryEvent {
+                turn: to_turn,
+                origin: "pipeline".into(),
+                object,
+                ts,
+            }),
+        )?;
+        applied += 1;
+    }
+
+    // 设定提案：与 anchors 冲突的直接驳回（设计 §6.8 最高保护级）
+    for draft in &outcome.codex {
+        let payload = serde_json::json!({
+            "target": draft.target,
+            "value": draft.value,
+            "reason": draft.reason,
+        });
+        let conflict = cx
+            .get(&draft.target)
+            .and_then(|e| codex::anchors_conflict(e, &draft.value));
+        let id = format!("codex.{}.{}", draft.target, to_turn);
+        if let Some(reason) = conflict {
+            crate::diag::record(
+                "summary",
+                format!("设定提案与辨识点冲突，已驳回：{}（{}）", draft.target, reason),
+            );
+            commit(
+                log,
+                root,
+                meta,
+                LogBody::Proposal(event::ProposalEvent {
+                    turn: to_turn,
+                    id,
+                    op: "reject".into(),
+                    kind: draft.kind.clone(),
+                    origin: "pipeline".into(),
+                    payload: Some(payload),
+                    note: Some(format!("与辨识点冲突，自动驳回：{reason}")),
+                    ts,
+                }),
+            )?;
+        } else {
+            commit(
+                log,
+                root,
+                meta,
+                LogBody::Proposal(event::ProposalEvent {
+                    turn: to_turn,
+                    id,
+                    op: "propose".into(),
+                    kind: draft.kind.clone(),
+                    origin: "pipeline".into(),
+                    payload: Some(payload),
+                    note: None,
+                    ts,
+                }),
+            )?;
+        }
+        applied += 1;
+    }
+
+    // 剧情线提案（含提及时机起草，设计 §8.3）
+    for (i, draft) in outcome.threads.iter().enumerate() {
+        let payload = serde_json::json!({
+            "title": draft.title,
+            "cause": draft.cause,
+            "actors": draft.actors,
+            "importance": draft.importance,
+            "resurface": draft.resurface_value(),
+        });
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: to_turn,
+                id: format!("thread.{}.{}.{}", to_turn, i, draft.title),
+                op: "propose".into(),
+                kind: "thread".into(),
+                origin: "pipeline".into(),
+                payload: Some(payload),
+                note: Some(draft.framing.clone()),
+                ts,
+            }),
+        )?;
+        applied += 1;
+    }
+
+    // 心理评价提案（需要满足/受挫 → 情绪与意图，设计 §9.2）
+    for (i, draft) in outcome.psyche.iter().enumerate() {
+        let payload = serde_json::json!({
+            "kind": draft.kind,
+            "name": draft.name,
+            "intensity": draft.intensity,
+            "source": draft.source,
+        });
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: to_turn,
+                id: format!("psyche.{}.{}.{}", to_turn, i, draft.name),
+                op: "propose".into(),
+                kind: "psyche".into(),
+                origin: "pipeline".into(),
+                payload: Some(payload),
+                note: None,
+                ts,
+            }),
+        )?;
+        applied += 1;
+    }
+
+    Ok(applied)
+}
+
+/// 跑一次总结（批次 → 便宜档 provider → 事件落盘）。
+///
+/// 设计 §5.3：轮末**异步**触发，不阻塞对话；失败只留诊断，下轮或手动可重试。
+async fn run_summary(
+    root: std::path::PathBuf,
+    session_id: String,
+    force: bool,
+) -> Result<String, String> {
+    let log = store::EventLog::new();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let character = first_character(&meta)?;
+    let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+
+    let (batch, to_turn) = match summary_batch(&proj) {
+        Some(b) => b,
+        None if !force => return Ok("没有待总结的批次".into()),
+        None => {
+            // 手动触发：把最近的窗口外消息也总结一遍（force）
+            let cutoff = proj.messages.len();
+            let batch: Vec<summarize::BatchMessage> = proj.messages[..cutoff]
+                .iter()
+                .filter(|m| m.turn > proj.summary_upto)
+                .filter(|m| m.role == "user" || m.role == "char")
+                .map(summarize::BatchMessage::from_message)
+                .collect();
+            if batch.is_empty() {
+                return Ok("没有待总结的消息".into());
+            }
+            let to_turn = batch.iter().map(|m| m.turn).max().unwrap_or(0);
+            (batch, to_turn)
+        }
+    };
+    let from_turn = batch.iter().map(|m| m.turn).min().unwrap_or(0);
+
+    let provider = pick_util_provider(&root)?;
+    let world = session_world(&meta);
+    let cx = load_codex(&root, None, &world);
+    let board = blackboard_of(&proj);
+    let active_threads: Vec<String> = proj
+        .threads
+        .values()
+        .filter_map(|v| threads::Thread::from_value(v).ok())
+        .filter(|t| t.is_active())
+        .map(|t| format!("{}（{}）", t.id, t.title))
+        .collect();
+    let needs = codex_needs(&cx, &loaded.card.name);
+    let ctx = summarize::SummaryContext {
+        card_name: &loaded.card.name,
+        persona_name: meta.persona.as_deref(),
+        premise: meta.premise.as_deref(),
+        story_clock: &board.clock,
+        rolling_summary: &proj.summary,
+        active_threads: &active_threads,
+        needs: &needs,
+    };
+    let prompt_text = summarize::build_prompt(&ctx, &batch);
+
+    let proxy = store::load_settings(&root)
+        .ok()
+        .and_then(|s| s.proxy)
+        .filter(|p| !p.trim().is_empty());
+    let raw = llm::chat_complete(
+        &provider,
+        &[llm::ChatMessage {
+            role: "user".into(),
+            content: prompt_text,
+        }],
+        1600,
+        0.3,
+        proxy.as_deref(),
+    )
+    .await?;
+    let outcome = summarize::sanitize(
+        summarize::parse_outcome(&raw).map_err(|e| format!("总结回复解析失败：{e}"))?,
+    );
+    let applied = apply_summary_outcome(
+        &log,
+        &root,
+        &meta,
+        &cx,
+        outcome,
+        from_turn,
+        to_turn,
+        board.day,
+        &board.clock,
+    )?;
+    crate::diag::record(
+        "summary",
+        format!("总结第 {from_turn}–{to_turn} 轮：落 {applied} 条事件（provider={}）", provider.name),
+    );
+    Ok(format!("已总结第 {from_turn}–{to_turn} 轮，落 {applied} 条事件"))
+}
+
+/// 手动触发一次总结（设置页/排查用；正常路径是轮末自动触发）
+#[tauri::command]
+pub async fn summarize_now(session_id: String) -> Result<String, String> {
+    run_summary(root(), session_id, true).await
+}
+
 // ---------- 卡内状态与长期记忆（M1.6：hooks 的可观测面）----------
 
 /// 角色私有 state 现状（会话快照为空时回退卡上 `state` 初始值）
@@ -2603,7 +3023,7 @@ return {
         log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
             .unwrap();
         let after_user = run_message_hook_core(root, meta, loaded, turn, None, log);
-        let after_reply = commit_reply(root, meta, loaded, turn, "（回复）", None, log, None, None).unwrap();
+        let after_reply = commit_reply(root, meta, loaded, turn, "（回复）", None, log, None, None, None).unwrap();
 
         // 报告取「本轮最后一次」（回复后的状态就是前端看到的最终状态）
         let mut report = after_reply;
@@ -2777,7 +3197,8 @@ return {
         )
         .unwrap();
         run_message_hook_core(&root, &meta, &loaded, turn, None, &log);
-        commit_reply(&root, &meta, &loaded, turn, "（重roll 的回复）", None, &log, None, None).unwrap();
+        commit_reply(&root, &meta, &loaded, turn, "（重roll 的回复）", None, &log, None, None, None)
+            .unwrap();
 
         assert_eq!(
             stored_state(&root, &meta)["favorability"],
@@ -3565,5 +3986,126 @@ return {
                 .any(|r| matches!(&r.body, LogBody::Proposal(_))),
             "提案应保留"
         );
+    }
+
+    /// M2.6 验收（不调模型）：批次判定 + 产物落事件 + 派生文件；情景记忆能被召回
+    #[test]
+    fn summary_pipeline_lands_events() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let log = store::EventLog::new();
+        // 直接灌 46 条消息（模拟长会话；不跑钩子——本测试只关心管线本身）
+        for turn in 1..=23u64 {
+            log.append(&root, &meta.id, LogBody::Message(user_msg(turn, &format!("第{turn}轮"))))
+                .unwrap();
+            log.append(
+                &root,
+                &meta.id,
+                LogBody::Message(Message {
+                    turn,
+                    role: "char".into(),
+                    content: format!("回复{turn}"),
+                    ts: 0,
+                    scene_id: None,
+                }),
+            )
+            .unwrap();
+        }
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let (batch, to_turn) = summary_batch(&proj).expect("应有滑出窗口的批次");
+        assert_eq!(
+            batch.len(),
+            46 - prompt::WINDOW_MESSAGES,
+            "批次 = 滑出 L0 窗口的部分"
+        );
+        assert_eq!(batch[0].role, "user");
+        assert!(to_turn >= 1);
+
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let cx = load_codex(&root, None, "default");
+        // 造一份总结产物（等价于模型回了合法 JSON 并被 sanitize）
+        let outcome = summarize::sanitize(summarize::SummaryOutcome {
+            summary_delta: "她记住了那条约定。".into(),
+            episodes: vec![summarize::EpisodeDraft {
+                content: "深夜闭馆时她把便签递过来。".into(),
+                salience: 0.9,
+                emotion: Some("温暖".into()),
+                place: Some("图书馆".into()),
+                actors: vec!["小雨".into()],
+                witnesses: Vec::new(),
+                links: vec!["topic:便签".into()],
+                thread: None,
+                turns: vec![3, 4],
+            }],
+            facts: vec![summarize::FactDraft {
+                key: "玩家称呼".into(),
+                value: serde_json::json!("阿澈"),
+            }],
+            threads: vec![summarize::ThreadDraft {
+                title: "周五还书".into(),
+                cause: "约定周五来还。".into(),
+                actors: vec!["小雨".into()],
+                importance: 0.7,
+                grade: "natural".into(),
+                windows: vec![serde_json::json!({ "mention": ["还书"] })],
+                deadline_day: Some(5),
+                cooldown: 5,
+                framing: "她在意但不好意思催。".into(),
+            }],
+            psyche: vec![summarize::PsycheDraft {
+                kind: "feel".into(),
+                name: "忐忑".into(),
+                intensity: 0.6,
+                source: "怕他忘了".into(),
+            }],
+            codex: vec![summarize::CodexDraft {
+                kind: "new_fact".into(),
+                target: "char.小雨".into(),
+                value: serde_json::json!({ "facts": { "schedule": "周三休息" } }),
+                reason: "剧情里提到".into(),
+            }],
+        });
+        let applied =
+            apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, to_turn, 1, "20:00").unwrap();
+        assert!(applied >= 5, "摘要 + 2 条记忆 + 3 条提案：{applied}");
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert!(proj.summary.contains("约定"), "摘要增量应进投影：{}", proj.summary);
+        assert_eq!(proj.summary_upto, to_turn, "记录已总结到哪一轮（批次从它之后取）");
+        assert_eq!(proj.episodes.len(), 2, "情景记忆 + L3 事实都进记忆对象层");
+
+        // 情景记忆能被召回（见证者默认取 actors，视角过滤后仍命中）
+        let objs = memory_objects(&proj, "小雨", 1);
+        let hits = palace::recall(
+            &objs,
+            &palace::RecallQuery {
+                viewer: "小雨".into(),
+                now_day: 1,
+                place: Some("图书馆".into()),
+                present: vec!["小雨".into()],
+                mentions: vec!["便签".into()],
+                hints: Vec::new(),
+                active_threads: Vec::new(),
+                top_k: 5,
+                budget_tokens: 0,
+            },
+        );
+        assert!(
+            hits.iter().any(|h| h.mem.content.contains("便签")),
+            "情景记忆应可召回：{:?}",
+            hits.iter().map(|h| &h.mem.content).collect::<Vec<_>>()
+        );
+
+        // 三类提案齐活，且派生文件落盘
+        assert_eq!(
+            proj.proposals.len(),
+            3,
+            "codex / thread / psyche 各一条：{:?}",
+            proj.proposals.keys().collect::<Vec<_>>()
+        );
+        assert!(store::read_summary(&root, &meta.id).unwrap().contains("约定"));
+        assert_eq!(store::read_proposals(&root, &meta.id).unwrap().len(), 3);
+
+        // 第二批：已总结过的部分不再重复总结
+        assert!(summary_batch(&proj).is_none(), "批次已被覆盖，不该重复总结");
     }
 }

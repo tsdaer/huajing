@@ -177,6 +177,17 @@ pub struct Settings {
     /// 国内直连不上 API、系统代理又读不到时，在这里手填 `http://127.0.0.1:7890` 即可。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// 模型上下文窗口（token；缺省按 32768 计）。设计 §4.2：输入预算 = 上下文 × 75%
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+}
+
+impl Settings {
+    /// 输入预算（设计 §4.2）：模型上下文窗口 × 75%；输出预留另计，不在这里扣。
+    /// `context_window` 缺省按 32768 计。
+    pub fn input_budget(&self) -> usize {
+        self.context_window.unwrap_or(32768) * 75 / 100
+    }
 }
 
 fn default_locale() -> String {
@@ -197,6 +208,7 @@ impl Default for Settings {
             narrative_mode: default_narrative_mode(),
             wizard_done: false,
             proxy: None,
+            context_window: None,
         }
     }
 }
