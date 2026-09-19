@@ -157,6 +157,8 @@ pub struct BuildInputs<'a> {
     pub pending_threads: &'a [String],
     /// B5 内心一行（M2.5 · 设计 §9.2：现状卡是客观世界，psyche 摘要是主观世界）
     pub psyche_line: Option<&'a str>,
+    /// B2 指令层：状态树活跃路径的 directive（根→叶拼接，子覆盖父）（M2.3 · 设计 §4.1/§7.4）
+    pub directive: Option<&'a str>,
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
@@ -217,6 +219,17 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     let b1 = format!("<scene>\n{}\n</scene>", snapshot.render());
     layers.push(layer("B1", "场景快照", &b1));
     let mut b_messages = vec![ChatMessage { role: "system".into(), content: b1 }];
+
+    // B2 指令层（设计 §4.1：状态树 directive 根→叶，子覆盖父；「输出约束」的落点——
+    // 把开放生成收窄到当前状态允许的表演空间，§7.4）
+    if let Some(d) = inputs.directive.filter(|d| !d.trim().is_empty()) {
+        let content = format!("<directive>\n{d}\n</directive>");
+        layers.push(layer("B2", "导演指令", &content));
+        b_messages.push(ChatMessage {
+            role: "system".into(),
+            content,
+        });
+    }
 
     // B3 设定集激活实体卡（设计 §6.3：分级注入 + anchors 恒注入；空层省略）
     if let Some(b3) = card_layer("B3", "设定集", "world", inputs.entity_cards) {
@@ -536,6 +549,7 @@ mod tests {
             resolutions: &[],
             pending_threads: &[],
             psyche_line: None,
+            directive: None,
             history,
             user_content,
         }

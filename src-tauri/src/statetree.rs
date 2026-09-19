@@ -1,39 +1,39 @@
 //! 状态树（M2.3 · 设计 §7）：剧情状态机的**纯数据与算法**。
 //!
-//! 分工（M2 决断 3：Lua 只在 card.rs 的沙箱里跑）：卡内 `state_tree» 的解析（含 `when» 函数）
-//! 与转移求值在 card.rs 的沙箱里做（`card::eval_state_tree»）；本模块只承载「宿主与界面
+//! 分工（M2 决断 3：Lua 只在 card.rs 的沙箱里跑）：卡内 `state_tree` 的解析（含 `when` 函数）
+//! 与转移求值在 card.rs 的沙箱里做（`card::eval_state_tree`）；本模块只承载「宿主与界面
 //! 都要的那份结构」——层级、directive、recall/reveal、声明式转移（to/priority/when 字符串）——
 //! 不碰 Lua、不碰文件、不碰网络，因而可被单测直接钉住（M2.3 验收：转移是事件的纯函数）。
 //!
 //! 与设计 §7.3 的对应：
 //! - §7.3-1 事件落地 → 收集当前叶状态自身的转移 + 沿 parent 链从祖先继承的转移
-//!   （[`StateTree::transition_targets»]）；
-//! - §7.3-2 `priority» 升序求值、首个命中即转移、一轮只转移一次（求值入口在 card.rs）；
-//! - §7.3-4 directive 按 根→叶 拼装注入 B2 槽（[`StateTree::directive_of»]）；
-//! - §7.3-5 可回放：本模块全部是纯函数，同一输入必得同一输出（[`StateTree::validate»] 的诊断
+//!   （[`StateTree::transition_targets`]）；
+//! - §7.3-2 `priority` 升序求值、首个命中即转移、一轮只转移一次（求值入口在 card.rs）；
+//! - §7.3-4 directive 按 根→叶 拼装注入 B2 槽（[`StateTree::directive_of`]）；
+//! - §7.3-5 可回放：本模块全部是纯函数，同一输入必得同一输出（[`StateTree::validate`] 的诊断
 //!   顺序也按状态 id 排序固定）。
 //!
 //! **求值顺序规则**（两条入口共用，改一处必须两边同步）：
-//! 候选转移 = 叶状态自己的 + 沿 `parent» 链继承的；叶的转移先于祖先的；
-//! 按 `priority» **升序稳定排序**——同 `priority» 时保持「叶先、祖先后，各自按声明顺序」。
-//! 未声明 `priority» 视为 0。
+//! 候选转移 = 叶状态自己的 + 沿 `parent` 链继承的；叶的转移先于祖先的；
+//! 按 `priority` **升序稳定排序**——同 `priority` 时保持「叶先、祖先后，各自按声明顺序」。
+//! 未声明 `priority` 视为 0。
 //!
-//! 纯数据的边界：Lua 函数（`when» / `on_enter» / `on_exit»）不可能进到本模块。结构里只留
-//! 「有没有」：`has_enter» / `has_exit» / `when_is_fn»。
+//! 纯数据的边界：Lua 函数（`when` / `on_enter` / `on_exit`）不可能进到本模块。结构里只留
+//! 「有没有」：`has_enter` / `has_exit` / `when_is_fn`。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-/// 一条转移的声明式部分（设计 §7.2 的 `{ to, when, priority }»）。
+/// 一条转移的声明式部分（设计 §7.2 的 `{ to, when, priority }`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateTransition {
-    /// 目标状态 id。可以是未声明的 id——引擎只如实转述，越界由 [`StateTree::validate»] 诊断，
-    /// 求值入口（card.rs）也照转不误（宿主拿 [`StateTree::active_path»] 校验后再决定是否落转移）
+    /// 目标状态 id。可以是未声明的 id——引擎只如实转述，越界由 [`StateTree::validate`] 诊断，
+    /// 求值入口（card.rs）也照转不误（宿主拿 [`StateTree::active_path`] 校验后再决定是否落转移）
     pub to: String,
     /// 求值顺序：小的先求值。未声明视为 0；同值按「叶先于祖先、各自声明顺序」
     pub priority: i64,
-    /// 字符串简写 when（`"event:提及过去伤疤"»）；函数式 when 为 `None»
+    /// 字符串简写 when（`"event:提及过去伤疤"`）；函数式 when 为 `None`
     pub when: Option<String>,
     /// when 是 Lua 函数（具体逻辑在卡里，纯数据只能记「有」）
     pub when_is_fn: bool,
@@ -53,27 +53,27 @@ pub struct StateNode {
     pub reveal: Vec<String>,
     pub has_enter: bool,
     pub has_exit: bool,
-    /// 声明式转移（函数式 when 只留 [`StateTransition::when_is_fn»] 一个布尔位）
+    /// 声明式转移（函数式 when 只留 [`StateTransition::when_is_fn`] 一个布尔位）
     pub transitions: Vec<StateTransition>,
 }
 
-/// 一整棵状态树。`from_value» 吃的是 card::state_tree_shape 产出的 JSON 形态
-/// （也可直接吃卡内 `state_tree» 的 JSON 化结果）。
+/// 一整棵状态树。`from_value` 吃的是 card::state_tree_shape 产出的 JSON 形态
+/// （也可直接吃卡内 `state_tree` 的 JSON 化结果）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateTree {
     pub root: String,
     pub states: BTreeMap<String, StateNode>,
-    /// 解析时输入里重复出现的状态 id（BTreeMap 表达不了重复，单独记一笔供 `validate» 诊断；
-    /// 只有 `states» 写成数组形态时才可能出现）
+    /// 解析时输入里重复出现的状态 id（BTreeMap 表达不了重复，单独记一笔供 `validate` 诊断；
+    /// 只有 `states` 写成数组形态时才可能出现）
     pub duplicate_ids: Vec<String>,
 }
 
 impl StateTree {
-    /// 解析状态树。缺 `root» / 结构坏一律 `Err»（中文诊断，不 panic）。
+    /// 解析状态树。缺 `root` / 结构坏一律 `Err`（中文诊断，不 panic）。
     ///
-    /// `states» 接受两种形态：对象 `{ "日常": {...} }»（正常）与数组
-    /// `[ { "id": "日常", ... } ]»（Lua 侧 dump 常见；数组里的重名会记进
-    /// [`StateTree::duplicate_ids»]，后写覆盖前写）。
+    /// `states` 接受两种形态：对象 `{ "日常": {...} }`（正常）与数组
+    /// `[ { "id": "日常", ... } ]`（Lua 侧 dump 常见；数组里的重名会记进
+    /// [`StateTree::duplicate_ids`]，后写覆盖前写）。
     pub fn from_value(v: &Value) -> Result<StateTree, String> {
         let obj = v
             .as_object()
@@ -120,11 +120,11 @@ impl StateTree {
         })
     }
 
-    /// 活跃路径：从叶一路沿 `parent» 往上，返回 **根→叶**（含父链）。
+    /// 活跃路径：从叶一路沿 `parent` 往上，返回 **根→叶**（含父链）。
     ///
-    /// - 叶没在 `states» 里声明 → 空 vec（宿主据此跳过注入/转移，不 panic）；
+    /// - 叶没在 `states` 里声明 → 空 vec（宿主据此跳过注入/转移，不 panic）；
     /// - 父链断在未声明的父节点上 → 就地截断（从断点往下仍是一条合法路径）；
-    /// - 父链有环（坏树）→ 截断，不死循环（诊断走 [`StateTree::validate»]）。
+    /// - 父链有环（坏树）→ 截断，不死循环（诊断走 [`StateTree::validate`]）。
     pub fn active_path(&self, leaf: &str) -> Vec<String> {
         if !self.states.contains_key(leaf) {
             return Vec::new();
@@ -239,11 +239,11 @@ impl StateTree {
         out
     }
 
-    /// 从 `active»（当前活跃叶）出发可用的转移：`(to, priority, 来源状态)»，
+    /// 从 `active`（当前活跃叶）出发可用的转移：`(to, priority, 来源状态)`，
     /// 按 priority 升序（设计 §7.3-2）；同 priority 时**叶的转移在前**，各自保持声明顺序。
     ///
-    /// `active» 未声明 / 树上没有任何转移 → 空 vec（不 panic）；目标越界也如实给出
-    /// （越界与否由 [`StateTree::validate»] 与宿主判断）。
+    /// `active` 未声明 / 树上没有任何转移 → 空 vec（不 panic）；目标越界也如实给出
+    /// （越界与否由 [`StateTree::validate`] 与宿主判断）。
     pub fn transition_targets(&self, active: &str) -> Vec<(String, i64, String)> {
         if !self.states.contains_key(active) {
             return Vec::new();
@@ -404,7 +404,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// 与设计 §7.2 同构的树（Lua 函数位折成 `has_enter» / `when_is_fn» 布尔位）
+    /// 与设计 §7.2 同构的树（Lua 函数位折成 `has_enter` / `when_is_fn` 布尔位）
     fn design_value() -> Value {
         json!({
             "root": "日常",

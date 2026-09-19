@@ -25,6 +25,7 @@ pub fn run() {
         .manage(store::EventLog::new())
         .manage(commands::CodexCache::default())
         .manage(commands::SessionRuntime::default())
+        .manage(commands::TreeCache::default())
         .manage(watch::CardWatch::default())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,

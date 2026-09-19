@@ -13,6 +13,7 @@ use crate::codex;
 use crate::event::{self, LogBody, LogRecord};
 use crate::palace;
 use crate::psyche;
+use crate::statetree;
 use crate::threads;
 use crate::llm::{self, Provider, StreamEvent};
 use crate::prompt;
@@ -660,6 +661,26 @@ fn rebuild_from(
                 out.push(rec.clone());
                 event::fold(&mut proj, &rec);
             }
+            // ⑥ 轮末状态树转移（与 commit_reply 同一份代码 → 重放同一条路径，设计 §7.3-5）
+            if let Some(tree) = load_tree(loaded, None) {
+                // 重放不重推界面事件（编辑历史不该再弹一次表情）
+                for body in advance_state_tree(
+                    &proj,
+                    &character,
+                    loaded,
+                    &tree,
+                    msg.turn,
+                    "on_turn_end",
+                    None,
+                    meta.seed,
+                )
+                .0
+                {
+                    let rec = LogRecord::new(0, body);
+                    out.push(rec.clone());
+                    event::fold(&mut proj, &rec);
+                }
+            }
         }
     }
     Ok(out)
@@ -872,6 +893,232 @@ fn display_role(role: &str, card_name: &str) -> String {
     }
 }
 
+/// 状态树结构缓存（Tauri State）：卡目录名 → (源码指纹, 解析出的树)。
+/// 卡源每轮从磁盘重读（热加载的前提），所以指纹就是源码本身。
+#[derive(Default)]
+pub struct TreeCache(Mutex<HashMap<String, (u64, Arc<statetree::StateTree>)>>);
+
+fn source_fingerprint(source: &str) -> u64 {
+    let mut fp: u64 = 1469598103934665603;
+    for byte in source.as_bytes() {
+        fp = (fp ^ *byte as u64).wrapping_mul(1099511628211);
+    }
+    fp
+}
+
+/// 取卡上的状态树（没有 state_tree 的卡返回 None；解析失败留诊断并按无树处理）
+fn load_tree(
+    loaded: &card::LoadedCard,
+    cache: Option<&TreeCache>,
+) -> Option<Arc<statetree::StateTree>> {
+    let fp = source_fingerprint(&loaded.source);
+    if let Some(cache) = cache {
+        if let Ok(map) = cache.0.lock() {
+            if let Some((cached, tree)) = map.get(&loaded.dir_name) {
+                if *cached == fp {
+                    return Some(tree.clone());
+                }
+            }
+        }
+    }
+    let shape = match card::state_tree_shape(&loaded.source) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::diag::record("statetree", format!("状态树读取失败：{e}"));
+            return None;
+        }
+    };
+    if shape
+        .get("root")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
+        return None; // 卡上没有状态树（不是错误）
+    }
+    let tree = match statetree::StateTree::from_value(&shape) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            crate::diag::record("statetree", format!("状态树解析失败：{e}"));
+            return None;
+        }
+    };
+    for warning in tree.validate() {
+        crate::diag::record("statetree", format!("状态树校验：{warning}"));
+    }
+    if let Some(cache) = cache {
+        if let Ok(mut map) = cache.0.lock() {
+            map.insert(loaded.dir_name.clone(), (fp, tree.clone()));
+        }
+    }
+    Some(tree)
+}
+
+/// 当前活跃路径：转移事件是权威（投影折叠出「最后一次转移的去向」），
+/// 没有转移时用树根播种（设计 §7.3：路径同样是事件流的函数）。
+fn active_path_of(proj: &event::Projection, tree: &statetree::StateTree) -> Vec<String> {
+    proj.transitions
+        .last()
+        .map(|t| t.to.clone())
+        .unwrap_or_else(|| tree.active_path(&tree.root))
+}
+
+/// 状态树求值用的判据环境（设计 §7.2：when 可查黑板、state、设定集与剧情线）
+fn tree_env(
+    proj: &event::Projection,
+    character: &str,
+    loaded: &card::LoadedCard,
+    event_name: &str,
+    active_entities: Option<&std::collections::BTreeSet<String>>,
+) -> card::TreeEnv {
+    let mut threads_active = std::collections::BTreeSet::new();
+    let mut threads_resolved = std::collections::BTreeSet::new();
+    for (id, snapshot) in &proj.threads {
+        match snapshot.get("state").and_then(|s| s.as_str()) {
+            Some("active") => {
+                threads_active.insert(id.clone());
+            }
+            Some("resolved") => {
+                threads_resolved.insert(id.clone());
+            }
+            _ => {}
+        }
+    }
+    card::TreeEnv {
+        event: event_name.to_string(),
+        blackboard: blackboard_env(&blackboard_of(proj)),
+        state: current_state(proj, character, loaded),
+        known: proj.known.clone(),
+        codex_active: active_entities.cloned().unwrap_or_default(),
+        threads_active,
+        threads_resolved,
+    }
+}
+
+/// 轮末状态树求值（设计 §7.3-2/3）：首个命中的转移 → 转移事件；进入新路径的 reveal → 设定事件。
+///
+/// 返回待落盘的事件（无转移则空）。commit_reply 与 rebuild_from 共用同一份代码——
+/// 转移同样是 (事件流, 黑板, state, 揭示, 剧情线) 的纯函数（§7.3-5）。
+#[allow(clippy::too_many_arguments)]
+fn advance_state_tree(
+    proj: &event::Projection,
+    character: &str,
+    loaded: &card::LoadedCard,
+    tree: &statetree::StateTree,
+    turn: u64,
+    event_name: &str,
+    active_entities: Option<&std::collections::BTreeSet<String>>,
+    seed: u64,
+) -> (Vec<LogBody>, Vec<llm::UiEmit>) {
+    let mut emits: Vec<llm::UiEmit> = Vec::new();
+    let path = active_path_of(proj, tree);
+    let Some(leaf) = path.last().cloned() else {
+        return (Vec::new(), emits);
+    };
+    let env = tree_env(proj, character, loaded, event_name, active_entities);
+    let decision = match card::eval_state_tree(&loaded.source, &path, &env) {
+        Ok(Some(d)) => d,
+        Ok(None) => return (Vec::new(), emits),
+        Err(e) => {
+            crate::diag::record("statetree", format!("状态树求值失败：{e}"));
+            return (Vec::new(), emits);
+        }
+    };
+    let to_path = tree.active_path(&decision.to);
+    if to_path.is_empty() {
+        crate::diag::record(
+            "statetree",
+            format!("转移目标未声明，保持原地：{}", decision.to),
+        );
+        return (Vec::new(), emits);
+    }
+    // 设计 §7.3-3 的执行顺序：exit 钩子 → 切换活跃路径 → enter 钩子/任务；
+    // 每一步的副作用都作为事件追加（回放时同样重跑，得到同一份状态）。
+    let mut out: Vec<LogBody> = Vec::new();
+    let mut local = proj.clone();
+
+    // ① on_exit（旧叶）
+    let (exit_body, exit_emits) = run_state_hook(
+        loaded, &local, character, &leaf, "on_exit", event_name, turn, seed,
+    );
+    emits.extend(exit_emits);
+    if let Some(body) = exit_body {
+        let rec = LogRecord::new(0, body.clone());
+        out.push(body);
+        event::fold(&mut local, &rec);
+    }
+
+    // ② 切换活跃路径
+    let transition = LogBody::Transition(event::TransitionEvent {
+        turn,
+        from: path,
+        to: to_path.clone(),
+        reason: decision.reason,
+        ts: store::unix_now(),
+    });
+    let rec = LogRecord::new(0, transition.clone());
+    out.push(transition);
+    event::fold(&mut local, &rec);
+
+    // ③ on_enter（新叶）
+    let to_leaf = to_path.last().cloned().unwrap_or_default();
+    let (enter_body, enter_emits) = run_state_hook(
+        loaded, &local, character, &to_leaf, "on_enter", event_name, turn, seed,
+    );
+    emits.extend(enter_emits);
+    if let Some(body) = enter_body {
+        let rec = LogRecord::new(0, body.clone());
+        out.push(body);
+        event::fold(&mut local, &rec);
+    }
+
+    // ④ 进入新路径即揭示（设计 §6.4：状态树的 reveal 解锁设定）
+    for target in tree.reveal_of(&to_path) {
+        if !proj.known.contains(&target) {
+            out.push(LogBody::Codex(event::CodexEvent {
+                turn,
+                op: "reveal".into(),
+                target,
+                origin: "tree".into(),
+                value: None,
+                note: Some(leaf.clone()),
+                ts: store::unix_now(),
+            }));
+        }
+    }
+    (out, emits)
+}
+
+/// 跑一个状态钩子（on_enter / on_exit）并把副作用折成 effect 事件（没改动则不记）。
+/// 与 hook_effect 同一套语义：state 顶层键补丁 + 黑板写入 + 记忆写入。
+#[allow(clippy::too_many_arguments)]
+fn run_state_hook(
+    loaded: &card::LoadedCard,
+    proj: &event::Projection,
+    character: &str,
+    state_id: &str,
+    kind: &str,
+    event_name: &str,
+    turn: u64,
+    seed: u64,
+) -> (Option<LogBody>, Vec<llm::UiEmit>) {
+    if !card::card_has_state_hook(&loaded.source, state_id, kind) {
+        return (None, Vec::new()); // 卡上没写这个钩子：不新建 Lua 实例
+    }
+    let env = tree_env(proj, character, loaded, event_name, None);
+    let before = current_state(proj, character, loaded);
+    let run = card::run_state_hook_full(&loaded.source, state_id, kind, &env, seed, &NOOP_SINK);
+    if !run.result.logs.is_empty() {
+        crate::diag::record(
+            "statetree",
+            format!("{state_id}.{kind} 日志：{:?}", run.result.logs),
+        );
+    }
+    let emits: Vec<llm::UiEmit> = run.result.ui_events.iter().map(ui_emit).collect();
+    let body = hook_effect(&run, &before, character, turn, &format!("state.{kind}"), false);
+    (body, emits)
+}
+
 // ---------- 对话生成（设计 §4 流程 + §11 流式）----------
 
 /// 每个会话的生成中断标记
@@ -1018,6 +1265,7 @@ fn assemble_prompt_core(
     log: Option<&store::EventLog>,
     codex_cache: Option<&CodexCache>,
     runtime: Option<&SessionRuntime>,
+    tree_cache: Option<&TreeCache>,
 ) -> Result<PromptRun, String> {
     let settings = store::load_settings(root).map_err(|e| e.to_string())?;
     let persona = match &meta.persona {
@@ -1041,6 +1289,27 @@ fn assemble_prompt_core(
             commit(log, root, meta, body)?;
         }
     }
+
+    // ---- B2 指令层：状态树活跃路径的 directive（设计 §7.4「输出约束」）----
+    let tree = load_tree(loaded, tree_cache);
+    let active_path = tree
+        .as_ref()
+        .map(|t| active_path_of(proj, t))
+        .unwrap_or_default();
+    let directive = tree
+        .as_ref()
+        .map(|t| t.directive_of(&active_path))
+        .unwrap_or_default();
+    let directive = if directive.trim().is_empty() {
+        None
+    } else {
+        Some(directive)
+    };
+    // 状态树的 recall 提示 → 宫殿召回权重（设计 §5.4：「回到事发地点才想起那件事」）
+    let recall_hints = tree
+        .as_ref()
+        .map(|t| t.recall_of(&active_path))
+        .unwrap_or_default();
 
     // ---- B3 设定集：别名扫描 → 五激活源 → 分级注入（设计 §6.3）----
     let world = session_world(meta);
@@ -1136,8 +1405,12 @@ fn assemble_prompt_core(
         place: place.clone(),
         present: blackboard.actors.clone(),
         mentions,
-        hints: Vec::new(),               // 状态树 recall 提示在 M2.3 接入
-        active_threads: Vec::new(),      // 活跃剧情线在 M2.4 接入
+        hints: recall_hints,             // 状态树 recall 提示（M2.3）
+        active_threads: thread_list
+            .iter()
+            .filter(|t| t.is_active())
+            .map(|t| t.id.clone())
+            .collect(),
         top_k: B4_TOP_K,
         budget_tokens: B4_TOKENS,
     };
@@ -1177,6 +1450,7 @@ fn assemble_prompt_core(
         resolutions: &resolutions,
         pending_threads: &pending,
         psyche_line: psyche_line.as_deref(),
+        directive: directive.as_deref(),
         history,
         user_content,
     };
@@ -1249,6 +1523,9 @@ async fn stream_reply(
     flags: &CancelFlags,
     log: &store::EventLog,
     assemblies: &LastAssemblies,
+    // 轮末状态树求值要用：上一轮激活的实体（codex.active 判据）与状态树结构缓存
+    runtime: Option<&SessionRuntime>,
+    tree_cache: Option<&TreeCache>,
     // 用户消息那一步的钩子报告（回复落盘后另有一次，会一起回给前端）
     user_report: llm::HookReport,
 ) -> Result<StreamEvent, String> {
@@ -1294,6 +1571,8 @@ async fn stream_reply(
                     &outcome.text,
                     Some(&ui_sink(app)),
                     log,
+                    runtime,
+                    tree_cache,
                 ) {
                     Ok(next) => {
                         forward_ui_events(on_event, &next);
@@ -1534,6 +1813,7 @@ fn tick_psyche(
 /// 回复事件 → 时钟步进事件 → on_message 事件 → 心理运行时推进。
 ///
 /// 事件化后时钟步进也是事件：重放同一轮必然得到同一时刻（设计 §7.3-5）。
+#[allow(clippy::too_many_arguments)]
 fn commit_reply(
     root: &std::path::Path,
     meta: &store::SessionMeta,
@@ -1542,6 +1822,8 @@ fn commit_reply(
     text: &str,
     sink: Option<&card::UiSink>,
     log: &store::EventLog,
+    runtime: Option<&SessionRuntime>,
+    tree_cache: Option<&TreeCache>,
 ) -> Result<llm::HookReport, String> {
     let reply = Message {
         turn,
@@ -1590,6 +1872,30 @@ fn commit_reply(
             });
         }
     }
+
+    // 轮末：状态树转移求值（设计 §7.3-2「默认转移推迟到轮末」，保证一轮对话内状态稳定）
+    if let Some(tree) = load_tree(loaded, tree_cache) {
+        let active_entities = runtime.map(|r| r.previously_active(&meta.id));
+        if let Ok(proj) = project_session(log, root, meta) {
+            let (events, emits) = advance_state_tree(
+                &proj,
+                &character,
+                loaded,
+                &tree,
+                turn,
+                "on_turn_end",
+                active_entities.as_ref(),
+                meta.seed,
+            );
+            // 转移的界面事件（on_enter 的 ui.emit）与本轮钩子事件一起回给前端
+            report.ui_events.extend(emits);
+            for body in events {
+                if let Err(e) = commit(log, root, meta, body) {
+                    report.logs.push(e);
+                }
+            }
+        }
+    }
     Ok(report)
 }
 
@@ -1620,6 +1926,7 @@ pub async fn send_message(
     assemblies: State<'_, LastAssemblies>,
     codex_cache: State<'_, CodexCache>,
     runtime: State<'_, SessionRuntime>,
+    tree_cache: State<'_, TreeCache>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -1659,6 +1966,7 @@ pub async fn send_message(
         Some(&log),
         Some(&codex_cache),
         Some(&runtime),
+        Some(&tree_cache),
     )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
@@ -1694,6 +2002,8 @@ pub async fn send_message(
         &flags,
         &log,
         &assemblies,
+        Some(&runtime),
+        Some(&tree_cache),
         report,
     )
     .await
@@ -1733,6 +2043,7 @@ pub async fn regenerate(
     assemblies: State<'_, LastAssemblies>,
     codex_cache: State<'_, CodexCache>,
     runtime: State<'_, SessionRuntime>,
+    tree_cache: State<'_, TreeCache>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -1772,6 +2083,7 @@ pub async fn regenerate(
         Some(&log),
         Some(&codex_cache),
         Some(&runtime),
+        Some(&tree_cache),
     )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
@@ -1793,6 +2105,8 @@ pub async fn regenerate(
         &flags,
         &log,
         &assemblies,
+        Some(&runtime),
+        Some(&tree_cache),
         report,
     )
     .await
@@ -1873,6 +2187,7 @@ pub fn preview_prompt(
     log: State<'_, store::EventLog>,
     codex_cache: State<'_, CodexCache>,
     runtime: State<'_, SessionRuntime>,
+    tree_cache: State<'_, TreeCache>,
 ) -> Result<prompt::PromptAssembly, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
@@ -1892,6 +2207,7 @@ pub fn preview_prompt(
         None, // 干跑：不记事件、不落盘
         Some(&codex_cache),
         Some(&runtime),
+        Some(&tree_cache),
     )?;
     Ok(run.assembly)
 }
@@ -2073,12 +2389,13 @@ return {
             Some(log),
             None,
             None,
+            None,
         )
         .unwrap();
         log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
             .unwrap();
         let after_user = run_message_hook_core(root, meta, loaded, turn, None, log);
-        let after_reply = commit_reply(root, meta, loaded, turn, "（回复）", None, log).unwrap();
+        let after_reply = commit_reply(root, meta, loaded, turn, "（回复）", None, log, None, None).unwrap();
 
         // 报告取「本轮最后一次」（回复后的状态就是前端看到的最终状态）
         let mut report = after_reply;
@@ -2248,10 +2565,11 @@ return {
             Some(&log),
             None,
             None,
+            None,
         )
         .unwrap();
         run_message_hook_core(&root, &meta, &loaded, turn, None, &log);
-        commit_reply(&root, &meta, &loaded, turn, "（重roll 的回复）", None, &log).unwrap();
+        commit_reply(&root, &meta, &loaded, turn, "（重roll 的回复）", None, &log, None, None).unwrap();
 
         assert_eq!(
             stored_state(&root, &meta)["favorability"],
@@ -2351,6 +2669,7 @@ return {
             &proj,
             None,
             2,
+            None,
             None,
             None,
             None,
@@ -2762,5 +3081,121 @@ return {
             .map(|a| a.len())
             .unwrap_or(0);
         assert!(hist >= 3, "衰减轨迹应随轮次增长：{hist}");
+    }
+
+    /// M2.3 验收（设计 §7.3/§7.4）：状态树活跃路径的 directive 进 B2；
+    /// 轮末求值首个命中即转移，转移与 reveal 都进事件流（可回放）。
+    #[test]
+    fn state_tree_drives_directive_and_transitions() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50 },
+  hooks = {
+    on_message = function(msg, state, api)
+      if msg.role == 'user' and msg.content:find('夜深') then
+        state.favorability = 80
+        api.blackboard.set('clock', '23:10')
+      end
+    end,
+  },
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '保持轻松日常的氛围，话题围绕图书馆与学业。',
+        transitions = {
+          { to = '日常.夜谈', priority = 10,
+            when = function(ev, bb, st) return bb.clock >= '23:00' and st.favorability >= 60 end },
+        },
+      },
+      ['日常.夜谈'] = {
+        parent = '日常',
+        directive = '夜深人静，两人独处。语速放慢，允许长时间沉默。',
+        reveal = { 'char.小雨.secrets.工作牌' },
+        on_enter = function(api, state)
+          state.in_night = true
+          api.blackboard.set('place.图书馆.status', '闭馆中')
+          api.ui.emit('emotion', 'calm')
+        end,
+      },
+    },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+
+        // 第一轮：还没到 23 点、好感度 50 → 不转移，B2 是根状态的指令
+        let (a1, _) = simulate_turn(&root, &meta, &loaded, &log, 1, "今天也在看书吗？");
+        let b2 = a1
+            .layers
+            .iter()
+            .find(|l| l.id == "B2")
+            .expect("B2 指令层");
+        assert!(b2.content.starts_with("<directive>"), "{}", b2.content);
+        assert!(b2.content.contains("轻松日常"), "{}", b2.content);
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert!(proj.transitions.is_empty(), "条件不满足不该转移");
+
+        // 第二轮：钩子把好感度推到 80、时钟推到 23:10 → 轮末（on_turn_end）转移
+        let (a2, r2) = simulate_turn(&root, &meta, &loaded, &log, 2, "夜深了，你还不回去吗？");
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(proj.transitions.len(), 1, "应恰好转移一次（一轮内状态稳定）");
+        assert_eq!(proj.transitions[0].to, vec!["日常", "日常.夜谈"]);
+        assert!(
+            proj.transitions[0].reason.contains("日常.夜谈"),
+            "转移原因应可读：{}",
+            proj.transitions[0].reason
+        );
+        // reveal 进设定事件 → 投影的揭示集
+        assert!(
+            proj.known.contains("char.小雨.secrets.工作牌"),
+            "进入状态应揭示秘密：{:?}",
+            proj.known
+        );
+        // 转移发生在轮末：本轮组装仍是根状态的指令，下一轮才换
+        assert!(a2.layers.iter().find(|l| l.id == "B2").unwrap().content.contains("轻松日常"));
+        // on_enter 的副作用随转移落盘（设计 §7.3-3）：state、黑板作用域键、界面事件
+        assert_eq!(
+            stored_state(&root, &meta)["in_night"],
+            serde_json::json!(true),
+            "on_enter 应能改 state"
+        );
+        let bb = store::load_blackboard(&root, &meta.id).unwrap();
+        assert_eq!(
+            bb.extra.get("place.图书馆.status"),
+            Some(&serde_json::json!("闭馆中")),
+            "on_enter 应能写黑板作用域键"
+        );
+        assert!(
+            r2.ui_events
+                .iter()
+                .any(|e| e.kind == "emotion" && e.value == "calm"),
+            "on_enter 的 ui.emit 应进本轮报告：{:?}",
+            r2.ui_events
+        );
+
+        // 第三轮：B2 变成根→叶拼接（子覆盖父）
+        let (a3, _) = simulate_turn(&root, &meta, &loaded, &log, 3, "……嗯。");
+        let b2 = a3.layers.iter().find(|l| l.id == "B2").unwrap();
+        assert!(
+            b2.content.contains("轻松日常") && b2.content.contains("夜深人静"),
+            "根→叶都要在：{}",
+            b2.content
+        );
+        assert!(
+            b2.content.find("轻松日常").unwrap() < b2.content.find("夜深人静").unwrap(),
+            "父在前、子在后（子覆盖父）：{}",
+            b2.content
+        );
+
+        // 重放同一事件流得到同一条路径（设计 §7.3-5）
+        let records = log.read(&root, &meta.id).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
+        let c = event::project_over(&rebuilt, &event::Base::default());
+        assert_eq!(c.transitions, proj.transitions, "重放得到同一批转移");
+        assert_eq!(c.known, proj.known, "重放得到同一份揭示集");
     }
 }
