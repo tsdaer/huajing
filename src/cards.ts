@@ -11,7 +11,11 @@ export const cardGeneration = ref(0);
 /** 最近一次变更的卡片路径（展示用，可为空） */
 export const lastCardChange = ref("");
 
-/// 拖入文件的导入请求：App.vue 收到拖放后写入，导入弹窗 watch 到即自动解析。
+/// 导入弹窗的开合状态（应用级：导入入口在顶栏、会话页、拖放三处，弹窗必须常驻）。
+/// 曾经把弹窗挂在会话页且只靠 watch 触发，结果在别的页拖入文件没人接——现在请求本身就会开。
+export const importOpen = ref(false);
+
+/// 待导入文件：App.vue 收到拖放后写入，导入弹窗 watch 到即自动解析。
 /// `nonce` 保证「同一个文件再拖一次」也能触发。
 export const importRequest = ref<{ path: string; nonce: number } | null>(null);
 
@@ -21,7 +25,8 @@ let importNonce = 0;
 export function requestImport(path: string): void {
   importNonce += 1;
   importRequest.value = { path, nonce: importNonce };
-  void api.recordDiagnostic("import", `拖放收到文件：${path}`);
+  importOpen.value = true;
+  void api.recordDiagnostic("import", `收到导入请求：${path}`);
 }
 
 /// 待导入的卡文件扩展名（拖放过滤）

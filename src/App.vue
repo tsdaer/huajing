@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, ref, watch } from "vue";
 import { api } from "./api";
-import { CARD_FILE_RE, importNotice, requestImport, startCardWatch } from "./cards";
+import { CARD_FILE_RE, cardGeneration, importNotice, importOpen, requestImport, startCardWatch } from "./cards";
 import Icon from "./components/Icon.vue";
 import TitleBar from "./components/TitleBar.vue";
 import { loadSessions, openNewSession, selectedId, selectSession, sessions } from "./sessions";
 import type { SessionMeta } from "./types";
+import ImportCardDialog from "./components/ImportCardDialog.vue";
 import HomeView from "./views/HomeView.vue";
 import SessionsView from "./views/SessionsView.vue";
 import SettingsView from "./views/SettingsView.vue";
@@ -48,6 +49,11 @@ function go(id: ViewId) {
 function openSession(s: SessionMeta) {
   selectSession(s.id);
   go("sessions");
+}
+
+/** 导入完成：让会话页重扫卡片清单（新建会话的下拉要跟上） */
+function onImported() {
+  cardGeneration.value += 1;
 }
 
 const info = ref<Awaited<ReturnType<typeof api.appInfo>> | null>(null);
@@ -106,6 +112,9 @@ async function startDropWatch() {
 <template>
   <div class="flex h-full flex-col">
     <TitleBar />
+
+    <!-- 导入向导常驻应用级：拖放/顶栏/会话页三处入口共用，且在任何页面都能被拖放唤起 -->
+    <ImportCardDialog v-model="importOpen" @imported="onImported" />
 
     <!-- 拖入被忽略时的说明 -->
     <div

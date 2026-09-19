@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from "vue";
 import { api } from "../api";
+import { cardGeneration, importOpen } from "../cards";
 import {
   closeNewSession,
   loadSessions,
@@ -12,7 +13,6 @@ import {
 import type { CardSummary, Persona } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
-import ImportCardDialog from "../components/ImportCardDialog.vue";
 import SessionView from "./SessionView.vue";
 
 // 会话页只放聊天本体：
@@ -22,7 +22,6 @@ const cards = ref<CardSummary[]>([]);
 const personas = ref<Persona[]>([]);
 const error = ref("");
 const newEl = ref<HTMLDialogElement | null>(null);
-const importOpen = ref(false);
 
 const form = reactive({
   character: "",
@@ -49,10 +48,8 @@ async function loadCardsAndPersonas() {
   }
 }
 
-// 导入完成：卡片清单变了，新建会话的下拉要跟上
-function onImported() {
-  void loadCardsAndPersonas();
-}
+// 导入完成（应用级弹窗发出）：卡片清单变了，新建会话的下拉要跟上
+watch(cardGeneration, () => void loadCardsAndPersonas());
 
 /** 顶栏按钮与原生 dialog 双向同步：Esc、点遮罩关闭时也要把状态收回来 */
 watch(newSessionOpen, (open) => {
@@ -110,8 +107,6 @@ async function create() {
         </div>
       </div>
     </div>
-
-    <ImportCardDialog v-model="importOpen" @imported="onImported" />
 
     <!-- 新建会话弹窗（由顶栏按钮打开） -->
     <dialog ref="newEl" class="modal" @close="closeNewSession">

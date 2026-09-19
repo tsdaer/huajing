@@ -595,6 +595,8 @@ async fn stream_reply(
     flags: &CancelFlags,
     msg_log: &store::MessageLog,
     assemblies: &LastAssemblies,
+    // 用户消息那一步的钩子报告（回复落盘后另有一次，会一起回给前端）
+    user_report: llm::HookReport,
 ) -> Result<StreamEvent, String> {
     let session_id = meta.id.as_str();
     let flag = match acquire_flag(flags, session_id) {
@@ -625,7 +627,9 @@ async fn stream_reply(
 
     match stream {
         Ok(outcome) => {
-            let mut report = None;
+            // 有用户消息那一步的报告打底：即使本轮没生成回复（失败/中断为空），
+            // 前端也能看到卡对用户输入的反应
+            let mut report = Some(user_report);
             if !outcome.text.is_empty() {
                 let reply = Message {
                     turn,
@@ -647,7 +651,7 @@ async fn stream_reply(
                     let _ = store::save_blackboard(root, session_id, &bb);
                 }
                 // M1.6：回复落盘后跑 on_message（设计 §3：每条新消息落地后调用）
-                report = Some(run_message_hook(app, root, meta, loaded, turn, on_event));
+                report = Some(run_message_hook(app, root, meta, loaded, turn, Some(on_event)));
             }
             Ok(StreamEvent::Done {
                 full: outcome.text,
@@ -695,7 +699,30 @@ fn run_message_hook(
     meta: &store::SessionMeta,
     loaded: &card::LoadedCard,
     turn: u64,
-    on_event: &Channel<StreamEvent>,
+    on_event: Option<&Channel<StreamEvent>>,
+) -> llm::HookReport {
+    let sink = ui_sink(app);
+    let report = run_message_hook_core(root, meta, loaded, turn, Some(&sink));
+    if let Some(channel) = on_event {
+        for event in &report.ui_events {
+            let _ = channel.send(StreamEvent::HookEvent {
+                kind: event.kind.clone(),
+                value: event.value.clone(),
+            });
+        }
+    }
+    report
+}
+
+/// `on_message` 的完整流程（与 Tauri 无关，便于单测走同一份代码）：
+/// 探测 → 取最新消息 → 组装环境 → 沙箱执行 → 落盘 → 报告。
+/// `sink` 为 None 时卡片推来的界面事件只进报告、不实时外推。
+fn run_message_hook_core(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    loaded: &card::LoadedCard,
+    turn: u64,
+    sink: Option<&card::UiSink>,
 ) -> llm::HookReport {
     if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_message") {
         // 诊断：这条最容易被误判成「钩子没生效」——其实是这张卡没写 on_message
@@ -711,23 +738,34 @@ fn run_message_hook(
             ..Default::default()
         };
     }
-    // 钩子看到的最新一条消息：用户消息或刚落盘的角色回复
+    // 钩子看到的最新一条消息：用户消息或刚落盘的角色回复。
+    // 每个提前返回都要留痕——静默返回正是「钩子看起来没生效」最难查的形态。
     let messages = match store::read_messages(root, &meta.id) {
         Ok(m) => m,
         Err(e) => {
-            return report_with_log(turn, format!("历史读取失败：{e}"));
+            let log = format!("历史读取失败：{e}");
+            crate::diag::record("hook", format!("on_message 中止：{log}"));
+            return report_with_log(turn, log);
         }
     };
     let Some(current) = messages.last() else {
+        crate::diag::record("hook", "on_message 中止：没有可处理的消息");
         return report_with_log(turn, "没有可处理的消息".into());
     };
     let mut state = match load_card_state(root, meta, loaded) {
         Ok(s) => s,
-        Err(e) => return report_with_log(turn, e),
+        Err(e) => {
+            crate::diag::record("hook", format!("on_message 中止：state 读取失败：{e}"));
+            return report_with_log(turn, e);
+        }
     };
     let mut blackboard = match store::load_blackboard(root, &meta.id) {
         Ok(bb) => bb,
-        Err(e) => return report_with_log(turn, format!("黑板读取失败：{e}")),
+        Err(e) => {
+            let log = format!("黑板读取失败：{e}");
+            crate::diag::record("hook", format!("on_message 中止：{log}"));
+            return report_with_log(turn, log);
+        }
     };
 
     // 钩子入参现场：把卡实际收到的 msg 与 state 原样记下来（JSON）。
@@ -750,7 +788,7 @@ fn run_message_hook(
             memory: BTreeMap::new(), // 长期记忆读侧（记忆宫殿）在 M2
         },
         meta.seed,
-        &ui_sink(app),
+        sink.unwrap_or(&NOOP_SINK),
     );
     let report = apply_message_hook(root, &meta.id, turn, &run, &mut state, &mut blackboard);
     crate::diag::record(
@@ -763,14 +801,12 @@ fn run_message_hook(
             report.logs
         ),
     );
-    for event in &report.ui_events {
-        let _ = on_event.send(StreamEvent::HookEvent {
-            kind: event.kind.clone(),
-            value: event.value.clone(),
-        });
-    }
     report
 }
+
+/// 卡片界面事件的空回调（单测与无界面场景）
+static NOOP_SINK: std::sync::LazyLock<card::UiSink> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(|_: &card::UiEvent| {}));
 
 fn report_with_log(turn: u64, log: String) -> llm::HookReport {
     llm::HookReport {
@@ -886,6 +922,10 @@ pub async fn send_message(
         .append(&root, &session_id, &user_msg)
         .map_err(|e| e.to_string())?;
 
+    // 设计 §3：`on_message` 在**每条**新消息落地后调用——用户消息同样要跑，
+    // 否则卡看不到本轮输入，且它的反应（比如好感度 +1）来不及影响这一轮的生成。
+    let report = run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event));
+
     stream_reply(
         &app,
         &root,
@@ -898,6 +938,7 @@ pub async fn send_message(
         &flags,
         &msg_log,
         &assemblies,
+        report,
     )
     .await
 }
@@ -954,6 +995,8 @@ pub async fn regenerate(
             run.blackboard_dirty.then_some(&run.blackboard),
         )?;
     }
+    // 与 send 对齐：重roll 时也给这一轮的用户消息跑一次 on_message
+    let report = run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event));
     stream_reply(
         &app,
         &root,
@@ -966,6 +1009,7 @@ pub async fn regenerate(
         &flags,
         &msg_log,
         &assemblies,
+        report,
     )
     .await
 }
@@ -1241,35 +1285,15 @@ return {
         std::sync::Arc::new(|_: &card::UiEvent| {})
     }
 
-    /// run_message_hook 的离线等价物（去掉 AppHandle 与前端通道）
+    /// 走生产同一份内核（run_message_hook_core），只把界面事件回调换成空实现——
+    /// 此前这里另写了一份等价逻辑，于是生产漏掉「用户消息那一步」时测试仍然绿。
     fn run_message_hook_offline(
         root: &std::path::Path,
         meta: &store::SessionMeta,
         loaded: &card::LoadedCard,
         turn: u64,
     ) -> llm::HookReport {
-        if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_message") {
-            return llm::HookReport {
-                turn,
-                ..Default::default()
-            };
-        }
-        let mut state = load_card_state(root, meta, loaded).unwrap();
-        let mut blackboard = store::load_blackboard(root, &meta.id).unwrap();
-        let messages = store::read_messages(root, &meta.id).unwrap();
-        let last = messages.last().unwrap();
-        let hook_run = card::run_hook_full(
-            &loaded.source,
-            card::HookCall::OnMessage { msg: last },
-            &card::HookEnv {
-                state: state.clone(),
-                blackboard: blackboard_env(&blackboard),
-                memory: BTreeMap::new(),
-            },
-            meta.seed,
-            &noop_sink(),
-        );
-        apply_message_hook(root, &meta.id, turn, &hook_run, &mut state, &mut blackboard)
+        run_message_hook_core(root, meta, loaded, turn, None)
     }
 
     #[test]
@@ -1280,8 +1304,24 @@ return {
         assert_eq!(loaded.hook_names.len(), 3, "示例卡应带三个 hook");
         let log = store::MessageLog::new();
 
-        // 第一轮：on_context 注入的内部状态是卡上初始值 50
+        // 回归：钩子必须在**用户消息**落盘后就跑（设计 §3「每条新消息落地后」）——
+        // 此前只有回复落盘后跑一次，于是卡看不到用户输入、它的反应也来不及影响本轮生成；
+        // 更糟的是单测自己模拟了两步，把生产代码漏掉的那半步掩盖了。
+        // 诊断留痕是当时唯一能看见这件事的地方，故在此也断言它。
+        let before_diag = crate::diag::recent(200).len();
+        let _ = before_diag;
         let (assembly, report) = simulate_turn(&root, &meta, &loaded, &log, 1, "今天好冷。");
+        let traces: Vec<String> = crate::diag::recent(10).iter().map(|d| d.detail.clone()).collect();
+        assert!(
+            traces.iter().filter(|d| d.contains("入参")).count() >= 2,
+            "用户消息与回复各应留下一条入参记录：{traces:?}"
+        );
+        assert!(
+            traces
+                .iter()
+                .any(|d| d.contains("\"role\":\"user\"") && d.contains("今天好冷")),
+            "钩子必须看到用户消息本身（而不是只看到角色回复）：{traces:?}"
+        );
         assert!(
             assembly
                 .layers
