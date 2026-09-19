@@ -25,7 +25,11 @@ pnpm tauri dev        # 开发模式（首次会编译 Rust，需几分钟）
 pnpm tauri build      # 产出安装包
 ```
 
-首次使用：复制 `DataHub/providers.example.toml` 为 `DataHub/providers.toml`，填入你的 API key。
+首次使用：启动后会看到三步向导——选一家服务（DeepSeek / 本地 Ollama 预设）、填 API key、建会话开聊；
+也可以直接复制 `DataHub/providers.example.toml` 为 `DataHub/providers.toml` 手改。
+
+**导入角色卡**：把 SillyTavern 的 PNG / JSON 卡拖进窗口即可（或「会话 → 导入 ST 卡」粘贴路径），
+解析预览确认后生成 `DataHub/characters/<名字>/card.lua`，改卡保存即生效，无需重启。
 
 ## 目录结构
 
@@ -36,16 +40,19 @@ src/                  # Vue 前端
   theme.ts            # 主题令牌定义 / 应用 / 导出
   theme-presets.ts    # 解析 docs/theme_test/theme.css 的预设（随主题页按需加载）
   sessions.ts         # 会话列表与选中态（侧栏子菜单与会话页共用）
+  cards.ts            # 卡片热加载通知 + 拖入导入请求（共享 store）
   window.ts           # 窗口控制（自定义标题栏用，浏览器下降级为空操作）
   api.ts / types.ts   # Tauri 命令封装与数据类型
   mock.ts             # 纯浏览器调试用的内存后端
-  components/         # Icon / TitleBar / ErrorToast
+  components/         # Icon / TitleBar / ErrorToast / ImportCardDialog
   views/              # 概览 · 会话 · 主题 · 设置
 src-tauri/src/        # Rust 核心
-  card.rs             # 角色卡与 Lua 沙箱（设计 §3）
+  card.rs             # 角色卡与 Lua 沙箱、hooks 运行时（设计 §3）
   prompt.rs           # Prompt Builder 双槽位组装（设计 §4）
   llm.rs              # OpenAI 兼容 SSE 客户端（设计 §11）
   store.rs            # DataHub 明文数据层（设计 §12）
+  watch.rs            # DataHub 热加载监听（notify）
+  stimport.rs         # SillyTavern 角色卡导入（PNG tEXt / JSON V2·V3）
 DataHub/              # 用户数据（明文，可随身拷贝）
   characters/小雨/    # 示例角色卡
   codex/default/      # 示例世界（设定集）

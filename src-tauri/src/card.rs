@@ -9,10 +9,15 @@
 //!   / `api.ui.emit` / `api.random` / `api.dice`；
 //! - 一切执行都在错误边界内：卡片崩溃只记日志并降级为静态卡，不崩主程序。
 //!
+//! M1.6 起 hooks 接入运行时（`HookEnv`）：调用方传入本轮可见的角色 state 与
+//! 黑板快照，hook 的原地修改与 `api.*` 写入经 `HookRun` 的 state / blackboard /
+//! memory 三组增量回传给宿主落盘；`api.ui.emit` 除进报告外，还经回调实时推给
+//! 界面（表情等）。调用时机见 commands.rs：`on_load` 建会话、`on_context` 每轮
+//! 组装、`on_message` 用户消息落盘后。
+//!
 //! 每次执行新建 Lua 实例（卡源码很小，重编译成本可忽略；实例不跨线程持有）。
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -49,6 +54,49 @@ const STATIC_FIELDS: [&str; 10] = [
     "first_mes",
     "example_dialogue",
 ];
+
+// ---------- hooks 运行时状态（M1.6：设计 §3「hooks 是反应」）----------
+
+/// 被 `api.blackboard.set` 允许写入的黑板键（黑板 v0 字段；设计 §4.1 B1）
+pub const BLACKBOARD_KEYS: [&str; 4] = ["day", "clock", "place", "actors"];
+
+/// 一次 hook 运行期间卡片可见的宿主状态（读侧快照）。
+///
+/// - `state`：角色私有 state（设计 §3：持久化在会话而非卡里）。Lua 侧原地改这张表，
+///   运行结束由 [`HookRun::state`] 回传宿主落盘；
+/// - `blackboard`：黑板只读快照（`api.blackboard.get` 走这里），
+///   写入走 `api.blackboard.set` 并进 [`HookRun::blackboard`]；
+/// - `memory`：`api.memory.get` 的历史值。M1 恒空——长期记忆由记忆宫殿（M2）提供读侧，
+///   本版只保证写入不丢（落 `palace.jsonl`）。
+#[derive(Debug, Clone, Default)]
+pub struct HookEnv {
+    pub state: serde_json::Value,
+    pub blackboard: std::collections::BTreeMap<String, serde_json::Value>,
+    pub memory: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// `api.ui.emit` 的实时回调（宿主转推前端）。报告里另留一份，供调用方汇总。
+/// 必须 `Send`：闭包经 mlua 转为 `'static`，持锁的宿主状态不能进。
+pub type UiSink = std::sync::Arc<dyn Fn(&UiEvent) + Send + Sync>;
+
+/// 一次 hook 运行的完整结果：错误边界内的报告 + 需要宿主落盘的三组增量。
+#[derive(Debug, Clone, Default)]
+pub struct HookRun {
+    pub result: HookResult,
+    /// hook 运行后的完整 state（`None` = 卡片没有这个 hook，未运行）
+    pub state: Option<serde_json::Value>,
+    /// `api.blackboard.set` 的写入（同 key 后写覆盖前写；已按 [`BLACKBOARD_KEYS`] 过滤）
+    pub blackboard: Vec<KvSet>,
+    /// `api.memory.set` 的写入（同 key 后写覆盖前写）
+    pub memory: Vec<KvSet>,
+}
+
+impl HookRun {
+    /// 本次是否真的跑过 hook（卡片未定义该 hook 时为 false，不应产生任何状态变化）
+    pub fn ran(&self) -> bool {
+        self.state.is_some()
+    }
+}
 
 // ---------- 静态卡片结构（serde 兼容层）----------
 
@@ -337,7 +385,8 @@ pub struct HookResult {
 pub enum HookCall<'a> {
     OnLoad,
     OnContext { window: &'a [Message] },
-    OnMessage { msg: &'a Message, window: &'a [Message] },
+    /// 每条新消息落地后（只有 msg：卡按需自取，窗口只在 on_context 给）
+    OnMessage { msg: &'a Message },
 }
 
 impl HookCall<'_> {
@@ -371,26 +420,33 @@ impl SeedableRng {
     }
 }
 
-/// 在沙箱中运行卡的一个 hook。任何失败都只进 `logs`（错误边界）。
-pub fn run_hook(
+/// 在沙箱中运行卡的一个 hook，并回传需要落盘的增量（M1.6 运行时调用入口）。
+///
+/// - `env`：卡片本轮可见的状态快照（state / 黑板 / 长期记忆读侧）；
+/// - `on_ui`：`api.ui.emit` 的实时回调（宿主转推前端；报告里也留一份）；
+/// - 任何失败都只进 `HookRun::result.logs`（错误边界），不外抛、不 panic。
+///
+/// 卡片没有定义该 hook 时 `ran()` 为 false，`state` 为 `None`——调用方据此跳过落盘。
+pub fn run_hook_full(
     source: &str,
     call: HookCall<'_>,
-    state: serde_json::Value,
+    env: &HookEnv,
     seed: u64,
-) -> HookResult {
-    let mut result = HookResult::default();
+    on_ui: &UiSink,
+) -> HookRun {
+    let mut run = HookRun::default();
     let lua = match new_sandbox() {
         Ok(l) => l,
         Err(e) => {
-            result.logs.push(format!("沙箱初始化失败：{e}"));
-            return result;
+            run.result.logs.push(format!("沙箱初始化失败：{e}"));
+            return run;
         }
     };
     let table = match eval_card(&lua, source) {
         Ok(t) => t,
         Err(e) => {
-            result.logs.push(format!("card.lua 执行失败：{e}"));
-            return result;
+            run.result.logs.push(format!("card.lua 执行失败：{e}"));
+            return run;
         }
     };
     let hook = match table
@@ -398,7 +454,7 @@ pub fn run_hook(
         .and_then(|h| h.get::<Value>(call.name()))
     {
         Ok(Value::Function(f)) => f,
-        _ => return result, // 无此 hook：正常静默
+        _ => return run, // 无此 hook：正常静默，不产生任何状态变化
     };
 
     let injections = Rc::new(RefCell::new(Vec::new()));
@@ -406,42 +462,61 @@ pub fn run_hook(
     let memory_log = Rc::new(RefCell::new(Vec::new()));
     let blackboard_log = Rc::new(RefCell::new(Vec::new()));
 
-    let state_value = match lua.to_value(&state) {
+    let state_value = match lua.to_value(&env.state) {
         Ok(v) => v,
         Err(e) => {
-            result.logs.push(format!("state 转换失败：{e}"));
-            return result;
+            run.result.logs.push(format!("state 转换失败：{e}"));
+            return run;
         }
     };
 
     let call_result = match &call {
         HookCall::OnLoad => {
-            let api = make_api(&lua, seed, &ui_events, &memory_log, &blackboard_log);
+            let api = make_api(
+                &lua,
+                seed,
+                env,
+                &ui_events,
+                &memory_log,
+                &blackboard_log,
+                on_ui,
+            );
             hook.call::<()>((state_value.clone(), api))
         }
         HookCall::OnContext { window } => {
             let ctx = make_ctx(&lua, window, &injections);
             hook.call::<()>((ctx, state_value.clone()))
         }
-        HookCall::OnMessage { msg, window: _ } => {
+        HookCall::OnMessage { msg } => {
             let msg_table = make_msg_table(&lua, msg);
-            let api = make_api(&lua, seed, &ui_events, &memory_log, &blackboard_log);
+            let api = make_api(
+                &lua,
+                seed,
+                env,
+                &ui_events,
+                &memory_log,
+                &blackboard_log,
+                on_ui,
+            );
             hook.call::<()>((msg_table, state_value.clone(), api))
         }
     };
     if let Err(e) = call_result {
-        result
+        run.result
             .logs
             .push(format!("hook「{}」执行失败：{e}", call.name()));
     }
 
     // hooks 原地修改 state 表；失败后也读回部分修改（卡作者可在日志里看到错误）
-    result.state = Some(lua.from_value(state_value).unwrap_or(state));
-    result.injections = injections.borrow().clone();
-    result.ui_events = ui_events.borrow().clone();
-    result.memory = memory_log.borrow().clone();
-    result.blackboard = blackboard_log.borrow().clone();
-    result
+    run.result.state = Some(lua.from_value(state_value).unwrap_or(env.state.clone()));
+    run.result.injections = injections.borrow().clone();
+    run.result.ui_events = ui_events.borrow().clone();
+    run.result.memory = memory_log.borrow().clone();
+    run.result.blackboard = blackboard_log.borrow().clone();
+    run.state = run.result.state.clone();
+    run.blackboard = run.result.blackboard.clone();
+    run.memory = run.result.memory.clone();
+    run
 }
 
 fn make_msg_table(lua: &Lua, msg: &Message) -> Table {
@@ -480,54 +555,51 @@ fn make_ctx(lua: &Lua, window: &[Message], injections: &Rc<RefCell<Vec<InjectedT
 }
 
 /// api：memory / blackboard / ui.emit / random / dice（设计 §3.1 白名单）
+///
+/// memory / blackboard 都是「读快照 + 记增量」：读侧来自 [`HookEnv`]
+/// （memory 读侧 M1 恒空——长期记忆的读由记忆宫殿在 M2 提供），写侧进各自的
+/// 增量日志，由调用方在运行结束后落盘。
+#[allow(clippy::too_many_arguments)]
 fn make_api(
     lua: &Lua,
     seed: u64,
+    env: &HookEnv,
     ui_events: &Rc<RefCell<Vec<UiEvent>>>,
     memory_log: &Rc<RefCell<Vec<KvSet>>>,
     blackboard_log: &Rc<RefCell<Vec<KvSet>>>,
+    on_ui: &UiSink,
 ) -> Table {
     let api = lua.create_table().expect("create api");
 
-    // memory / blackboard：本-run 内可读写的键值（持久化在 M1.6 接入）
-    for (log, key) in [
-        (Rc::clone(memory_log), "memory"),
-        (Rc::clone(blackboard_log), "blackboard"),
-    ] {
-        let ns = lua.create_table().expect("create ns");
-        let store: Rc<RefCell<HashMap<String, serde_json::Value>>> = Rc::default();
-        let st_get = Rc::clone(&store);
-        let get_fn = lua
-            .create_function(move |lua, k: String| {
-                Ok(match st_get.borrow().get(&k) {
-                    Some(v) => lua.to_value(v)?,
-                    None => Value::Nil,
-                })
-            })
-            .expect("api.get");
-        let _ = ns.set("get", get_fn);
-        let st_set = Rc::clone(&store);
-        let log_set = Rc::clone(&log);
-        let set_fn = lua
-            .create_function(move |lua, (k, v): (String, Value)| {
-                let json = lua.from_value::<serde_json::Value>(v)?;
-                st_set.borrow_mut().insert(k.clone(), json.clone());
-                let mut log = log_set.borrow_mut();
-                log.retain(|s| s.key != k); // 同 key 后写覆盖
-                log.push(KvSet { key: k, value: json });
-                Ok(())
-            })
-            .expect("api.set");
-        let _ = ns.set("set", set_fn);
-        let _ = api.set(key, ns);
-    }
+    let mem_ns = make_kv_ns(
+        lua,
+        Rc::new(env.memory.clone()),
+        Rc::clone(memory_log),
+        None,
+        "api.memory",
+    );
+    let _ = api.set("memory", mem_ns);
 
-    // ui.emit(kind, value)
+    // 黑板：只允许写 BLACKBOARD_KEYS（黑板 v0 字段），越权键报 Lua 错误
+    let allowed: Vec<String> = BLACKBOARD_KEYS.iter().map(|k| k.to_string()).collect();
+    let bb_ns = make_kv_ns(
+        lua,
+        Rc::new(env.blackboard.clone()),
+        Rc::clone(blackboard_log),
+        Some(allowed),
+        "api.blackboard",
+    );
+    let _ = api.set("blackboard", bb_ns);
+
+    // ui.emit(kind, value)：进报告 + 实时推给界面
     let ui = lua.create_table().expect("create ui");
     let ev = Rc::clone(ui_events);
+    let sink = std::sync::Arc::clone(on_ui);
     let emit_fn = lua
         .create_function(move |_, (kind, value): (String, String)| {
-            ev.borrow_mut().push(UiEvent { kind, value });
+            let event = UiEvent { kind, value };
+            sink(&event);
+            ev.borrow_mut().push(event);
             Ok(())
         })
         .expect("ui.emit");
@@ -559,6 +631,48 @@ fn make_api(
         .expect("api.dice");
     let _ = api.set("dice", dice_fn);
     api
+}
+
+/// 构造 `api.<ns>.get/set` 一对函数：读侧取自 [`HookEnv`] 快照，写侧进增量日志
+/// （同 key 后写覆盖前写）。`allowed` 为 Some 时拒绝白名单外的键。
+fn make_kv_ns(
+    lua: &Lua,
+    read: Rc<std::collections::BTreeMap<String, serde_json::Value>>,
+    log: Rc<RefCell<Vec<KvSet>>>,
+    allowed: Option<Vec<String>>,
+    ns_name: &'static str,
+) -> Table {
+    let ns = lua.create_table().expect("create ns");
+    let get_store = Rc::clone(&read);
+    let get_fn = lua
+        .create_function(move |lua, k: String| {
+            Ok(match get_store.get(&k) {
+                Some(v) => lua.to_value(v)?,
+                None => Value::Nil,
+            })
+        })
+        .expect("api.get");
+    let _ = ns.set("get", get_fn);
+
+    let set_fn = lua
+        .create_function(move |lua, (k, v): (String, Value)| {
+            if let Some(allowed) = &allowed {
+                if !allowed.iter().any(|a| a == &k) {
+                    return Err(mlua::Error::runtime(format!(
+                        "{ns_name}.set 不支持的键「{k}」（可用：{}）",
+                        allowed.join(" / ")
+                    )));
+                }
+            }
+            let json = lua.from_value::<serde_json::Value>(v)?;
+            let mut log = log.borrow_mut();
+            log.retain(|s| s.key != k); // 同 key 后写覆盖
+            log.push(KvSet { key: k, value: json });
+            Ok(())
+        })
+        .expect("api.set");
+    let _ = ns.set("set", set_fn);
+    ns
 }
 
 #[cfg(test)]
@@ -603,6 +717,22 @@ return {
         }
     }
 
+    /// 运行 hook 并丢弃界面事件回调（单测不关心实时推送）
+    fn run(source: &str, call: HookCall<'_>, state: serde_json::Value, seed: u64) -> HookResult {
+        run_hook_full(source, call, &env(state), seed, &sink()).result
+    }
+
+    fn env(state: serde_json::Value) -> HookEnv {
+        HookEnv {
+            state,
+            ..HookEnv::default()
+        }
+    }
+
+    fn sink() -> UiSink {
+        std::sync::Arc::new(|_: &UiEvent| {})
+    }
+
     #[test]
     fn parse_static_fields_and_behavior_layer() {
         let cs = parse_card(TEST_CARD).expect("解析测试卡");
@@ -621,12 +751,7 @@ return {
     fn on_message_favorability_and_side_effects() {
         let state = serde_json::json!({ "favorability": 50 });
         let m = msg("谢谢你。");
-        let r = run_hook(
-            TEST_CARD,
-            HookCall::OnMessage { msg: &m, window: &[] },
-            state,
-            42,
-        );
+        let r = run(TEST_CARD, HookCall::OnMessage { msg: &m }, state, 42);
         assert!(r.logs.is_empty(), "logs: {:?}", r.logs);
         assert_eq!(r.state.unwrap()["favorability"], 51);
         assert_eq!(
@@ -649,21 +774,15 @@ return {
     fn favorability_clamped_at_100_and_emotion_threshold() {
         let state = serde_json::json!({ "favorability": 100 });
         let m = msg("谢谢");
-        let r = run_hook(
-            TEST_CARD,
-            HookCall::OnMessage { msg: &m, window: &[] },
-            state,
-            42,
-        );
+        let r = run(TEST_CARD, HookCall::OnMessage { msg: &m }, state, 42);
         assert_eq!(r.state.unwrap()["favorability"], 100);
         assert_eq!(r.ui_events[0].value, "shy");
 
         // 未命中关键词：不加好感
-        let r2 = run_hook(
+        let r2 = run(
             TEST_CARD,
             HookCall::OnMessage {
                 msg: &msg("今天好冷。"),
-                window: &[],
             },
             serde_json::json!({ "favorability": 50 }),
             42,
@@ -674,7 +793,7 @@ return {
 
     #[test]
     fn on_context_injects_internal_state() {
-        let r = run_hook(
+        let r = run(
             TEST_CARD,
             HookCall::OnContext {
                 window: &[msg("早")],
@@ -707,12 +826,9 @@ return {
   end },
 }
 "#;
-        let r = run_hook(
+        let r = run(
             evil,
-            HookCall::OnMessage {
-                msg: &msg("hi"),
-                window: &[],
-            },
+            HookCall::OnMessage { msg: &msg("hi") },
             serde_json::json!({}),
             1,
         );
@@ -759,6 +875,81 @@ return {
     }
 
     #[test]
+    fn card_without_hook_leaves_state_untouched() {
+        let plain = r#"
+return { name = "静卡", scenario = "s", personality = "p", first_mes = "f" }
+"#;
+        let m = msg("你好");
+        let r = run_hook_full(
+            plain,
+            HookCall::OnMessage { msg: &m },
+            &env(serde_json::json!({ "a": 1 })),
+            1,
+            &sink(),
+        );
+        assert!(!r.ran(), "未定义 on_message 时不应算作跑过");
+        assert!(r.state.is_none());
+        assert!(r.result.logs.is_empty());
+    }
+
+    #[test]
+    fn ui_emit_reaches_sink_and_report() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink_seen = std::sync::Arc::clone(&seen);
+        let sink: UiSink = std::sync::Arc::new(move |e: &UiEvent| {
+            sink_seen.lock().unwrap().push(format!("{}={}", e.kind, e.value));
+        });
+        let m = msg("谢谢你");
+        let run = run_hook_full(
+            TEST_CARD,
+            HookCall::OnMessage { msg: &m },
+            &env(serde_json::json!({ "favorability": 50 })),
+            42,
+            &sink,
+        );
+        assert_eq!(seen.lock().unwrap().as_slice(), ["emotion=calm".to_string()]);
+        assert_eq!(run.result.ui_events[0].kind, "emotion");
+    }
+
+    #[test]
+    fn memory_and_blackboard_writes_logged_once_per_key() {
+        let card = r#"
+return {
+  name = "写卡", scenario = "s", personality = "p", first_mes = "f",
+  hooks = { on_message = function(msg, state, api)
+    api.memory.set("k", 1)
+    api.memory.set("k", 2)
+    api.blackboard.set("place", "天台")
+    api.blackboard.set("day", 3)
+  end },
+}
+"#;
+        let m = msg("x");
+        let r = run(card, HookCall::OnMessage { msg: &m }, serde_json::json!({}), 1);
+        assert!(r.logs.is_empty(), "logs: {:?}", r.logs);
+        assert_eq!(r.memory.len(), 1, "同 key 后写覆盖前写");
+        assert_eq!(r.memory[0].value, serde_json::json!(2));
+        assert_eq!(r.blackboard.len(), 2);
+        assert_eq!(r.blackboard[0].key, "place");
+    }
+
+    #[test]
+    fn blackboard_rejects_unknown_key() {
+        let card = r#"
+return {
+  name = "越权卡", scenario = "s", personality = "p", first_mes = "f",
+  hooks = { on_message = function(msg, state, api)
+    api.blackboard.set("weather", "雨")
+  end },
+}
+"#;
+        let m = msg("x");
+        let r = run(card, HookCall::OnMessage { msg: &m }, serde_json::json!({}), 1);
+        assert!(r.blackboard.is_empty());
+        assert!(r.logs[0].contains("不支持的键"), "logs: {:?}", r.logs);
+    }
+
+    #[test]
     fn seeded_random_is_replayable() {
         let card = r#"
 return {
@@ -769,26 +960,44 @@ return {
 }
 "#;
         let m = msg("roll");
-        let a = run_hook(
-            card,
-            HookCall::OnMessage {
-                msg: &m,
-                window: &[],
-            },
-            serde_json::json!({}),
-            99,
-        );
-        let b = run_hook(
-            card,
-            HookCall::OnMessage {
-                msg: &m,
-                window: &[],
-            },
-            serde_json::json!({}),
-            99,
-        );
+        let a = run(card, HookCall::OnMessage { msg: &m }, serde_json::json!({}), 99);
+        let b = run(card, HookCall::OnMessage { msg: &m }, serde_json::json!({}), 99);
         assert_eq!(a.ui_events, b.ui_events, "同一种子应可回放");
         assert!(!a.ui_events.is_empty());
+    }
+
+    #[test]
+    fn edited_card_file_takes_effect_without_restart() {
+        // M1.7 验收：改 first_mes 保存后，下一次读取即用新值（每轮从磁盘重读，无需重启）
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("characters/热卡");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("card.lua");
+        // 一行写完：续行缩进会被折进 first_mes（Rust 的 \ 续行只在行尾紧跟换行时生效）
+        let card = |first: &str, fav: i64| {
+            format!(
+                "return {{ spec='charcard/1.0', name='热卡', scenario='s', personality='p', first_mes='{first}', state={{ favorability={fav} }}, hooks={{ on_message=function(msg, state) state.favorability = state.favorability + 1 end }} }}"
+            )
+        };
+        std::fs::write(&path, card("旧开场", 50)).unwrap();
+        let before = load_card(root.path(), "热卡").unwrap();
+        assert_eq!(before.card.first_mes, "旧开场");
+
+        std::fs::write(&path, card("新开场", 70)).unwrap();
+        let after = load_card(root.path(), "热卡").unwrap();
+        assert_eq!(after.card.first_mes, "新开场");
+        assert_eq!(after.default_state["favorability"], 70);
+
+        // 钩子也来自新源码（旧实例不会被复用）
+        let m = msg("x");
+        let r = run_hook_full(
+            &after.source,
+            HookCall::OnMessage { msg: &m },
+            &env(serde_json::json!({ "favorability": 10 })),
+            1,
+            &sink(),
+        );
+        assert_eq!(r.state.unwrap()["favorability"], 11);
     }
 
     #[test]
@@ -801,5 +1010,15 @@ return {
         assert!(!lc.degraded, "降级原因：{:?}", lc.degrade_reason);
         assert_eq!(lc.card.name, "小雨");
         assert_eq!(lc.card.example_dialogue.len(), 2);
+        // M1.6：示例卡带行为层（好感度），入席即有初始 state
+        assert_eq!(
+            lc.hook_names,
+            vec![
+                "on_load".to_string(),
+                "on_context".to_string(),
+                "on_message".to_string()
+            ]
+        );
+        assert_eq!(lc.default_state["favorability"], 50);
     }
 }

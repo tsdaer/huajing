@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
 import { api } from "../api";
 import type { Persona, Provider, Settings } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
@@ -35,6 +35,9 @@ async function refresh() {
       api.listPersonas(),
       api.getSettings(),
     ]);
+    wizardDone.value = settings.value.wizard_done;
+    // 全新用户：直接落在「填 key」这一步，省掉找入口的时间
+    if (needsSetup.value) startCreate();
   } catch (e) {
     error.value = String(e);
   }
@@ -45,6 +48,66 @@ onMounted(refresh);
 function startCreate() {
   Object.assign(draft, blank());
   editing.value = true;
+}
+
+// ---------- 首启向导（M1.9：装好 → 填 key → 开聊 ≤ 3 分钟）----------
+const wizardDone = ref(false);
+
+/** 还缺一个能用的接入点：没有任何接入点，或现有接入点都没有 key（Ollama 除外） */
+const needsSetup = computed(() => {
+  if (wizardDone.value) return false;
+  if (providers.value.length === 0) return true;
+  return providers.value.every((p) => !usable(p));
+});
+
+/** 本地服务（Ollama 等）不需要 key */
+function usable(p: Provider): boolean {
+  const local = /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(p.base_url);
+  return local || p.api_key.trim().length > 0;
+}
+
+/** 常见接入点预设：一键填好 Base URL 与模型名，用户只补 key */
+const PRESETS: Array<{ label: string; hint: string; preset: Provider }> = [
+  {
+    label: "DeepSeek",
+    hint: "api.deepseek.com · deepseek-chat",
+    preset: {
+      name: "deepseek",
+      base_url: "https://api.deepseek.com/v1",
+      api_key: "",
+      model: "deepseek-chat",
+      temperature: 0.8,
+      role: "chat",
+    },
+  },
+  {
+    label: "Ollama（本地）",
+    hint: "localhost:11434 · 无需 key",
+    preset: {
+      name: "ollama",
+      base_url: "http://localhost:11434/v1",
+      api_key: "",
+      model: "qwen2.5:7b",
+      temperature: 0.8,
+      role: "chat",
+    },
+  },
+];
+
+function usePreset(preset: Provider) {
+  Object.assign(draft, JSON.parse(JSON.stringify(preset)) as Provider);
+  editing.value = true;
+}
+
+/** 走完向导：记住「别再提示」（设置随 settings.toml 持久化） */
+async function finishWizard() {
+  wizardDone.value = true;
+  if (!settings.value) return;
+  try {
+    settings.value = await api.saveSettings({ ...settings.value, wizard_done: true });
+  } catch (e) {
+    error.value = String(e);
+  }
 }
 
 function startEdit(p: Provider) {
@@ -61,6 +124,7 @@ async function save() {
     providers.value = await api.saveProvider({ ...draft });
     editing.value = false;
     error.value = "";
+    if (draft.api_key.trim() || usable(draft)) void finishWizard();
   } catch (e) {
     error.value = String(e);
   }
@@ -93,6 +157,37 @@ async function confirmRemove() {
     <ErrorToast :message="error" @dismiss="error = ''" />
 
     <div class="mx-auto flex w-full max-w-[900px] flex-col gap-4">
+      <!-- 首启向导：三步把第一次对话跑起来（M1.9 ≤3 分钟目标） -->
+      <section v-if="needsSetup" class="card card-border border-primary/40 bg-primary/5">
+        <div class="card-body gap-3 p-5">
+          <h2 class="card-title gap-2 text-sm font-medium">
+            <Icon name="sparkle" :size="16" class="text-primary" />
+            三步开始：填一个接入点就能开聊
+          </h2>
+          <ol class="m-0 flex list-none flex-col gap-1.5 p-0 text-xs text-base-content/70">
+            <li>① 选一家服务（或直接用本地 Ollama）——下面是常用预设</li>
+            <li>② 填入 API key（本地服务不用填），保存</li>
+            <li>③ 回到「会话」新建一场，就能聊了</li>
+          </ol>
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              v-for="p in PRESETS"
+              :key="p.label"
+              class="btn btn-sm"
+              :class="editing && draft.base_url === p.preset.base_url ? 'btn-primary' : ''"
+              @click="usePreset(p.preset)"
+            >
+              {{ p.label }}
+              <span class="text-[11px] font-normal opacity-60">{{ p.hint }}</span>
+            </button>
+            <button class="btn btn-ghost btn-sm" @click="finishWizard">我知道了，别再提示</button>
+          </div>
+          <p class="m-0 text-[11px] text-base-content/45">
+            配置明文存放在 <code class="font-mono">DataHub/providers.toml</code>，也可以直接编辑该文件。
+          </p>
+        </div>
+      </section>
+
       <!-- 接入点 -->
       <section class="card card-border bg-base-100">
         <div class="card-body gap-4 p-5">

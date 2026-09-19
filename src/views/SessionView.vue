@@ -1,7 +1,16 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
 import { api } from "../api";
-import type { Blackboard, Message, PromptAssembly, SessionMeta, StreamEvent } from "../types";
+import { cardGeneration } from "../cards";
+import type {
+  Blackboard,
+  HookReport,
+  MemRecord,
+  Message,
+  PromptAssembly,
+  SessionMeta,
+  StreamEvent,
+} from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
 
@@ -20,6 +29,57 @@ const cardName = ref(props.meta.characters[0] ?? "角色");
 const panel = ref<"" | "board" | "inspector">("");
 const bbForm = reactive({ day: 1, clock: "", place: "", actors: "" });
 const savingBb = ref(false);
+
+// ---------- M1.6：卡内状态 / 记忆 / 界面事件 ----------
+/** 检查器页签：注入层 / 卡内状态 / 卡内记忆 / 事件流 */
+const inspTab = ref<"layers" | "state" | "memory" | "events">("layers");
+const cardState = ref<Record<string, unknown>>({});
+const memory = ref<MemRecord[]>([]);
+/** 卡内界面事件（api.ui.emit）：最近 50 条，最新的在前 */
+const hookEvents = ref<{ kind: string; value: string; turn: number }[]>([]);
+/** 本轮生成期间收到的钩子报告（done 事件另带一份） */
+const lastReport = ref<HookReport | null>(null);
+/** 卡内错误日志（沙箱错误边界捕获；只在面板里显示） */
+const hookLogs = ref<string[]>([]);
+
+const KIND_LABEL: Record<string, string> = {
+  emotion: "表情",
+  bgm: "音效",
+  sprite: "立绘",
+  effect: "特效",
+};
+
+function kindLabel(kind: string): string {
+  return KIND_LABEL[kind] ?? kind;
+}
+
+/** 最近一次表情事件：会话头部的徽标（表情位的 M1 占位显示） */
+const mood = computed(() => {
+  const hit = hookEvents.value.find((e) => e.kind === "emotion");
+  return hit ? hit.value : "";
+});
+
+/** 卡内状态行（顶层键值；嵌套对象折叠成 JSON 单行） */
+const stateRows = computed(() =>
+  Object.entries(cardState.value).map(([k, v]) => ({
+    key: k,
+    value: typeof v === "object" && v !== null ? JSON.stringify(v) : String(v),
+  })),
+);
+
+/** 记忆流按时间倒序（最新在前） */
+const memoryRows = computed(() => [...memory.value].reverse());
+
+function fmtTs(ts: number): string {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function fmtValue(v: unknown): string {
+  if (v === null || v === undefined) return "nil";
+  return typeof v === "object" ? JSON.stringify(v) : String(v);
+}
 
 const draft = ref("");
 const generating = ref(false);
@@ -133,6 +193,7 @@ async function loadAll() {
     messages.value = [...msgs];
     page.value = pageCount.value; // 打开会话时停在最新一页
     void refreshInspector();
+    void refreshCard();
     void scrollToBottom();
     // 气泡署名用卡片显示名；读取失败退回目录名
     api
@@ -233,12 +294,46 @@ function onDelta(e: StreamEvent) {
   if (e.event === "delta") {
     streamText.value += e.text;
     void scrollToBottom();
+  } else if (e.event === "hook_event") {
+    pushHookEvent(e.kind, e.value);
+  }
+}
+
+function pushHookEvent(kind: string, value: string) {
+  hookEvents.value = [
+    { kind, value, turn: messages.value.length ? messages.value[messages.value.length - 1].turn : 0 },
+    ...hookEvents.value,
+  ].slice(0, 50);
+}
+
+/** 钩子报告落地：卡内状态、记忆增量、日志 */
+function applyReport(report: HookReport) {
+  lastReport.value = report;
+  if (report.card_state) cardState.value = report.card_state;
+  hookLogs.value = report.logs ?? [];
+  if (report.ui_events?.length) {
+    for (const e of report.ui_events) pushHookEvent(e.kind, e.value);
+  }
+}
+
+/** 读卡内状态与记忆流（面板数据源） */
+async function refreshCard() {
+  try {
+    const [state, mem] = await Promise.all([
+      api.getCardState(props.meta.id),
+      api.listCardMemory(props.meta.id),
+    ]);
+    cardState.value = state;
+    memory.value = mem;
+  } catch {
+    /* 卡内数据读取失败不阻塞聊天 */
   }
 }
 
 /** 生成收尾：错误上报、消息与黑板重读（时钟已步进）、检查器刷新 */
 async function finishGeneration(final: StreamEvent) {
   if (final.event === "error") error.value = final.message;
+  if (final.event === "done" && final.report) applyReport(final.report);
   try {
     const [msgs, bb] = await Promise.all([
       api.readMessages(props.meta.id),
@@ -258,6 +353,7 @@ async function finishGeneration(final: StreamEvent) {
   generating.value = false;
   streamText.value = "";
   void refreshInspector();
+  void refreshCard();
   void scrollToBottom();
   composerEl.value?.focus();
 }
@@ -327,6 +423,17 @@ function resetComposerHeight() {
 
 onMounted(loadAll);
 watch(() => props.meta.id, loadAll);
+// 卡片热加载（M1.7）：改了 card.lua 立即重读卡内状态与署名，不必重启
+watch(cardGeneration, () => {
+  if (generating.value) return; // 生成中不动面板，避免读到半截状态
+  void refreshCard();
+  api
+    .getCard(props.meta.characters[0])
+    .then((d) => {
+      if (d.card.name) cardName.value = d.card.name;
+    })
+    .catch(() => {});
+});
 </script>
 
 <template>
@@ -347,6 +454,14 @@ watch(() => props.meta.id, loadAll);
             <h2 class="truncate text-base font-semibold">{{ cardName }}</h2>
             <span class="status status-xs status-success"></span>
             <span class="text-xs text-base-content/50">{{ generating ? "生成中" : "在场" }}</span>
+            <!-- 表情位占位（M1.6）：卡片 api.ui.emit("emotion", …) 的结果 -->
+            <span
+              v-if="mood"
+              class="badge badge-xs badge-soft badge-secondary tooltip tooltip-bottom"
+              data-tip="角色表情（卡内 ui.emit，立绘差分留待资产规范落地）"
+            >
+              {{ kindLabel("emotion") }} · {{ mood }}
+            </span>
           </div>
           <p class="mt-0.5 mb-0 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-base-content/50">
             <span class="flex items-center gap-1">
@@ -590,6 +705,26 @@ watch(() => props.meta.id, loadAll);
         </div>
 
         <div v-else class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+          <!-- 检查器页签：注入层 / 卡内状态 / 卡内记忆 / 事件流（M1.6） -->
+          <div role="tablist" class="tabs tabs-border tabs-xs flex-none">
+            <button
+              v-for="t in [
+                { id: 'layers', label: '注入层' },
+                { id: 'state', label: '卡内状态' },
+                { id: 'memory', label: '卡内记忆' },
+                { id: 'events', label: '事件流' },
+              ]"
+              :key="t.id"
+              role="tab"
+              class="tab"
+              :class="{ 'tab-active': inspTab === t.id }"
+              @click="inspTab = t.id as typeof inspTab"
+            >
+              {{ t.label }}
+            </button>
+          </div>
+
+          <template v-if="inspTab === 'layers'">
           <div class="flex items-center justify-between gap-2">
             <p v-if="assembly" class="m-0 text-xs text-base-content/50">
               {{ assemblySource === "last" ? "最近一次发送" : "预览 · 干跑" }}
@@ -632,6 +767,92 @@ watch(() => props.meta.id, loadAll);
             </div>
           </template>
           <p v-else class="m-0 text-xs text-base-content/50">尚无组装数据。</p>
+          </template>
+
+          <!-- 卡内状态：角色私有 state（state.json，hook 每轮维护） -->
+          <template v-else-if="inspTab === 'state'">
+            <div class="flex items-center justify-between gap-2">
+              <p class="m-0 text-xs text-base-content/50">
+                卡片私有状态（state.json）· 重启不丢
+              </p>
+              <button class="btn btn-ghost btn-xs flex-none" @click="refreshCard">
+                <Icon name="refresh" :size="13" />刷新
+              </button>
+            </div>
+            <dl v-if="stateRows.length" class="m-0 flex flex-col gap-2">
+              <div
+                v-for="row in stateRows"
+                :key="row.key"
+                class="rounded-box flex items-center justify-between gap-3 bg-base-200 px-3 py-2"
+              >
+                <dt class="font-mono text-xs text-base-content/60">{{ row.key }}</dt>
+                <dd class="m-0 truncate text-sm font-medium" :title="row.value">{{ row.value }}</dd>
+              </div>
+            </dl>
+            <p v-else class="m-0 text-xs text-base-content/50">这张卡没有 state（静态卡）。</p>
+            <p v-if="lastReport && !lastReport.ran" class="m-0 text-[11px] text-base-content/40">
+              卡片未定义 on_message 钩子，状态不随对话变化。
+            </p>
+          </template>
+
+          <!-- 卡内记忆：api.memory.set 的写入流（palace.jsonl） -->
+          <template v-else-if="inspTab === 'memory'">
+            <div class="flex items-center justify-between gap-2">
+              <p class="m-0 text-xs text-base-content/50">
+                卡内长期记忆写入（palace.jsonl）· 召回在 M2 接记忆宫殿
+              </p>
+              <button class="btn btn-ghost btn-xs flex-none" @click="refreshCard">
+                <Icon name="refresh" :size="13" />刷新
+              </button>
+            </div>
+            <ul v-if="memoryRows.length" class="m-0 flex list-none flex-col gap-2 p-0">
+              <li
+                v-for="(rec, i) in memoryRows"
+                :key="`${rec.ts}-${rec.key}-${i}`"
+                class="rounded-box flex items-center justify-between gap-3 bg-base-200 px-3 py-2"
+              >
+                <div class="min-w-0">
+                  <p class="m-0 truncate font-mono text-xs">{{ rec.key }}</p>
+                  <p class="m-0 text-[11px] text-base-content/45">
+                    第 {{ rec.turn }} 轮 · {{ rec.source }} · {{ fmtTs(rec.ts) }}
+                  </p>
+                </div>
+                <span class="badge badge-sm badge-soft flex-none">{{ fmtValue(rec.value) }}</span>
+              </li>
+            </ul>
+            <p v-else class="m-0 text-xs text-base-content/50">还没有记忆写入。</p>
+          </template>
+
+          <!-- 事件流：api.ui.emit 的界面事件 + 卡内错误 -->
+          <template v-else>
+            <div class="flex items-center justify-between gap-2">
+              <p class="m-0 text-xs text-base-content/50">卡片推来的界面事件（api.ui.emit）</p>
+              <button class="btn btn-ghost btn-xs flex-none" @click="hookEvents = []">清空</button>
+            </div>
+            <ul v-if="hookEvents.length" class="m-0 flex list-none flex-col gap-1.5 p-0">
+              <li
+                v-for="(ev, i) in hookEvents"
+                :key="`${ev.turn}-${ev.kind}-${ev.value}-${i}`"
+                class="rounded-box flex items-center gap-2 bg-base-200 px-3 py-1.5 text-xs"
+              >
+                <span class="badge badge-xs badge-soft badge-primary">{{ kindLabel(ev.kind) }}</span>
+                <span class="truncate">{{ ev.value }}</span>
+                <span class="ml-auto flex-none text-[11px] text-base-content/40">第 {{ ev.turn }} 轮</span>
+              </li>
+            </ul>
+            <p v-else class="m-0 text-xs text-base-content/50">还没有界面事件。</p>
+
+            <template v-if="hookLogs.length">
+              <p class="m-0 mt-1 text-xs text-base-content/50">卡内错误（不打断对话）</p>
+              <div
+                v-for="(log, i) in hookLogs"
+                :key="i"
+                class="alert alert-error alert-soft py-2 text-xs whitespace-pre-wrap"
+              >
+                {{ log }}
+              </div>
+            </template>
+          </template>
         </div>
       </aside>
     </div>

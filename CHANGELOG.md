@@ -6,6 +6,16 @@
 
 ### Added
 
+- **M1.6 hooks 接入运行时**：hooks 从「能跑」变成「参与对话」——`card.rs` 引入 `HookEnv` / `HookRun` / `UiSink`：调用方传入本轮可见的 state 与黑板快照，hook 的原地改动与 `api.memory`/`api.blackboard`/`api.ui.emit` 写入按三类增量回传宿主；`api.blackboard.set` 按黑板 v0 字段白名单（day/clock/place/actors）校验，越权键报 Lua 错误；`on_message` 不再接收多余窗口参数（设计 §3 签名只有 msg）。调用时机：`on_load` 建会话（角色入席、初始化 state）、`on_context` 每轮组装（B5 注入 + 顺带改状态）、`on_message` 每条消息落盘后。落盘分工：state → `state.json`（重启不丢）、`api.memory.set` → `palace.jsonl`（`MemRecord` 追加流，读侧召回留待 M2 记忆宫殿）、黑板写入 → `blackboard.json`；`api.ui.emit` 实时经 Tauri 事件推前端并在 `done` 事件的 `HookReport` 里留一份。新增命令 `get_card_state` / `list_card_memory`；示例卡「小雨」补行为层（好感度 + 情绪 + 记忆写入，与设计 §3 示例同构）。新增 8 例测试（HookEnv 读写、未定义 hook 不动状态、ui.emit 实时回调、同 key 后写覆盖、越权键拒绝），累计 46 例全绿（含 3 例「钩子副作用真的落盘」端到端用例：好感度 50→51→52 跨轮演进 + state.json 读回 + palace.jsonl 追加 + 黑板写入）
+
+- **M1.6 前端：卡内可观测面**：会话页检查器扩成四页签——注入层 / **卡内状态**（state.json 逐项）/ **卡内记忆**（palace.jsonl 倒序，带轮次与来源）/ **事件流**（`api.ui.emit` 最近 50 条 + 沙箱错误日志）；会话头部新增表情徽标（`ui.emit("emotion", …)` 的 M1 占位显示，立绘差分留待资产规范）；`StreamEvent` 增 `hook_event` 形态，`done` 带 `report`
+
+- **M1.7 热加载**：新增 `watch.rs`——notify 监听 `characters/`（递归）与 `personas/`、`settings.toml`，事件去重 + 300ms 合并窗口后推 `card_changed` 给前端；`Classify` 只认这三处，`sessions/` 等每轮都在写的运行时数据不触发刷新。命令 `watch_cards`/`unwatch_cards`（幂等，watcher 由 Tauri State 持有）。前端新增 `src/cards.ts`：共享「卡片代次」计数器，概览卡片墙、会话页署名与卡内状态随变更自动重扫。说明：解析本身不缓存（每轮从磁盘重读 card.lua），所以热加载做的是「通知」而非「重载」——改卡保存后下一条消息即用新值。新增 5 例测试（路径分类三例、队列去重、改卡即生效）
+
+- **M1.8 SillyTavern 卡导入**：新增 `stimport.rs`——PNG 的 tEXt `chara` 块（兼容 `ccv3`，自写 base64 解码，容忍折行）与 JSON（V2/V3/裸字段）解析为草稿；字段映射把 ST 的 description 折进 scenario、personality 空时用描述兜底、`{{char}}`/`{{user}}` 占位符归一化、`mes_example` 按 `<START>` 段拆成 `example_dialogue` 问答对（拆不动的原文与 system_prompt/creator_notes 一起折进 `notes`，不静默丢数据）；生成 `charcard/1.0` 的 `card.lua`（Lua 字面量按字节转义，任意 UTF-8 安全）并在落盘后立刻用自家解析器读回校验，读不回则回滚报错。目录名清洗防路径穿越，同名卡自动 `-2` 后缀不覆盖。`character_book`/`extensions` 等未映射字段在提醒里点名（M2 设定集拆分接手）。前端新增导入向导（`ImportCardDialog.vue`）：拖入文件即弹窗（App 级 `onDragDropEvent`，因为 WebView 的 File API 拿不到本地路径）+ 手动粘贴路径 + 解析预览（设定/开场白/示例对话组数/提醒）+ 确认落盘。新增 10 例测试（V2 字段映射、示例对话拆分与兜底、V3/裸 JSON、生成物读回、恶意文本转义、最小 PNG 往返、base64 容错、同名去重、路径穿越），累计 56 例全绿
+
+- **M1.9 首启向导与打包**：`settings.toml` 增 `wizard_done`；设置页在「还没有可用接入点」时显示三步向导（DeepSeek / Ollama 预设一键填好 Base URL 与模型名，只需补 key，本地服务免 key），保存接入点即自动收尾，也可显式「别再提示」。NSIS 安装包与 MSI 构建通过：`huajing_0.1.0_x64-setup.exe`（2.35 MB）与 `huajing_0.1.0_x64_en-US.msi`（3.32 MB）
+
 - 项目初始化：Tauri 2 + Vue 3 + Vite + TypeScript 脚手架；Rust 核心模块桩（card / prompt / llm / store / commands）；DataHub 示例数据（小雨角色卡、default 世界）；设计文档 v0.12 与角色卡制作提示词套件入库
 - 工程文档：ROADMAP、CHANGELOG、M1 执行计划（docs/plan/m1.md）
 - **M1.1 配置与会话骨架**：`store.rs` 数据层——providers.json 按名 upsert/删除、settings.json 读写（缺省回退）、personas 扫描（坏文件容错）；会话目录骨架（session.json / messages.jsonl / state.json / blackboard.json）与消息追加/读取；无外部依赖的时间工具（会话 id、ISO 时间戳）；命令层注册 list_providers / save_provider / delete_provider / get_settings / save_settings / list_personas / new_session / list_sessions / read_messages；前端壳导航与设置页（接入点增删改、用户人格与全局配置展示）；含 5 例数据层单元测试

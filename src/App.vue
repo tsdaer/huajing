@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, ref, watch } from "vue";
 import { api } from "./api";
+import { CARD_FILE_RE, requestImport, startCardWatch } from "./cards";
 import Icon from "./components/Icon.vue";
 import TitleBar from "./components/TitleBar.vue";
 import { loadSessions, openNewSession, selectedId, selectSession, sessions } from "./sessions";
@@ -57,12 +58,49 @@ onMounted(async () => {
     info.value = null;
   }
   void loadSessions();
+  // M1.7 热加载：改了 DataHub 下的卡片/人格即推事件，视图据此刷新
+  void startCardWatch();
+  void startDropWatch();
 });
+
+// ---------- 拖放导入（M1.8）----------
+// WebView 的 File API 拿不到本地路径，拖放的路径只能从 Tauri 的窗口事件取。
+const dragging = ref(false);
+
+async function startDropWatch() {
+  try {
+    const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+    await getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "enter" || event.payload.type === "over") {
+        dragging.value = true;
+        return;
+      }
+      dragging.value = false;
+      if (event.payload.type !== "drop") return;
+      const hit = event.payload.paths.find((p) => CARD_FILE_RE.test(p));
+      if (hit) requestImport(hit);
+    });
+  } catch {
+    /* 浏览器 mock 下没有 Tauri 窗口事件 */
+  }
+}
 </script>
 
 <template>
   <div class="flex h-full flex-col">
     <TitleBar />
+
+    <!-- 拖入卡文件的提示（M1.8）：松手即打开导入向导 -->
+    <div
+      v-if="dragging"
+      class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-base-300/70 backdrop-blur-xs"
+    >
+      <div class="rounded-box border-2 border-dashed border-primary bg-base-100 px-8 py-6 text-center">
+        <Icon name="sparkle" :size="24" class="mx-auto text-primary" />
+        <p class="mt-2 mb-0 text-sm font-medium">松手导入角色卡</p>
+        <p class="mb-0 text-xs text-base-content/50">SillyTavern 的 PNG 或 JSON</p>
+      </div>
+    </div>
 
     <div class="drawer min-h-0 flex-1 lg:drawer-open">
       <input id="shell-drawer" v-model="drawerOpen" type="checkbox" class="drawer-toggle" />

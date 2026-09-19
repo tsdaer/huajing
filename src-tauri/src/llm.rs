@@ -40,13 +40,42 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// `api.ui.emit` 转推给前端的一条界面事件（M1.6：表情/立绘位占位）。
+/// 与 [`crate::card::UiEvent`] 同义，此处单独定义是为了让流事件不依赖卡片模块。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiEmit {
+    pub kind: String,
+    pub value: String,
+}
+
 /// 发送给前端的流事件
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum StreamEvent {
     Delta { text: String },
-    Done { full: String, cancelled: bool },
+    Done {
+        full: String,
+        cancelled: bool,
+        /// 本轮 on_message 钩子的报告（无 on_message 卡为 None）
+        report: Option<HookReport>,
+    },
     Error { message: String },
+    /// 卡片经 `api.ui.emit` 推来的界面事件（紧跟产生它的那一步发生）
+    HookEvent { kind: String, value: String },
+}
+
+/// 一轮 `on_message` 钩子的执行报告（前端据此显示卡内状态与事件）
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HookReport {
+    pub turn: u64,
+    /// 卡片是否定义了该 hook（未定义时后面几项都为空）
+    pub ran: bool,
+    pub card_state: serde_json::Value,
+    /// `api.memory.set` 的写入（已落 palace.jsonl）
+    pub memory: Vec<crate::card::KvSet>,
+    pub ui_events: Vec<UiEmit>,
+    /// 卡内错误（沙箱错误边界捕获；只在面板里展示，不打断对话）
+    pub logs: Vec<String>,
 }
 
 // ---------- SSE 解析 ----------

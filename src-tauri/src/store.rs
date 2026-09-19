@@ -64,23 +64,40 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 // ---------- 目录 ----------
 
-/// DataHub 目录解析：HUAJING_DATA 环境变量 > 可执行文件旁 DataHub >
-/// 从 cwd 向上找（覆盖 `tauri dev` 时 cwd=src-tauri 的情况）> 当前目录 DataHub
+/// DataHub 目录解析（设计 §12「程序与数据分离」），按优先级：
+///
+/// 1. `HUAJING_DATA` 环境变量（便携/多套数据用）；
+/// 2. 可执行文件旁的 `DataHub`（便携版、绿色解压即用）；
+/// 3. 从 cwd 逐级向上找已有的 `DataHub`（开发期：`tauri dev` 的 cwd 是 src-tauri）；
+/// 4. 用户数据目录下的 `DataHub`（安装版首启：绝不在 Program Files 里写数据，
+///    也不能依赖启动时的 cwd——从开始菜单启动时 cwd 可能是 system32）。
 pub fn data_root() -> PathBuf {
     if let Ok(p) = std::env::var("HUAJING_DATA") {
         return PathBuf::from(p);
     }
-    let exe_adjacent = std::env::current_exe()
+    if let Some(p) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("DataHub")))
-        .filter(|p| p.is_dir());
-    match exe_adjacent {
-        Some(p) => p,
-        None => std::env::current_dir()
-            .ok()
-            .and_then(|cwd| cwd.ancestors().map(|d| d.join("DataHub")).find(|p| p.is_dir()))
-            .unwrap_or_else(|| PathBuf::from("DataHub")),
+        .filter(|p| p.is_dir())
+    {
+        return p;
     }
+    if let Some(p) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cwd.ancestors().map(|d| d.join("DataHub")).find(|p| p.is_dir()))
+    {
+        return p;
+    }
+    user_data_root()
+}
+
+/// 兜底数据目录：`%APPDATA%\huajing\DataHub`（其他平台退回 `~/.huajing/DataHub`）
+fn user_data_root() -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("huajing").join("DataHub")
 }
 
 /// 确保数据目录骨架存在（设计 §12 目录树）
@@ -153,6 +170,9 @@ pub struct Settings {
     pub theme: String,
     #[serde(default = "default_narrative_mode")]
     pub narrative_mode: String,
+    /// 首启向导是否已走完（M1.9：填过 key 或显式跳过）
+    #[serde(default)]
+    pub wizard_done: bool,
 }
 
 fn default_locale() -> String {
@@ -171,6 +191,7 @@ impl Default for Settings {
             locale: default_locale(),
             theme: default_theme(),
             narrative_mode: default_narrative_mode(),
+            wizard_done: false,
         }
     }
 }
@@ -305,6 +326,56 @@ pub fn save_state(root: &Path, session_id: &str, state: &serde_json::Value) -> S
     )?;
     Ok(())
 }
+
+// ---------- palace.jsonl：卡内长期记忆写入流（设计 §12；M2 记忆宫殿的落点）----------
+
+/// 记忆对象（设计 §12：`palace.jsonl` 追加流中的一条）。
+///
+/// M1.6 只落卡内 `api.memory.set` 的键值写入，并按 `turn` 溯源；
+/// 记忆宫殿的读侧（召回/房间/时间线）在 M2 长出来，届时本结构按设计扩充
+/// （`kind` 之外的字段、witnesses 等），旧记录保持可读。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemRecord {
+    /// 记录类型：M1 恒为 `fact`（卡内写入的长期事实）
+    pub kind: String,
+    pub key: String,
+    pub value: serde_json::Value,
+    /// 来源：`hook.on_message` / `hook.on_load`（设计 §3.1 的卡内写入）
+    pub source: String,
+    /// 产生该记录的轮次（on_load 为 0）
+    pub turn: u64,
+    pub ts: u64,
+}
+
+/// 追加一条记忆记录（创建文件；调用方保证目录存在）
+pub fn append_memory_record(root: &Path, session_id: &str, rec: &MemRecord) -> StoreResult<()> {
+    use std::io::Write;
+    let dir = session_dir(root, session_id);
+    if !dir.is_dir() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    let line = serde_json::to_string(rec)? + "\n";
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("palace.jsonl"))?;
+    f.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+/// 读取全部记忆记录（坏行跳过；文件不存在返回空）
+pub fn read_memory_records(root: &Path, session_id: &str) -> StoreResult<Vec<MemRecord>> {
+    let path = session_dir(root, session_id).join("palace.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(std::fs::read_to_string(&path)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<MemRecord>(l).ok())
+        .collect())
+}
+
 
 pub struct NewSessionRequest {
     pub character: String,
@@ -804,6 +875,22 @@ mod tests {
         // 不存在的会话报错
         assert!(load_blackboard(root.path(), "no-such").is_err());
         assert!(save_state(root.path(), "no-such", &st).is_err());
+    }
+
+    #[test]
+    fn env_override_wins_and_fallback_is_user_writable() {
+        // 环境变量优先（便携/多套数据）
+        std::env::set_var("HUAJING_DATA", "J:/tmp/huajing-test-data");
+        assert_eq!(data_root(), PathBuf::from("J:/tmp/huajing-test-data"));
+        std::env::remove_var("HUAJING_DATA");
+
+        // 兜底目录必须在用户数据目录下（安装版不能在 Program Files 里写盘）
+        let fallback = user_data_root();
+        assert!(fallback.ends_with("DataHub"), "{fallback:?}");
+        let host = std::env::var_os("APPDATA").map(PathBuf::from);
+        if let Some(appdata) = host {
+            assert!(fallback.starts_with(&appdata), "兜底应落在 %APPDATA% 下：{fallback:?}");
+        }
     }
 
     #[test]

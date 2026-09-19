@@ -12,6 +12,7 @@ import {
 import type { CardSummary, Persona } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
+import ImportCardDialog from "../components/ImportCardDialog.vue";
 import SessionView from "./SessionView.vue";
 
 // 会话页只放聊天本体：
@@ -21,6 +22,7 @@ const cards = ref<CardSummary[]>([]);
 const personas = ref<Persona[]>([]);
 const error = ref("");
 const newEl = ref<HTMLDialogElement | null>(null);
+const importOpen = ref(false);
 
 const form = reactive({
   character: "",
@@ -33,6 +35,10 @@ const form = reactive({
 
 onMounted(async () => {
   void loadSessions();
+  await loadCardsAndPersonas();
+});
+
+async function loadCardsAndPersonas() {
   try {
     [cards.value, personas.value] = await Promise.all([api.listCards(), api.listPersonas()]);
     if (!form.character && cards.value.length > 0) {
@@ -41,7 +47,12 @@ onMounted(async () => {
   } catch {
     /* 卡/人格读取失败不阻塞弹窗 */
   }
-});
+}
+
+// 导入完成：卡片清单变了，新建会话的下拉要跟上
+function onImported() {
+  void loadCardsAndPersonas();
+}
 
 /** 顶栏按钮与原生 dialog 双向同步：Esc、点遮罩关闭时也要把状态收回来 */
 watch(newSessionOpen, (open) => {
@@ -89,11 +100,18 @@ async function create() {
         <Icon name="sparkle" :size="24" class="text-base-content/25" />
         <p class="m-0 text-sm text-base-content/50">挑一场戏，接着往下演。</p>
         <p class="m-0 text-xs text-base-content/40">在左侧「会话」里选一场，或者新建一场。</p>
-        <button class="btn btn-primary btn-sm" @click="openNewSession">
-          <Icon name="plus" :size="15" />新建会话
-        </button>
+        <div class="mt-1 flex items-center gap-2">
+          <button class="btn btn-primary btn-sm" @click="openNewSession">
+            <Icon name="plus" :size="15" />新建会话
+          </button>
+          <button class="btn btn-sm" @click="importOpen = true">
+            <Icon name="database" :size="15" />导入 ST 卡
+          </button>
+        </div>
       </div>
     </div>
+
+    <ImportCardDialog v-model="importOpen" @imported="onImported" />
 
     <!-- 新建会话弹窗（由顶栏按钮打开） -->
     <dialog ref="newEl" class="modal" @close="closeNewSession">

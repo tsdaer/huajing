@@ -28,7 +28,7 @@ const providers: Provider[] = [
   },
 ];
 
-const settings: Settings = { locale: "zh-CN", theme: "huajing", narrative_mode: "台词体" };
+const settings: Settings = { locale: "zh-CN", theme: "huajing", narrative_mode: "台词体", wizard_done: true };
 
 const personas: Persona[] = [
   { name: "夜读者", description: "安静的图书馆常客，话少，观察细。" },
@@ -71,6 +71,20 @@ const messages: Message[] = [
     role: "char",
     content:
       "「我在等雨停。」她朝窗外扬了扬下巴，玻璃上全是细密的水痕。\n\n「不过现在看起来，还要再下一会儿。」",
+    ts: 1758200160,
+  },
+];
+
+/** mock 的卡内状态与记忆流（M1.6 面板数据） */
+const mockCardState: Record<string, unknown> = { favorability: 52 };
+
+const memoryRecords: import("./types").MemRecord[] = [
+  {
+    kind: "fact",
+    key: "last_thanked",
+    value: 1,
+    source: "hook.on_message",
+    turn: 1,
     ts: 1758200160,
   },
 ];
@@ -267,6 +281,10 @@ export function setupMock() {
         return assembly(messages);
       case "last_prompt":
         return null;
+      case "get_card_state":
+        return { ...mockCardState };
+      case "list_card_memory":
+        return memoryRecords;
       default:
         throw new Error(`mock 未覆盖命令：${cmd}`);
     }

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { api } from "../api";
+import { cardGeneration } from "../cards";
 import type { CardSummary, SessionMeta, Settings } from "../types";
 import Icon from "../components/Icon.vue";
 
@@ -31,6 +32,9 @@ onMounted(async () => {
     settings.value = null;
   }
 });
+
+// 卡片热加载（M1.7）：DataHub 里的卡变了就重扫卡片墙
+watch(cardGeneration, () => void loadCards());
 
 /** 卡目录为空或读取失败时静默 */
 async function loadCards() {

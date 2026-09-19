@@ -5,7 +5,10 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   Blackboard,
   CardDetail,
+  CardDraft,
   CardSummary,
+  ImportReport,
+  MemRecord,
   Message,
   Persona,
   PromptAssembly,
@@ -79,4 +82,20 @@ export const api = {
   previewPrompt: (sessionId: string) => invoke<PromptAssembly>("preview_prompt", { sessionId }),
   /** 最近一次实际发送的组装 */
   lastPrompt: (sessionId: string) => invoke<PromptAssembly | null>("last_prompt", { sessionId }),
+
+  /** 角色私有 state 现状（卡内状态面板） */
+  getCardState: (sessionId: string) => invoke<Record<string, unknown>>("get_card_state", { sessionId }),
+  /** 卡内长期记忆写入流（palace.jsonl） */
+  listCardMemory: (sessionId: string) => invoke<MemRecord[]>("list_card_memory", { sessionId }),
+
+  /** 解析 SillyTavern 卡（PNG/JSON）为草稿，不落盘（导入向导预览） */
+  previewStCard: (path: string) => invoke<CardDraft>("preview_st_card", { path }),
+  /** 导入 ST 卡：生成 characters/<名字>/card.lua（同名自动 -2；overwrite 时覆盖） */
+  importStCard: (path: string, overwrite = false) =>
+    invoke<ImportReport>("import_st_card", { path, overwrite }),
+
+  /** 启动 DataHub 热加载监听（M1.7；幂等） */
+  watchCards: () => invoke<void>("watch_cards"),
+  /** 停止热加载监听（幂等） */
+  unwatchCards: () => invoke<void>("unwatch_cards"),
 };

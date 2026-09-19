@@ -16,6 +16,8 @@ export interface Settings {
   locale: string;
   theme: string;
   narrative_mode: string;
+  /** 首启向导是否已走完（M1.9） */
+  wizard_done: boolean;
 }
 
 /** 用户人格（personas/*.json） */
@@ -92,6 +94,32 @@ export interface CardDetail {
   degrade_reason?: string | null;
 }
 
+// ---------- SillyTavern 卡导入（stimport.rs · M1.8）----------
+
+/** 从 ST 卡解析出的草稿（落盘前可预览） */
+export interface CardDraft {
+  name: string;
+  creator?: string | null;
+  tags: string[];
+  world?: string | null;
+  scenario: string;
+  personality: string;
+  first_mes: string;
+  example_dialogue: ExampleTurn[];
+  notes: string;
+  /** 原卡规范：chara_card_v2 / v3 / 未知 */
+  source_spec: string;
+  warnings: string[];
+}
+
+/** 导入结果（导入向导展示） */
+export interface ImportReport {
+  dir_name: string;
+  card_path: string;
+  draft: CardDraft;
+  warnings: string[];
+}
+
 // ---------- LLM 流式（llm.rs · 设计 §11）----------
 
 /** OpenAI 格式对话消息 */
@@ -100,11 +128,43 @@ export interface ChatMessage {
   content: string;
 }
 
-/** send_message 推送的流事件 */
+/** `api.memory.set` / `api.blackboard.set` 的一次写入（card.rs · KvSet） */
+export interface KvSet {
+  key: string;
+  value: unknown;
+}
+
+/** 一轮 `on_message` 钩子的执行报告（llm.rs · HookReport） */
+export interface HookReport {
+  turn: number;
+  /** 卡片是否定义了该 hook（否 → 其余字段为空） */
+  ran: boolean;
+  /** 运行后的角色私有 state（面板据此显示卡内状态） */
+  card_state: Record<string, unknown>;
+  /** `api.memory.set` 的写入（已落 palace.jsonl） */
+  memory: KvSet[];
+  ui_events: { kind: string; value: string }[];
+  /** 卡内错误（沙箱错误边界捕获，不打断对话） */
+  logs: string[];
+}
+
+/** send_message / regenerate 推送的流事件 */
 export type StreamEvent =
   | { event: "delta"; text: string }
-  | { event: "done"; full: string; cancelled: boolean }
-  | { event: "error"; message: string };
+  | { event: "done"; full: string; cancelled: boolean; report?: HookReport | null }
+  | { event: "error"; message: string }
+  /** 卡片经 api.ui.emit 推来的界面事件 */
+  | { event: "hook_event"; kind: string; value: string };
+
+/** 卡内长期记忆写入流中的一条（store.rs · MemRecord） */
+export interface MemRecord {
+  kind: string;
+  key: string;
+  value: unknown;
+  source: string;
+  turn: number;
+  ts: number;
+}
 
 // ---------- 黑板与 Prompt 组装（store.rs / prompt.rs · 设计 §4）----------
 
