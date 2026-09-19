@@ -11,6 +11,7 @@ mod store;    // DataHub 明文数据层（设计 §12）
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(commands::CancelFlags::default())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
             commands::list_providers,
@@ -24,6 +25,8 @@ pub fn run() {
             commands::new_session,
             commands::list_sessions,
             commands::read_messages,
+            commands::send_message,
+            commands::stop_generation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running huajing");

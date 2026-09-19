@@ -343,11 +343,21 @@ pub fn list_sessions(root: &Path) -> StoreResult<Vec<SessionMeta>> {
 
 // ---------- 时间工具（不引入时间库；Howard Hinnant civil 算法）----------
 
-fn unix_now() -> u64 {
+/// 当前 unix 秒（命令层落盘时间戳用）
+pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// 读取单个会话元数据
+pub fn load_session(root: &Path, id: &str) -> StoreResult<SessionMeta> {
+    let path = session_dir(root, id).join("session.json");
+    if !path.exists() {
+        return Err(StoreError::NotFound(format!("会话「{}」", id)));
+    }
+    Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
 }
 
 fn seed_now() -> u64 {
