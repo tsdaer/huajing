@@ -10,6 +10,8 @@ import type {
   CardSummary,
   DiagRecord,
   ImportReport,
+  InspectorData,
+  InspectorProposal,
   MemRecord,
   Message,
   Persona,
@@ -96,6 +98,14 @@ export const api = {
   previewPrompt: (sessionId: string) => invoke<PromptAssembly>("preview_prompt", { sessionId }),
   /** 最近一次实际发送的组装 */
   lastPrompt: (sessionId: string) => invoke<PromptAssembly | null>("last_prompt", { sessionId }),
+
+  /** 记忆检查器数据（M2.8）：一次拉全状态树 / 剧情线 / 心理 / 宫殿 / 设定集 / 收件箱 */
+  inspectorData: (sessionId: string) => invoke<InspectorData>("inspector_data", { sessionId }),
+  /** 设定收件箱：确认或否决一条提案，返回更新后的提案 */
+  decideProposal: (sessionId: string, id: string, accept: boolean, note?: string) =>
+    invoke<InspectorProposal>("decide_proposal", { sessionId, id, accept, note }),
+  /** 手动触发一次总结（可能较慢；正常路径是消息滑出窗口后自动触发） */
+  summarizeNow: (sessionId: string) => invoke<string>("summarize_now", { sessionId }),
 
   /** 角色私有 state 现状（卡内状态面板） */
   getCardState: (sessionId: string) => invoke<Record<string, unknown>>("get_card_state", { sessionId }),

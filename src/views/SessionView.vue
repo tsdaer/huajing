@@ -5,6 +5,7 @@ import { cardGeneration } from "../cards";
 import type {
   Blackboard,
   HookReport,
+  InspectorData,
   MemRecord,
   Message,
   PromptAssembly,
@@ -13,6 +14,12 @@ import type {
 } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
+import StatePathPanel from "../components/inspector/StatePathPanel.vue";
+import ThreadsPanel from "../components/inspector/ThreadsPanel.vue";
+import PsychePanel from "../components/inspector/PsychePanel.vue";
+import PalacePanel from "../components/inspector/PalacePanel.vue";
+import CodexPanel from "../components/inspector/CodexPanel.vue";
+import SummaryPanel from "../components/inspector/SummaryPanel.vue";
 
 // M1.5 聊天界面：气泡流 + 流式打字机 + 停止 + 消息编辑/重roll/删除。
 // 黑板与记忆检查器收进右侧抽屉，聊天流为主。界面全部由 daisyUI 组件构成。
@@ -35,9 +42,94 @@ const panel = ref<"" | "board" | "inspector">("");
 const bbForm = reactive({ day: 1, clock: "", place: "", actors: "" });
 const savingBb = ref(false);
 
+// ---------- 记忆检查器：页签与数据（M1.6 的四个可观测面 + M2.8 的六个面板） ----------
+/** 检查器页签：M1 的四个可观测面 + M2.8 的六个记忆检查器面板 */
+const INSP_TABS = [
+  { id: "layers", label: "注入层" },
+  { id: "statetree", label: "状态路径" },
+  { id: "threads", label: "剧情线" },
+  { id: "psyche", label: "心理" },
+  { id: "palace", label: "宫殿" },
+  { id: "codex", label: "设定集" },
+  { id: "outbox", label: "摘要·收件箱" },
+  { id: "state", label: "卡内状态" },
+  { id: "memory", label: "卡内记忆" },
+  { id: "events", label: "事件流" },
+] as const;
+
+type InspTab = (typeof INSP_TABS)[number]["id"];
+
+/** M2.8 面板组：共享一份 inspectorData（注入层仍走 preview/last_prompt） */
+const M2_TABS: InspTab[] = ["statetree", "threads", "psyche", "palace", "codex", "outbox"];
+
+const inspTab = ref<InspTab>("layers");
+const inspTabLabel = computed(() => INSP_TABS.find((t) => t.id === inspTab.value)?.label ?? "");
+
+/** 记忆检查器全量投影（状态树 / 剧情线 / 心理 / 宫殿 / 设定集 / 摘要与收件箱） */
+const inspector = ref<InspectorData | null>(null);
+const inspLoading = ref(false);
+const inspError = ref("");
+/** 「立即总结」的进行态与结果（总结可能较慢） */
+const summarizing = ref(false);
+const summaryResult = ref("");
+/** 正在确认/否决的提案 id */
+const decidingId = ref("");
+
+/** 拉一次检查器数据；失败只在面板里提示，不打断聊天（浏览器 mock 未覆盖该命令时也走这里） */
+async function loadInspector() {
+  inspLoading.value = true;
+  inspError.value = "";
+  try {
+    inspector.value = await api.inspectorData(props.meta.id);
+  } catch (e) {
+    inspError.value = String(e);
+  } finally {
+    inspLoading.value = false;
+  }
+}
+
+/** 打开抽屉时拉一次；已经有数据就复用缓存，重拉交给「刷新」 */
+function ensureInspector() {
+  if (!inspector.value && !inspLoading.value) void loadInspector();
+}
+
+/** 抽屉头切到「检查器」页（与工具栏同一条路径：切过去顺手把数据拉上） */
+function openInspector() {
+  panel.value = "inspector";
+  ensureInspector();
+}
+
+/** 收件箱：确认 / 否决一条提案，动作进事件流，成功后刷新全量视图 */
+async function decideProposal(id: string, accept: boolean) {
+  decidingId.value = id;
+  try {
+    await api.decideProposal(props.meta.id, id, accept);
+    await loadInspector();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    decidingId.value = "";
+  }
+}
+
+/** 手动触发一次总结（正常路径是消息滑出窗口后自动触发） */
+async function summarizeNow() {
+  if (summarizing.value) return;
+  summarizing.value = true;
+  summaryResult.value = "";
+  error.value = "";
+  try {
+    summaryResult.value = await api.summarizeNow(props.meta.id);
+    await loadInspector();
+    void refreshInspector();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    summarizing.value = false;
+  }
+}
+
 // ---------- M1.6：卡内状态 / 记忆 / 界面事件 ----------
-/** 检查器页签：注入层 / 卡内状态 / 卡内记忆 / 事件流 */
-const inspTab = ref<"layers" | "state" | "memory" | "events">("layers");
 const cardState = ref<Record<string, unknown>>({});
 const memory = ref<MemRecord[]>([]);
 /** 卡内界面事件（api.ui.emit）：最近 50 条，最新的在前 */
@@ -165,6 +257,7 @@ function canReroll(i: number, m: Message): boolean {
 
 function togglePanel(p: "board" | "inspector") {
   panel.value = panel.value === p ? "" : p;
+  if (panel.value === "inspector") ensureInspector(); // M2.8：打开抽屉时拉一次检查器数据
 }
 
 async function scrollToBottom() {
@@ -180,6 +273,10 @@ async function loadAll() {
   editingIndex.value = -1;
   draft.value = "";
   page.value = 1;
+  // 换会话：检查器数据作废（下次打开抽屉再拉）
+  inspector.value = null;
+  inspError.value = "";
+  summaryResult.value = "";
   const id = props.meta.id;
   try {
     const [bb, msgs] = await Promise.all([api.getBlackboard(id), api.readMessages(id)]);
@@ -354,6 +451,8 @@ async function finishGeneration(final: StreamEvent) {
   streamText.value = "";
   void refreshInspector();
   void refreshCard();
+  // 刚聊完一轮：状态树/剧情线/心理/宫殿多半都变了，抽屉开着就顺手重拉（设计 §8/§9 的「面板可查」）
+  if (panel.value === "inspector") void loadInspector();
   void scrollToBottom();
   composerEl.value?.focus();
 }
@@ -666,7 +765,7 @@ watch(cardGeneration, () => {
               role="tab"
               class="tab"
               :class="{ 'tab-active': panel === 'inspector' }"
-              @click="panel = 'inspector'"
+              @click="openInspector()"
             >
               检查器
             </button>
@@ -705,20 +804,15 @@ watch(cardGeneration, () => {
         </div>
 
         <div v-else class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
-          <!-- 检查器页签：注入层 / 卡内状态 / 卡内记忆 / 事件流（M1.6） -->
+          <!-- 检查器页签：M1.6 的四个可观测面 + M2.8 的六个记忆检查器面板 -->
           <div role="tablist" class="tabs tabs-border tabs-xs flex-none">
             <button
-              v-for="t in [
-                { id: 'layers', label: '注入层' },
-                { id: 'state', label: '卡内状态' },
-                { id: 'memory', label: '卡内记忆' },
-                { id: 'events', label: '事件流' },
-              ]"
+              v-for="t in INSP_TABS"
               :key="t.id"
               role="tab"
               class="tab"
               :class="{ 'tab-active': inspTab === t.id }"
-              @click="inspTab = t.id as typeof inspTab"
+              @click="inspTab = t.id"
             >
               {{ t.label }}
             </button>
@@ -820,6 +914,55 @@ watch(cardGeneration, () => {
             </div>
           </template>
           <p v-else class="m-0 text-xs text-base-content/50">尚无组装数据。</p>
+          </template>
+
+          <!-- M2.8 记忆检查器面板组：一份 inspectorData 喂六个页签（设计 §14） -->
+          <template v-else-if="M2_TABS.includes(inspTab)">
+            <div class="flex items-center justify-between gap-2">
+              <p class="m-0 min-w-0 truncate text-xs text-base-content/50">
+                {{ inspTabLabel }} · {{ inspector?.character || cardName }}
+              </p>
+              <button class="btn btn-ghost btn-xs flex-none" :disabled="inspLoading" @click="loadInspector">
+                <span v-if="inspLoading" class="loading loading-spinner loading-xs"></span>
+                <Icon v-else name="refresh" :size="13" />刷新
+              </button>
+            </div>
+
+            <!-- 读失败只在这里提示：不打断聊天（浏览器 mock 未覆盖该命令时也走这里） -->
+            <div v-if="inspError" role="alert" class="alert alert-error alert-soft py-2 text-xs break-words">
+              {{ inspError }}
+            </div>
+            <p v-else-if="!inspector" class="m-0 flex items-center gap-2 text-xs text-base-content/50">
+              <span v-if="inspLoading" class="loading loading-spinner loading-xs"></span>
+              {{ inspLoading ? "正在读记忆检查器…" : "还没有检查器数据，点「刷新」重拉。" }}
+            </p>
+
+            <template v-else>
+              <StatePathPanel
+                v-if="inspTab === 'statetree'"
+                :tree="inspector.stateTree"
+                :transitions="inspector.transitions"
+              />
+              <ThreadsPanel v-else-if="inspTab === 'threads'" :threads="inspector.threads" />
+              <PsychePanel v-else-if="inspTab === 'psyche'" :psyche="inspector.psyche" />
+              <PalacePanel v-else-if="inspTab === 'palace'" :palace="inspector.palace" />
+              <CodexPanel
+                v-else-if="inspTab === 'codex'"
+                :codex="inspector.codex"
+                :known="inspector.known"
+                :active-entities="inspector.activeEntities"
+              />
+              <SummaryPanel
+                v-else
+                :summary="inspector.summary"
+                :proposals="inspector.proposals"
+                :summarizing="summarizing"
+                :result="summaryResult"
+                :deciding="decidingId"
+                @summarize="summarizeNow"
+                @decide="decideProposal"
+              />
+            </template>
           </template>
 
           <!-- 卡内状态：角色私有 state（state.json，hook 每轮维护） -->

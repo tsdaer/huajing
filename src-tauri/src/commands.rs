@@ -2245,6 +2245,191 @@ pub fn preview_prompt(
     Ok(run.assembly)
 }
 
+// ---------- 剧情线的手动操作（设计 §8.3：玩家手动开线/收线）----------
+
+/// 手动开线（面板或 OOC；归属 origin=manual，重放历史时不会被丢弃）
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn open_thread(
+    session_id: String,
+    title: String,
+    cause: String,
+    actors: Vec<String>,
+    importance: Option<f32>,
+    log: State<'_, store::EventLog>,
+) -> Result<serde_json::Value, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    open_thread_at(&log, &root, &meta, &title, &cause, &actors, importance)
+}
+
+/// 开线的内核（与 Tauri 无关，便于单测）
+fn open_thread_at(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    title: &str,
+    cause: &str,
+    actors: &[String],
+    importance: Option<f32>,
+) -> Result<serde_json::Value, String> {
+    let proj = project_session(log, root, meta)?;
+    let board = blackboard_of(&proj);
+    let turn = proj.last_message().map(|m| m.turn).unwrap_or(0);
+    let id = threads::id_from_title(title);
+    let thread = threads::Thread::open(
+        &id,
+        title,
+        cause,
+        actors,
+        importance.unwrap_or(0.6),
+        threads::ThreadStamp {
+            turn,
+            story_day: board.day,
+            story_clock: board.clock.clone(),
+        },
+    );
+    let snapshot = thread.to_value();
+    commit(
+        log,
+        root,
+        meta,
+        LogBody::Thread(event::ThreadEvent {
+            turn,
+            op: threads::OP_OPEN.into(),
+            thread_id: id,
+            thread: Some(snapshot.clone()),
+            origin: threads::ORIGIN_MANUAL.into(),
+            note: None,
+            ts: store::unix_now(),
+        }),
+    )?;
+    Ok(snapshot)
+}
+
+/// 手动收线（设计 §8.3「收线自动做三件事」）：
+/// ① 高显著结果记忆入宫殿（带 thread 链接，供「这件事的来龙去脉」聚合召回）；
+/// ② 线事件落流（origin=manual）：现状卡的「心里有事」随之消失、C1 只读投影不再列出；
+/// ③ 以 thread:<id>:resolved 为事件名求值一次状态树转移（设计 §8.5：线了结可驱动状态转移）。
+#[tauri::command]
+pub fn resolve_thread(
+    session_id: String,
+    id: String,
+    outcome: String,
+    log: State<'_, store::EventLog>,
+    tree_cache: State<'_, TreeCache>,
+    runtime: State<'_, SessionRuntime>,
+) -> Result<serde_json::Value, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    resolve_thread_at(&log, &root, &meta, &id, &outcome, &tree_cache, &runtime)
+}
+
+/// 收线的内核（与 Tauri 无关，便于单测）
+#[allow(clippy::too_many_arguments)]
+fn resolve_thread_at(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    id: &str,
+    outcome: &str,
+    tree_cache: &TreeCache,
+    runtime: &SessionRuntime,
+) -> Result<serde_json::Value, String> {
+    let character = first_character(meta)?;
+    let loaded = card::load_card(root, &character).map_err(|e| e.to_string())?;
+    let proj = project_session(log, root, meta)?;
+    let board = blackboard_of(&proj);
+    let turn = proj.last_message().map(|m| m.turn).unwrap_or(0);
+
+    let Some(mut thread) = proj
+        .threads
+        .get(id)
+        .and_then(|v| threads::Thread::from_value(v).ok())
+    else {
+        return Err(format!("没有这条线：{id}"));
+    };
+    thread.resolve(turn, board.day, &board.clock, outcome);
+
+    // ① 结果记忆（高显著：它是「结果」，比过程更该被记住）
+    let seq = proj.episodes.len() + proj.memory.len() + 1;
+    let memory = palace::MemObject {
+        id: palace::next_id(seq),
+        kind: palace::KIND_EPISODE.to_string(),
+        content: outcome.to_string(),
+        turn,
+        story_day: board.day,
+        story_clock: board.clock.clone(),
+        place: if board.place.is_empty() {
+            None
+        } else {
+            Some(board.place.clone())
+        },
+        actors: if board.actors.is_empty() {
+            vec![character.clone()]
+        } else {
+            board.actors.clone()
+        },
+        witnesses: board.actors.clone(),
+        salience: 0.9,
+        emotion: None,
+        links: vec![format!("thread:{id}")],
+        thread: Some(id.to_string()),
+        source: "thread.resolve".into(),
+        ts: store::unix_now(),
+        rehearsals: 0,
+    };
+    thread.attach_resolution_memory(&memory.id);
+    let snapshot = thread.to_value();
+
+    // ② 线事件（快照带 resolution 与结果记忆 id）
+    commit(
+        log,
+        root,
+        meta,
+        LogBody::Thread(event::ThreadEvent {
+            turn,
+            op: threads::OP_RESOLVE.into(),
+            thread_id: id.to_string(),
+            thread: Some(snapshot.clone()),
+            origin: threads::ORIGIN_MANUAL.into(),
+            note: Some(outcome.to_string()),
+            ts: store::unix_now(),
+        }),
+    )?;
+    commit(
+        log,
+        root,
+        meta,
+        LogBody::Memory(event::MemoryEvent {
+            turn,
+            origin: threads::ORIGIN_MANUAL.into(),
+            object: serde_json::to_value(&memory).map_err(|e| e.to_string())?,
+            ts: store::unix_now(),
+        }),
+    )?;
+
+    // ③ 线了结驱动状态树（设计 §8.5：thread:<id>:resolved 可作转移事件）
+    if let Some(tree) = load_tree(&loaded, Some(tree_cache)) {
+        let active_entities = runtime.previously_active(&meta.id);
+        let proj2 = project_session(log, root, meta)?;
+        let (events, _emits) = advance_state_tree(
+            &proj2,
+            &character,
+            &loaded,
+            &tree,
+            turn,
+            &format!("{id}:resolved"), // 设计 §8.5 的 thread:<id>:resolved（id 本身已带 thread. 前缀）
+            Some(&active_entities),
+            meta.seed,
+        );
+        for body in events {
+            commit(log, root, meta, body)?;
+        }
+    }
+    Ok(snapshot)
+}
+
 // ---------- 记忆检查器数据（M2.8 面板的数据源）----------
 
 /// 组装检查器面板需要的全部投影数据（与 Tauri 无关的内核，便于单测）。
@@ -4107,5 +4292,107 @@ return {
 
         // 第二批：已总结过的部分不再重复总结
         assert!(summary_batch(&proj).is_none(), "批次已被覆盖，不该重复总结");
+    }
+
+    /// M2 验收第 2 条：约定类情节能被正确了结——现状卡同步更新、结果自动入宫殿，
+    /// 且线了结可驱动状态树转移（设计 §8.3 收线三件事 / §8.5）。
+    #[test]
+    fn resolving_a_thread_updates_scene_palace_and_state_tree() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50 },
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '轻松日常。',
+        transitions = {
+          { to = '释然', priority = 5, when = 'event:thread.周五还书:resolved' },
+        },
+      },
+      ['释然'] = { parent = '日常', directive = '事情说开了，她松了一口气。' },
+    },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "今天好冷。");
+
+        // 玩家手动开线（设计 §8.3 ②）
+        let snapshot = open_thread_at(
+            &log,
+            &root,
+            &meta,
+            "周五还书",
+            "玩家忘带借书卡，小雨破例让他先把书拿走，约定周五来还。",
+            &["小雨".into(), "玩家".into()],
+            Some(0.8),
+        )
+        .unwrap();
+        let id = snapshot["id"].as_str().unwrap().to_string();
+        assert_eq!(id, "thread.周五还书", "线 id 由标题生成且带前缀");
+
+        // 未收线：C1 的只读投影列得出这条欠账
+        let (a2, _) = simulate_turn(&root, &meta, &loaded, &log, 2, "嗯。");
+        assert!(
+            a2.layers
+                .iter()
+                .find(|l| l.id == "C1")
+                .map(|l| l.content.contains("周五还书"))
+                .unwrap_or(false),
+            "未了结的线应出现在 C1：{:?}",
+            a2.layers.iter().find(|l| l.id == "C1").map(|l| l.content.clone())
+        );
+
+        // 收线：三件事一次做完
+        let cache = TreeCache::default();
+        let runtime = SessionRuntime::default();
+        let resolved = resolve_thread_at(
+            &log,
+            &root,
+            &meta,
+            &id,
+            "玩家如约还书，小雨送了张画着太阳的便签。",
+            &cache,
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(resolved["state"], "resolved");
+        assert!(
+            resolved["resolution"]["memory"].is_string(),
+            "结果记忆 id 应回填到线上：{resolved}"
+        );
+
+        // ① 结果自动入宫殿（高显著，带 thread 链接）
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let result = proj
+            .episodes
+            .iter()
+            .find(|e| e["content"].as_str().unwrap_or("").contains("如约还书"))
+            .expect("结果记忆应进宫殿");
+        assert_eq!(result["thread"], "thread.周五还书", "结果记忆应挂在线 id 上");
+        // f32 → f64 的精度损失：0.9f32 序列化回来是 0.8999999…
+        assert!(
+            result["salience"].as_f64().unwrap() >= 0.89,
+            "结果记忆应是高显著：{}",
+            result["salience"]
+        );
+
+        // ② ③ 下一轮：C1 不再列它、B1 出现「了结未远」、状态树已被线驱动转移
+        let (a3, _) = simulate_turn(&root, &meta, &loaded, &log, 3, "那就好。");
+        let c1 = a3.layers.iter().find(|l| l.id == "C1").map(|l| l.content.clone()).unwrap_or_default();
+        assert!(!c1.contains("周五还书"), "收线后不该再列为未决事项：{c1}");
+        let b1 = a3.layers.iter().find(|l| l.id == "B1").unwrap().content.clone();
+        assert!(b1.contains("了结未远"), "现状卡应出现「了结未远」：{b1}");
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(
+            proj.transitions.last().unwrap().to,
+            vec!["日常", "释然"],
+            "线了结应驱动状态转移：{:?}",
+            proj.transitions
+        );
     }
 }

@@ -357,6 +357,142 @@ export function setupMock() {
         return { ...mockCardState };
       case "list_card_memory":
         return memoryRecords;
+      // 记忆检查器（M2.8）：形状与 commands.rs 的 inspector_data 对齐，
+      // 让浏览器调试路径也能看到 M2 的七个面板（数据是示意值，不参与对话逻辑）。
+      case "inspector_data":
+        return {
+          session: a.sessionId ?? "mock",
+          character: "小雨",
+          stateTree: {
+            root: "日常",
+            path: ["日常", "日常.夜谈"],
+            directive: "保持轻松日常的氛围，话题围绕图书馆与学业。\n夜深人静，两人独处。语速放慢。",
+            recall: ["room:图书馆", "topic:过去"],
+            reveal: ["char.小雨.secrets.工作牌"],
+            states: ["日常", "日常.夜谈", "疏远"],
+            warnings: [],
+          },
+          transitions: [
+            {
+              turn: 3,
+              from: ["日常"],
+              to: ["日常", "日常.夜谈"],
+              reason: "日常 → 日常.夜谈（priority 10）",
+              ts: Math.floor(Date.now() / 1000),
+            },
+          ],
+          threads: {
+            active: [
+              {
+                id: "thread.周五还书",
+                title: "周五还书的约定",
+                cause: "玩家忘带借书卡，小雨破例让他先把书拿走。",
+                actors: ["小雨", "玩家"],
+                importance: 0.7,
+                state: "active",
+                progress: [{ turn: 2, note: "立约", memory: null }],
+                resurface: {
+                  grade: "natural",
+                  windows: [{ mention: ["还书", "借书卡"] }],
+                  deadline: { day: 5, escalate: "eager" },
+                  cooldown: 5,
+                  framing: "她在意但不好意思催。",
+                  last_mentioned_turn: null,
+                },
+              },
+            ],
+            resolved: [],
+            abandoned: [],
+            pending: ["周五还书的约定（active）"],
+            inWindow: [
+              {
+                id: "thread.周五还书",
+                title: "周五还书的约定",
+                grade: "natural",
+                framing: "她在意但不好意思催。",
+                reason: "提及:还书",
+              },
+            ],
+            eventCount: 1,
+          },
+          psyche: {
+            summary: "【小雨·内心】喜悦0.6 ▸ 惦记着说再见(0.4)",
+            affects: [
+              {
+                name: "喜悦",
+                intensity: 0.6,
+                source: "被道谢",
+                since_turn: 2,
+                history: [
+                  { turn: 2, intensity: 0.8 },
+                  { turn: 3, intensity: 0.68 },
+                  { turn: 4, intensity: 0.6 },
+                ],
+              },
+            ],
+            intents: [{ name: "惦记着说再见", strength: 0.4, linked_thread: null, since_turn: 2 }],
+            trail: [
+              [
+                "喜悦",
+                [
+                  { turn: 2, intensity: 0.8 },
+                  { turn: 3, intensity: 0.68 },
+                ],
+              ],
+            ],
+            auto_emotion: "喜悦",
+          },
+          palace: {
+            count: 1,
+            rooms: [{ place: "图书馆", count: 1, top: [] }],
+            timeline: [{ label: "第3天", count: 1, top: [] }],
+            graph: { nodes: ["topic:便签", "person:小雨"], edges: [["person:小雨", "topic:便签", 1]] },
+            recent: [
+              {
+                id: "mem_0001",
+                content: "深夜闭馆时她把画着猫的便签送给了玩家",
+                turn: 2,
+                story_day: 3,
+                story_clock: "第3天 23:40",
+                salience: 0.82,
+                emotion: "温暖",
+                place: "图书馆",
+                source: "hook.on_message",
+              },
+            ],
+          },
+          codex: {
+            world: "default",
+            count: 1,
+            entities: [
+              {
+                id: "char.小雨",
+                name: "小雨",
+                type: "char",
+                status: "canon",
+                oneLiner: "大学图书馆夜班管理员。",
+                anchors: ["左眼角一颗泪痣", "母亲留下的旧胸牌"],
+              },
+            ],
+          },
+          summary: "第一段：她记住了那个约定。",
+          proposals: [
+            {
+              id: "codex.char.小雨.2",
+              status: "propose",
+              kind: "new_fact",
+              turn: 2,
+              payload: { target: "char.小雨", value: { facts: { schedule: "周三休息" } }, reason: "剧情里提到" },
+            },
+          ],
+          known: ["char.小雨.secrets.工作牌"],
+          blackboard: { day: 3, clock: "23:40", place: "图书馆", actors: ["小雨"] },
+          activeEntities: ["char.小雨", "place.图书馆"],
+        };
+      case "decide_proposal":
+        return { id: (args as { id?: string }).id ?? "mock", status: (args as { accept?: boolean }).accept ? "accept" : "reject" };
+      case "summarize_now":
+        return "（mock）已总结第 1–2 轮，落 3 条事件";
       default:
         throw new Error(`mock 未覆盖命令：${cmd}`);
     }

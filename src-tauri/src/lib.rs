@@ -58,6 +58,8 @@ pub fn run() {
             commands::inspector_data,
             commands::decide_proposal,
             commands::summarize_now,
+            commands::open_thread,
+            commands::resolve_thread,
             commands::get_card_state,
             commands::list_card_memory,
             watch::watch_cards,

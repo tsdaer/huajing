@@ -262,3 +262,207 @@ export interface PromptAssembly {
   /** 预算总账（M2.7；老后端不带这个字段） */
   budget?: BudgetReport;
 }
+
+// ---------- 记忆检查器（M2.8 · commands.rs · inspector_data）----------
+
+/** 状态树视图：活跃路径 + 当前 directive + recall/reveal + 校验告警 */
+export interface InspectorStateTree {
+  root: string;
+  /** 活跃路径（根→叶） */
+  path: string[];
+  /** 根→叶拼接后的导演指令（没写 directive 的状态跳过） */
+  directive: string;
+  /** 当前状态声明的召回提示（“回到事发地点才想起那件事”） */
+  recall: string[];
+  /** 当前状态声明的揭示集 */
+  reveal: string[];
+  /** 树上声明过的全部状态 id */
+  states: string[];
+  /** 树的校验告警（坏父链 / 环 / 重复 id 等） */
+  warnings: string[];
+}
+
+/** 一次状态转移（event.rs · TransitionEvent） */
+export interface InspectorTransition {
+  turn: number;
+  from: string[];
+  to: string[];
+  reason: string;
+  ts: number;
+}
+
+/** 剧情线的一个经过节点 */
+export interface ThreadProgressNode {
+  turn: number;
+  note: string;
+  memory?: string | null;
+}
+
+/** 提及时机（设计 §8.4：克制梯度 × 可提及窗口 × 冷却 × framing） */
+export interface ThreadResurface {
+  /** dormant | natural | eager */
+  grade: string;
+  /** 窗口条件（宿主确定性求值，界面只做只读展示） */
+  windows: unknown[];
+  deadline?: { day: number; escalate: string } | null;
+  cooldown: number;
+  framing: string;
+  last_mentioned_turn?: number | null;
+}
+
+/** 一条剧情线（threads.rs · Thread::to_value） */
+export interface InspectorThread {
+  id: string;
+  title: string;
+  /** 起因 */
+  cause: string;
+  actors: string[];
+  /** 重要度 0–1 */
+  importance: number;
+  opened: { turn: number; story_day: number; story_clock: string };
+  /** active | resolved | abandoned */
+  state: string;
+  progress: ThreadProgressNode[];
+  resurface: ThreadResurface;
+  resolution?: {
+    turn: number;
+    story_day: number;
+    story_clock: string;
+    outcome: string;
+    memory?: string | null;
+  } | null;
+  scope: string;
+  linked_intent?: string | null;
+}
+
+/** 此刻落在可提及窗口内的一条线（B1「心里有事」的候选，带激活原因） */
+export interface InspectorResurfacePick {
+  id: string;
+  title: string;
+  grade: string;
+  framing: string;
+  /** 激活原因（如「黑板:day≥5+在场:小雨」） */
+  reason: string;
+}
+
+/** 剧情线视图（M2.4 · 设计 §8） */
+export interface InspectorThreads {
+  active: InspectorThread[];
+  resolved: InspectorThread[];
+  abandoned: InspectorThread[];
+  /** C1 未决事项：全部活跃线的只读投影（仅标题与状态） */
+  pending: string[];
+  inWindow: InspectorResurfacePick[];
+  eventCount: number;
+}
+
+/** 情绪槽的一条历史采样（psyche.rs · AffectTick） */
+export interface AffectTick {
+  turn: number;
+  intensity: number;
+}
+
+/** 一个情绪槽（强度 + 来源 + 起始轮 + 历史采样） */
+export interface PsycheAffect {
+  name: string;
+  intensity: number;
+  source: string;
+  since_turn: number;
+  history: AffectTick[];
+}
+
+/** 一条意图（意志的内隐形态；说出口后外化为剧情线） */
+export interface PsycheIntent {
+  name: string;
+  strength: number;
+  linked_thread?: string | null;
+  since_turn: number;
+}
+
+/** 心理运行时视图（M2.5 · 设计 §9） */
+export interface InspectorPsyche {
+  /** B5 注入用的「内心」一行摘要 */
+  summary: string;
+  affects: PsycheAffect[];
+  intents: PsycheIntent[];
+  /** 衰减轨迹：[情绪名, 采样…]（界面只画小条，不引图表库） */
+  trail: [string, AffectTick[]][];
+  /** 自动表情（情绪 → 差分表命中） */
+  auto_emotion?: string | null;
+}
+
+/** 记忆对象摘要（palace.rs · MemBrief；每条都能溯源到轮次） */
+export interface InspectorMemory {
+  id: string;
+  content: string;
+  turn: number;
+  story_day: number;
+  story_clock: string;
+  /** 显著度 0–1 */
+  salience: number;
+  emotion?: string | null;
+  place?: string | null;
+  source: string;
+}
+
+/** 记忆宫殿三视图 + 最近记忆（设计 §5.5） */
+export interface InspectorPalace {
+  count: number;
+  rooms: { place: string; count: number; top: InspectorMemory[] }[];
+  timeline: { label: string; count: number; top: InspectorMemory[] }[];
+  /** 节点是 link 标签，边是共现 [a, b, 次数] */
+  graph: { nodes: string[]; edges: [string, string, number][] };
+  recent: InspectorMemory[];
+}
+
+/** 设定集实体清单条目（codex.rs · 设计 §6） */
+export interface InspectorEntity {
+  id: string;
+  name: string;
+  /** char | place | item | event | org | rule | concept | note */
+  type: string;
+  /** draft | canon | retired */
+  status: string;
+  oneLiner: string;
+  /** 恒注入的辨识锚点（跨 200 轮不漂移） */
+  anchors: string[];
+}
+
+/** 设定集视图 */
+export interface InspectorCodex {
+  world: string;
+  count: number;
+  entities: InspectorEntity[];
+}
+
+/** 设定收件箱的一条提案（propose 落条目，accept/reject 改状态） */
+export interface InspectorProposal {
+  id: string;
+  /** propose | accept | reject */
+  status: string;
+  /** new_entity | new_fact | fact_change | relation | episode | thread | psyche */
+  kind: string;
+  turn: number;
+  payload?: unknown;
+  note?: string | null;
+}
+
+/** 记忆检查器的全量投影（M2.8 面板一次拉全） */
+export interface InspectorData {
+  session: string;
+  character: string;
+  stateTree: InspectorStateTree | null;
+  transitions: InspectorTransition[];
+  threads: InspectorThreads;
+  psyche: InspectorPsyche;
+  palace: InspectorPalace;
+  codex: InspectorCodex;
+  summary: string;
+  proposals: InspectorProposal[];
+  /** 秘密揭示集（“实体.秘密” 路径） */
+  known: string[];
+  blackboard: Blackboard;
+  /** 上一轮在场 / 激活的实体 id */
+  activeEntities: string[];
+}
+
