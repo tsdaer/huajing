@@ -53,6 +53,7 @@ pub fn run() {
             commands::update_blackboard,
             commands::preview_prompt,
             commands::last_prompt,
+            commands::inspector_data,
             commands::get_card_state,
             commands::list_card_memory,
             watch::watch_cards,

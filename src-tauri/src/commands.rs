@@ -2212,6 +2212,171 @@ pub fn preview_prompt(
     Ok(run.assembly)
 }
 
+// ---------- 记忆检查器数据（M2.8 面板的数据源）----------
+
+/// 组装检查器面板需要的全部投影数据（与 Tauri 无关的内核，便于单测）。
+///
+/// 一次给全：状态树路径与转移历史、剧情线、心理、宫殿三视图、设定集清单与揭示集。
+/// 设计 §14：这些面板合称「记忆检查器」——看「我们处于哪个阶段、欠着什么线、
+/// 她心里在想什么、她记得什么、这次注入了什么」。
+fn inspector_payload(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    loaded: &card::LoadedCard,
+    proj: &event::Projection,
+    codex_cache: Option<&CodexCache>,
+    tree_cache: Option<&TreeCache>,
+    runtime: Option<&SessionRuntime>,
+) -> Result<serde_json::Value, String> {
+    let character = first_character(meta)?;
+    let board = blackboard_of(proj);
+    let bb_map = blackboard_env(&board);
+
+    // 状态树：活跃路径 + 最近转移历史（新的在前）
+    let tree = load_tree(loaded, tree_cache);
+    let path = tree
+        .as_ref()
+        .map(|t| active_path_of(proj, t))
+        .unwrap_or_default();
+    let state_tree = tree.as_ref().map(|t| {
+        serde_json::json!({
+            "root": t.root,
+            "path": path,
+            "directive": t.directive_of(&path),
+            "recall": t.recall_of(&path),
+            "reveal": t.reveal_of(&path),
+            "states": t.states.keys().cloned().collect::<Vec<_>>(),
+            "warnings": t.validate(),
+        })
+    });
+    let transitions: Vec<&event::TransitionEvent> =
+        proj.transitions.iter().rev().take(20).collect();
+
+    // 剧情线：活跃/已了结/已放弃 + C1 的只读投影
+    let thread_list: Vec<threads::Thread> = proj
+        .threads
+        .values()
+        .filter_map(|v| threads::Thread::from_value(v).ok())
+        .collect();
+    let pick = |state: &str| -> Vec<serde_json::Value> {
+        thread_list
+            .iter()
+            .filter(|t| t.state == state)
+            .map(|t| t.to_value())
+            .collect()
+    };
+    let window_text = scan_window_text(&proj.messages, &loaded.card.name);
+    let mut mentions: Vec<String> = Vec::new();
+    if let Some(cx) = codex_cache.map(|c| load_codex(root, Some(c), &session_world(meta))) {
+        mentions.extend(cx.scan_mentions(&window_text).into_iter().map(|m| m.id));
+    }
+    mentions.extend(
+        proj.messages
+            .iter()
+            .rev()
+            .take(SCAN_WINDOW_MESSAGES)
+            .map(|m| m.content.clone()),
+    );
+    let query = threads::ThreadQuery {
+        turn: proj.last_message().map(|m| m.turn).unwrap_or(0),
+        story_day: board.day,
+        story_clock: &board.clock,
+        blackboard: &bb_map,
+        mentions: &mentions,
+        present: &board.actors,
+        state_path: &path,
+    };
+    let in_window: Vec<serde_json::Value> = threads::select_resurface(&thread_list, &query, 5)
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id, "title": p.title, "grade": p.grade,
+                "framing": p.framing, "reason": p.reason,
+            })
+        })
+        .collect();
+
+    // 心理：内心摘要 + 情绪槽 + 意图 + 衰减轨迹
+    let state = current_state(proj, &character, loaded);
+    let p = psyche::Psyche::from_state(&state);
+    let psyche_view = serde_json::json!({
+        "summary": p.summary_line_for(&loaded.card.name),
+        "affects": p.affects,
+        "intents": p.intents,
+        "trail": p.decay_trail(),
+        "auto_emotion": p.auto_emotion(),
+    });
+
+    // 宫殿：三视图 + 最近记忆（每条都能溯源到轮次）
+    let memories = memory_objects(proj, &character, board.day);
+    let palace_view = serde_json::json!({
+        "count": memories.len(),
+        "rooms": palace::rooms(&memories),
+        "timeline": palace::timeline(&memories),
+        "graph": palace::link_graph(&memories),
+        "recent": memories.iter().rev().take(20).map(palace::brief).collect::<Vec<_>>(),
+    });
+
+    // 设定集：世界清单（草稿与正史都列，注入只认 canon）
+    let world = session_world(meta);
+    let cx = load_codex(root, codex_cache, &world);
+    let entities: Vec<serde_json::Value> = cx
+        .entities()
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id, "name": e.name, "type": e.ty, "status": e.status,
+                "oneLiner": e.one_liner, "anchors": e.anchors(),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "session": meta.id,
+        "character": loaded.card.name,
+        "stateTree": state_tree,
+        "transitions": transitions,
+        "threads": {
+            "active": pick("active"),
+            "resolved": pick("resolved"),
+            "abandoned": pick("abandoned"),
+            "pending": threads::pending_lines(&thread_list),
+            "inWindow": in_window,
+            "eventCount": proj.thread_log.len(),
+        },
+        "psyche": psyche_view,
+        "palace": palace_view,
+        "codex": { "world": world, "count": entities.len(), "entities": entities },
+        "known": proj.known.iter().cloned().collect::<Vec<_>>(),
+        "blackboard": board,
+        "activeEntities": runtime.map(|r| r.previously_active(&meta.id)).unwrap_or_default(),
+    }))
+}
+
+/// 记忆检查器数据（M2.8 面板）：一次性给前端全部投影视图
+#[tauri::command]
+pub fn inspector_data(
+    session_id: String,
+    log: State<'_, store::EventLog>,
+    codex_cache: State<'_, CodexCache>,
+    tree_cache: State<'_, TreeCache>,
+    runtime: State<'_, SessionRuntime>,
+) -> Result<serde_json::Value, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    inspector_payload(
+        &root,
+        &meta,
+        &loaded,
+        &proj,
+        Some(&codex_cache),
+        Some(&tree_cache),
+        Some(&runtime),
+    )
+}
+
 // ---------- 卡内状态与长期记忆（M1.6：hooks 的可观测面）----------
 
 /// 角色私有 state 现状（会话快照为空时回退卡上 `state` 初始值）
@@ -3197,5 +3362,60 @@ return {
         let c = event::project_over(&rebuilt, &event::Base::default());
         assert_eq!(c.transitions, proj.transitions, "重放得到同一批转移");
         assert_eq!(c.known, proj.known, "重放得到同一份揭示集");
+    }
+
+    /// M2.8 面板数据源：一次给全状态树/线/心理/宫殿/设定集的投影视图
+    #[test]
+    fn inspector_payload_reports_every_panel() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50, psyche = { affects = {}, intents = {} } },
+  hooks = {
+    on_message = function(msg, state, api)
+      if msg.role == 'user' and msg.content:find('谢谢') then
+        state.favorability = state.favorability + 1
+        api.memory.set('last_thanked', msg.turn)
+        state.psyche.affects = { { name = '喜悦', intensity = 0.8, source = '被道谢' } }
+      end
+    end,
+  },
+  state_tree = {
+    root = '日常',
+    states = { ['日常'] = { directive = '轻松日常。' } },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let payload = inspector_payload(&root, &meta, &loaded, &proj, None, None, None).unwrap();
+
+        assert_eq!(payload["character"], "小雨");
+        let tree = &payload["stateTree"];
+        assert_eq!(tree["root"], "日常");
+        assert_eq!(tree["path"][0], "日常", "无转移时用树根播种");
+        assert!(tree["directive"].as_str().unwrap().contains("轻松日常"));
+        assert_eq!(payload["transitions"].as_array().unwrap().len(), 0);
+        assert!(payload["blackboard"]["day"].as_i64().unwrap() >= 1);
+        assert_eq!(payload["palace"]["count"], 1, "卡写的记忆应进宫殿视图");
+        assert_eq!(payload["palace"]["recent"][0]["content"], "last_thanked：1");
+        // 卡内键值记忆没有地点（设计 §5.2 的房间 = 故事地点），故不进房间图；时间线必须有桶
+        assert!(
+            !payload["palace"]["timeline"].as_array().unwrap().is_empty(),
+            "时间线走廊应能列出这条记忆"
+        );
+        assert!(
+            payload["psyche"]["summary"].as_str().unwrap().contains("喜悦"),
+            "心理面板应给内心摘要：{}",
+            payload["psyche"]["summary"]
+        );
+        assert!(payload["psyche"]["trail"].as_array().unwrap().len() >= 1, "衰减轨迹可查");
+        assert_eq!(payload["threads"]["active"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["codex"]["world"], "default");
+        assert!(payload["known"].as_array().unwrap().is_empty());
     }
 }
