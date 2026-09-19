@@ -159,6 +159,8 @@ pub struct BuildInputs<'a> {
     pub psyche_line: Option<&'a str>,
     /// B2 指令层：状态树活跃路径的 directive（根→叶拼接，子覆盖父）（M2.3 · 设计 §4.1/§7.4）
     pub directive: Option<&'a str>,
+    /// C1 滚动摘要（M2.6 · 设计 §5.3：总结管线产出的编年史体梗概，空则省略）
+    pub summary: Option<&'a str>,
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
@@ -201,16 +203,26 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
 
     // ---- 槽位 C1：未决事项清单（历史区的低注意力位：全量欠账随时查得到，
     //      但每轮只在 B1 的注意力位看到「此刻该提的」——设计 §8.4 的完备性不牺牲）----
-    let c1 = if inputs.pending_threads.is_empty() {
+    // C1 = 滚动摘要正文 + 未决事项清单（设计 §4.1）。未决事项优先于摘要正文：
+    // 预算不够时先裁摘要、再裁清单（§4.2 的硬性规则）。
+    let summary_text = inputs.summary.map(str::trim).filter(|s| !s.is_empty());
+    let c1 = if summary_text.is_none() && inputs.pending_threads.is_empty() {
         None
     } else {
-        Some(format!(
-            "<pending>\n{}\n</pending>",
-            inputs.pending_threads.join("\n")
-        ))
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(s) = summary_text {
+            parts.push(format!("<summary>\n{s}\n</summary>"));
+        }
+        if !inputs.pending_threads.is_empty() {
+            parts.push(format!(
+                "<pending>\n{}\n</pending>",
+                inputs.pending_threads.join("\n")
+            ));
+        }
+        Some(parts.join("\n"))
     };
     if let Some(c1) = &c1 {
-        layers.push(layer("C1", "未决事项", c1));
+        layers.push(layer("C1", "摘要与未决事项", c1));
     }
 
     // ---- 槽位 B：动态锚（紧邻最新用户消息之前）----
@@ -550,6 +562,7 @@ mod tests {
             pending_threads: &[],
             psyche_line: None,
             directive: None,
+            summary: None,
             history,
             user_content,
         }

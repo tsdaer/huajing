@@ -1454,6 +1454,7 @@ fn assemble_prompt_core(
         pending_threads: &pending,
         psyche_line: psyche_line.as_deref(),
         directive: directive.as_deref(),
+        summary: Some(proj.summary.as_str()),
         history,
         user_content,
     };
@@ -2350,10 +2351,49 @@ fn inspector_payload(
         "psyche": psyche_view,
         "palace": palace_view,
         "codex": { "world": world, "count": entities.len(), "entities": entities },
+        "summary": proj.summary,
+        "proposals": proj.proposals.values().cloned().collect::<Vec<_>>(),
         "known": proj.known.iter().cloned().collect::<Vec<_>>(),
         "blackboard": board,
         "activeEntities": runtime.map(|r| r.previously_active(&meta.id)).unwrap_or_default(),
     }))
+}
+
+/// 设定收件箱：确认或否决一条提案（设计 §6.9：确认/否决动作进事件流，回放不受影响）
+#[tauri::command]
+pub fn decide_proposal(
+    session_id: String,
+    id: String,
+    accept: bool,
+    note: Option<String>,
+    log: State<'_, store::EventLog>,
+) -> Result<serde_json::Value, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let turn = project_session(&log, &root, &meta)?
+        .last_message()
+        .map(|m| m.turn)
+        .unwrap_or(0);
+    let proj = commit(
+        &log,
+        &root,
+        &meta,
+        LogBody::Proposal(event::ProposalEvent {
+            turn,
+            id: id.clone(),
+            op: if accept { "accept" } else { "reject" }.into(),
+            kind: String::new(),
+            origin: "manual".into(),
+            payload: None,
+            note,
+            ts: store::unix_now(),
+        }),
+    )?;
+    Ok(proj
+        .proposals
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({ "id": id })))
 }
 
 /// 记忆检查器数据（M2.8 面板）：一次性给前端全部投影视图
@@ -3493,9 +3533,25 @@ return {
             proposals[0]
         );
 
+        // 摘要进 C1（设计 §4.1：C1 = 滚动摘要 + 未决事项清单）
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let (assembly, _) = simulate_turn(&root, &meta, &loaded, &log, 1, "你好。");
+        let c1 = assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "C1")
+            .expect("C1 摘要层");
+        assert!(c1.content.contains("<summary>"), "{}", c1.content);
+        assert!(c1.content.contains("第一段"), "摘要正文应进 C1：{}", c1.content);
+
+        // 检查器面板能看到摘要与提案
+        let proj_view = project_session(&log, &root, &meta).unwrap();
+        let payload = inspector_payload(&root, &meta, &loaded, &proj_view, None, None, None).unwrap();
+        assert!(payload["summary"].as_str().unwrap().contains("第二段"));
+        assert_eq!(payload["proposals"][0]["status"], "accept");
+
         // 模型产物保留：编辑历史的重建不丢弃摘要与提案
         let records = log.read(&root, &meta.id).unwrap();
-        let loaded = card::load_card(&root, "小雨").unwrap();
         let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
         assert!(
             rebuilt

@@ -54,6 +54,7 @@ pub fn run() {
             commands::preview_prompt,
             commands::last_prompt,
             commands::inspector_data,
+            commands::decide_proposal,
             commands::get_card_state,
             commands::list_card_memory,
             watch::watch_cards,
