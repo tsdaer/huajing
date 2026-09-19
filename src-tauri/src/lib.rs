@@ -12,6 +12,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(commands::CancelFlags::default())
+        .manage(commands::LastAssemblies::default())
         .manage(store::MessageLog::new())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
@@ -28,6 +29,10 @@ pub fn run() {
             commands::read_messages,
             commands::send_message,
             commands::stop_generation,
+            commands::get_blackboard,
+            commands::update_blackboard,
+            commands::preview_prompt,
+            commands::last_prompt,
         ])
         .run(tauri::generate_context!())
         .expect("error while running huajing");

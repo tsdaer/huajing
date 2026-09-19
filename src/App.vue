@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import HomeView from "./views/HomeView.vue";
+import SessionsView from "./views/SessionsView.vue";
 import SettingsView from "./views/SettingsView.vue";
 
-// 壳 + 顶层导航。路由（会话列表/聊天等）随 M1.5 引入，此处先两页切换。
-const view = ref<"home" | "settings">("home");
+// 壳 + 顶层导航。路由细化（单会话地址等）随 M1.5 评估，此处先三页切换。
+const view = ref<"home" | "sessions" | "settings">("home");
 </script>
 
 <template>
@@ -13,11 +14,13 @@ const view = ref<"home" | "settings">("home");
       <span class="brand">化境</span>
       <nav class="nav">
         <button :class="{ active: view === 'home' }" @click="view = 'home'">首页</button>
+        <button :class="{ active: view === 'sessions' }" @click="view = 'sessions'">会话</button>
         <button :class="{ active: view === 'settings' }" @click="view = 'settings'">设置</button>
       </nav>
     </header>
 
     <HomeView v-if="view === 'home'" />
+    <SessionsView v-else-if="view === 'sessions'" />
     <SettingsView v-else />
   </div>
 </template>

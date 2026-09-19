@@ -255,13 +255,55 @@ pub struct Message {
     pub scene_id: Option<String>,
 }
 
-/// 黑板 v0（M1.4 补 UI 编辑与时钟步进；M1.1 仅初始落盘）
+/// 黑板 v0（设计 §4.1 B1 的数据源；UI 可手动编辑，每轮时钟步进）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Blackboard {
     pub day: i64,
     pub clock: String,
     pub place: String,
     pub actors: Vec<String>,
+}
+
+pub fn load_blackboard(root: &Path, session_id: &str) -> StoreResult<Blackboard> {
+    let path = session_dir(root, session_id).join("blackboard.json");
+    if !path.exists() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
+}
+
+pub fn save_blackboard(root: &Path, session_id: &str, bb: &Blackboard) -> StoreResult<()> {
+    let dir = session_dir(root, session_id);
+    if !dir.is_dir() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    std::fs::write(
+        dir.join("blackboard.json"),
+        serde_json::to_string_pretty(bb)? + "\n",
+    )?;
+    Ok(())
+}
+
+/// 各角色 Lua state 快照（缺文件/坏文件回退空对象；空对象由调用方
+/// 降级为卡上 default_state）
+pub fn load_state(root: &Path, session_id: &str) -> StoreResult<serde_json::Value> {
+    let path = session_dir(root, session_id).join("state.json");
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    Ok(serde_json::from_str(&std::fs::read_to_string(&path)?).unwrap_or(serde_json::json!({})))
+}
+
+pub fn save_state(root: &Path, session_id: &str, state: &serde_json::Value) -> StoreResult<()> {
+    let dir = session_dir(root, session_id);
+    if !dir.is_dir() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_string_pretty(state)? + "\n",
+    )?;
+    Ok(())
 }
 
 pub struct NewSessionRequest {
@@ -707,6 +749,44 @@ mod tests {
 
         // 不存在的会话追加报错而非 panic
         assert!(log.append(root.path(), "no-such", &msgs[0]).is_err());
+    }
+
+    #[test]
+    fn blackboard_and_state_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                character: "小雨".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        // 初始：默认黑板 + 空 state
+        let bb = load_blackboard(root.path(), &meta.id).unwrap();
+        assert_eq!((bb.day, bb.clock.as_str()), (1, ""));
+        assert_eq!(load_state(root.path(), &meta.id).unwrap(), serde_json::json!({}));
+
+        let bb = Blackboard {
+            day: 7,
+            clock: "23:05".into(),
+            place: "天台".into(),
+            actors: vec!["小雨".into(), "玩家".into()],
+        };
+        save_blackboard(root.path(), &meta.id, &bb).unwrap();
+        assert_eq!(load_blackboard(root.path(), &meta.id).unwrap().place, "天台");
+
+        let st = serde_json::json!({ "favorability": 61 });
+        save_state(root.path(), &meta.id, &st).unwrap();
+        assert_eq!(load_state(root.path(), &meta.id).unwrap()["favorability"], 61);
+
+        // 不存在的会话报错
+        assert!(load_blackboard(root.path(), "no-such").is_err());
+        assert!(save_state(root.path(), "no-such", &st).is_err());
     }
 
     #[test]

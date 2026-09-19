@@ -105,3 +105,28 @@ export type StreamEvent =
   | { event: "delta"; text: string }
   | { event: "done"; full: string; cancelled: boolean }
   | { event: "error"; message: string };
+
+// ---------- 黑板与 Prompt 组装（store.rs / prompt.rs · 设计 §4）----------
+
+/** 黑板 v0：时间/地点/人物 */
+export interface Blackboard {
+  day: number;
+  clock: string;
+  place: string;
+  actors: string[];
+}
+
+/** 记忆检查器中的一个注入层 */
+export interface PromptLayer {
+  id: string;
+  name: string;
+  content: string;
+  tokens: number;
+}
+
+/** 一轮组装的完整结果 */
+export interface PromptAssembly {
+  layers: PromptLayer[];
+  messages: ChatMessage[];
+  total_tokens: number;
+}

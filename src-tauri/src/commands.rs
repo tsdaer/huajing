@@ -8,7 +8,8 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::card;
-use crate::llm::{self, ChatMessage, Provider, StreamEvent};
+use crate::llm::{self, Provider, StreamEvent};
+use crate::prompt;
 use crate::store::{self, Message, NewSessionRequest, Settings};
 
 #[tauri::command]
@@ -120,21 +121,59 @@ pub fn read_messages(
 #[derive(Default)]
 pub struct CancelFlags(Mutex<HashMap<String, Arc<AtomicBool>>>);
 
-/// 发给 LLM 的最近消息窗口（高轮次下请求不随历史无限膨胀；
-/// M1.4 正式预算分配 + 场景边界裁剪替换此占位）
-const HISTORY_WINDOW: usize = 40;
+/// 每会话最近一次实际发送的组装结果（记忆检查器"本次注入"数据源）
+#[derive(Default)]
+pub struct LastAssemblies(Mutex<HashMap<String, prompt::PromptAssembly>>);
 
-/// 本地消息角色 → OpenAI 角色（char → assistant）
-fn to_openai(m: &Message) -> ChatMessage {
-    ChatMessage {
-        role: match m.role.as_str() {
-            "user" => "user",
-            "system" => "system",
-            _ => "assistant",
-        }
-        .into(),
-        content: m.content.clone(),
+/// 组装一轮上下文（send_message 与 preview_prompt 共用）。
+/// `user_content` = Some 时为本轮真实发送（末尾带用户消息）；None 为检查器预览。
+fn assemble_prompt(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    loaded: &card::LoadedCard,
+    history: &[Message],
+    user_content: Option<&str>,
+) -> Result<prompt::PromptAssembly, String> {
+    let settings = store::load_settings(root).map_err(|e| e.to_string())?;
+    let persona = match &meta.persona {
+        Some(name) => store::list_personas(root)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|p| &p.name == name),
+        None => None,
+    };
+    // state.json 为空时降级用卡上 default_state（M1.6 接入持久化回写）
+    let mut card_state = store::load_state(root, &meta.id).map_err(|e| e.to_string())?;
+    if card_state.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        card_state = loaded.default_state.clone();
     }
+    let blackboard = store::load_blackboard(root, &meta.id).map_err(|e| e.to_string())?;
+
+    // B5：on_context hook 注入（降级卡不执行；窗口给最近消息）
+    let start = history.len().saturating_sub(prompt::WINDOW_MESSAGES);
+    let hook_injections = if loaded.degraded {
+        Vec::new()
+    } else {
+        card::run_hook(
+            &loaded.source,
+            card::HookCall::OnContext { window: &history[start..] },
+            card_state.clone(),
+            meta.seed,
+        )
+        .injections
+    };
+
+    let inputs = prompt::BuildInputs {
+        settings: &settings,
+        persona: persona.as_ref(),
+        card: &loaded.card,
+        card_state: &card_state,
+        blackboard: &blackboard,
+        hook_injections: &hook_injections,
+        history,
+        user_content,
+    };
+    Ok(prompt::build(&inputs))
 }
 
 /// 发送一条用户消息并流式生成回复。
@@ -147,6 +186,7 @@ pub async fn send_message(
     on_event: Channel<StreamEvent>,
     flags: State<'_, CancelFlags>,
     msg_log: State<'_, store::MessageLog>,
+    assemblies: State<'_, LastAssemblies>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -166,21 +206,12 @@ pub async fn send_message(
         .find(|p| p.role == "chat")
         .ok_or_else(|| "未配置 chat 档接入点，请先到设置页添加".to_string())?;
 
-    // 组装消息（M1.3 最小组装：卡静态字段做系统头 + 最近窗口；M1.4 换正式 Prompt Builder）
-    // 读取走增量缓存：高轮次下每轮只解析新增行
+    // 双槽位组装（设计 §4.1）：历史读取走增量缓存，高轮次只解析新增行
     let history = msg_log
         .read(&root, &session_id)
         .map_err(|e| e.to_string())?;
     let turn = history.last().map(|m| m.turn).unwrap_or(0) + 1;
-    let window_start = history.len().saturating_sub(HISTORY_WINDOW);
-    let mut chat: Vec<ChatMessage> = Vec::new();
-    if !loaded.card.scenario.is_empty() || !loaded.card.personality.is_empty() {
-        chat.push(ChatMessage {
-            role: "system".into(),
-            content: format!("{}\n{}", loaded.card.scenario, loaded.card.personality),
-        });
-    }
-    chat.extend(history[window_start..].iter().map(to_openai));
+    let assembly = assemble_prompt(&root, &meta, &loaded, &history, Some(&content))?;
 
     // 用户消息落盘后进入流式请求
     let user_msg = Message {
@@ -193,10 +224,6 @@ pub async fn send_message(
     msg_log
         .append(&root, &session_id, &user_msg)
         .map_err(|e| e.to_string())?;
-    chat.push(ChatMessage {
-        role: "user".into(),
-        content,
-    });
 
     // 中断标记：同会话并发防重
     let flag = {
@@ -218,6 +245,7 @@ pub async fn send_message(
     };
 
     // 流式补全（取消检查在每个响应块之间）
+    let chat = assembly.messages.clone();
     let stream = llm::chat_stream(&provider, &chat, |delta| {
         let _ = on_event.send(StreamEvent::Delta {
             text: delta.to_string(),
@@ -225,9 +253,12 @@ pub async fn send_message(
     }, &flag)
     .await;
 
-    // 清标记
+    // 清标记；记录本次组装（记忆检查器）
     if let Ok(mut map) = flags.0.lock() {
         map.remove(&session_id);
+    }
+    if let Ok(mut map) = assemblies.0.lock() {
+        map.insert(session_id.clone(), assembly);
     }
 
     match stream {
@@ -244,6 +275,13 @@ pub async fn send_message(
                     return Ok(StreamEvent::Error {
                         message: format!("回复落盘失败：{e}"),
                     });
+                }
+                // 一轮完成：黑板时钟步进（设计 M1：每轮 +10 分钟，跨日进位）
+                if let Ok(mut bb) = store::load_blackboard(&root, &session_id) {
+                    let (day, clock) = prompt::advance_clock(bb.day, &bb.clock);
+                    bb.day = day;
+                    bb.clock = clock;
+                    let _ = store::save_blackboard(&root, &session_id, &bb);
                 }
             }
             Ok(StreamEvent::Done {
@@ -269,4 +307,65 @@ pub fn stop_generation(session_id: String, flags: State<'_, CancelFlags>) -> Res
         }
         None => Ok(false),
     }
+}
+
+// ---------- 黑板 v0（设计 §4.1 B1 数据源）----------
+
+#[tauri::command]
+pub fn get_blackboard(session_id: String) -> Result<store::Blackboard, String> {
+    store::load_blackboard(&root(), &session_id).map_err(|e| e.to_string())
+}
+
+/// 手动编辑黑板（全量替换；保存后下一轮组装生效）
+#[tauri::command]
+pub fn update_blackboard(
+    session_id: String,
+    day: i64,
+    clock: String,
+    place: String,
+    actors: Vec<String>,
+) -> Result<store::Blackboard, String> {
+    let bb = store::Blackboard {
+        day,
+        clock: clock.trim().to_string(),
+        place: place.trim().to_string(),
+        actors: actors.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
+    };
+    store::save_blackboard(&root(), &session_id, &bb).map_err(|e| e.to_string())?;
+    Ok(bb)
+}
+
+// ---------- 记忆检查器 v0（设计 §4.2：组装结果逐层可见）----------
+
+/// 预览组装：按当前状态干跑一轮（不含用户消息），不发送
+#[tauri::command]
+pub fn preview_prompt(
+    session_id: String,
+    msg_log: State<'_, store::MessageLog>,
+) -> Result<prompt::PromptAssembly, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let character = meta
+        .characters
+        .first()
+        .cloned()
+        .ok_or_else(|| "会话未配置角色".to_string())?;
+    let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
+    let history = msg_log
+        .read(&root, &session_id)
+        .map_err(|e| e.to_string())?;
+    assemble_prompt(&root, &meta, &loaded, &history, None)
+}
+
+/// 最近一次实际发送的组装（无记录返回 None，前端可回退到预览）
+#[tauri::command]
+pub fn last_prompt(
+    session_id: String,
+    assemblies: State<'_, LastAssemblies>,
+) -> Result<Option<prompt::PromptAssembly>, String> {
+    let map = assemblies
+        .0
+        .lock()
+        .map_err(|_| "内部状态锁 poisoned".to_string())?;
+    Ok(map.get(&session_id).cloned())
 }
