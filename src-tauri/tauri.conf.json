@@ -12,11 +12,15 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "化境",
         "width": 1100,
         "height": 760,
         "minWidth": 480,
-        "minHeight": 600
+        "minHeight": 600,
+        "decorations": false,
+        "shadow": true,
+        "resizable": true
       }
     ],
     "security": {

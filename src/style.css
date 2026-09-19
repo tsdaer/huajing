@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+/* 使用 daisyUI 的默认主题配置：light（默认）+ dark（跟随系统深色）。
+   不做自定义主题；要换肤只改这一行 themes 列表即可。 */
+@plugin "daisyui" {
+  themes: light --default, dark --prefersdark;
+}
+
+/* 全局层：只保留 daisyUI 覆盖不到的三件必要事——铺满视口、中文栈、动效降级 */
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

@@ -1,15 +1,20 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { onMounted, reactive, ref } from "vue";
 import { api } from "../api";
 import type { Persona, Provider, Settings } from "../types";
+import ErrorToast from "../components/ErrorToast.vue";
+import Icon from "../components/Icon.vue";
 
-// ---------- 接入点（providers.json · 设计 §11）----------
+// ---------- 接入点（providers.toml · 设计 §11）----------
 
 const providers = ref<Provider[]>([]);
 const personas = ref<Persona[]>([]);
 const settings = ref<Settings | null>(null);
 const error = ref("");
 const editing = ref(false);
+
+const confirmEl = ref<HTMLDialogElement | null>(null);
+const pendingDelete = ref<Provider | null>(null);
 
 const blank = (): Provider => ({
   name: "",
@@ -21,10 +26,6 @@ const blank = (): Provider => ({
 });
 
 const draft = reactive<Provider>(blank());
-
-const roleBadge = computed(
-  () => (p: Provider) => (p.role === "util" ? "工具档" : "主对话"),
-);
 
 async function refresh() {
   error.value = "";
@@ -65,8 +66,16 @@ async function save() {
   }
 }
 
-async function remove(p: Provider) {
-  if (!window.confirm(`删除接入点「${p.name}」？`)) return;
+function remove(p: Provider) {
+  pendingDelete.value = p;
+  confirmEl.value?.showModal();
+}
+
+async function confirmRemove() {
+  const p = pendingDelete.value;
+  confirmEl.value?.close();
+  pendingDelete.value = null;
+  if (!p) return;
   try {
     providers.value = await api.deleteProvider(p.name);
     if (editing.value && draft.name === p.name) editing.value = false;
@@ -75,261 +84,214 @@ async function remove(p: Provider) {
     error.value = String(e);
   }
 }
+
+// 界面主题（基础主题 / 预设 / 自定义令牌）见「主题」页。
 </script>
 
 <template>
-  <main class="page">
-    <p v-if="error" class="error">{{ error }}</p>
+  <div class="h-full overflow-y-auto p-4 lg:p-6">
+    <ErrorToast :message="error" @dismiss="error = ''" />
 
-    <!-- 接入点 -->
-    <section class="block">
-      <header class="block-head">
-        <h2>接入点</h2>
-        <button class="btn accent" @click="startCreate" v-if="!editing">＋ 新增</button>
-      </header>
-
-      <p v-if="providers.length === 0 && !editing" class="empty">
-        还没有接入点。新增一个 OpenAI 兼容接入点（DeepSeek / GLM / Ollama 均可），
-        或参考 <code>DataHub/providers.example.toml</code>。
-      </p>
-
-      <ul class="plist">
-        <li v-for="p in providers" :key="p.name" class="prow">
-          <div class="pmain">
-            <span class="pname">{{ p.name }}</span>
-            <span class="badge" :class="{ util: p.role === 'util' }">{{ roleBadge(p) }}</span>
-            <span class="pmodel">{{ p.model }} @ {{ p.base_url }}</span>
+    <div class="mx-auto flex w-full max-w-[900px] flex-col gap-4">
+      <!-- 接入点 -->
+      <section class="card card-border bg-base-100">
+        <div class="card-body gap-4 p-5">
+          <div class="flex items-start justify-between gap-3">
+            <div>
+              <h2 class="card-title gap-2 text-sm font-medium">
+                <Icon name="bolt" :size="16" class="text-base-content/45" />
+                接入点
+              </h2>
+              <p class="mt-1 mb-0 text-xs text-base-content/50">
+                OpenAI 兼容协议（DeepSeek / GLM / Ollama 均可），明文存在
+                <code class="font-mono">DataHub/providers.toml</code>。
+              </p>
+            </div>
+            <button v-if="!editing" class="btn btn-primary btn-sm flex-none" @click="startCreate">
+              <Icon name="plus" :size="15" />新增
+            </button>
           </div>
-          <div class="pops">
-            <span class="temp">T={{ p.temperature }}</span>
-            <button class="btn" @click="startEdit(p)">编辑</button>
-            <button class="btn danger" @click="remove(p)">删除</button>
-          </div>
-        </li>
-      </ul>
 
-      <!-- 新增 / 编辑表单（本地明文存储，API key 直接可见编辑） -->
-      <form v-if="editing" class="pform" @submit.prevent="save">
-        <h3>{{ providers.some((p) => p.name === draft.name) ? "编辑接入点" : "新增接入点" }}</h3>
-        <label class="field">
-          <span>名称 *</span>
-          <input v-model="draft.name" placeholder="如 deepseek" :disabled="providers.some((p) => p.name === draft.name)" />
-        </label>
-        <label class="field">
-          <span>Base URL *</span>
-          <input v-model="draft.base_url" placeholder="https://api.deepseek.com/v1" />
-        </label>
-        <label class="field">
-          <span>API Key</span>
-          <input v-model="draft.api_key" placeholder="sk-…（本地明文保存，请自行保管）" />
-        </label>
-        <label class="field">
-          <span>模型 *</span>
-          <input v-model="draft.model" placeholder="deepseek-chat" />
-        </label>
-        <label class="field half">
-          <span>温度</span>
-          <input v-model.number="draft.temperature" type="number" min="0" max="2" step="0.1" />
-        </label>
-        <label class="field half">
-          <span>用途</span>
-          <select v-model="draft.role">
-            <option value="chat">chat · 主对话</option>
-            <option value="util">util · 总结/捕获（便宜档）</option>
-          </select>
-        </label>
-        <div class="form-ops">
-          <button class="btn accent" type="submit">保存</button>
-          <button class="btn" type="button" @click="editing = false">取消</button>
+          <ul v-if="providers.length > 0" class="list p-0">
+            <li
+              v-for="p in providers"
+              :key="p.name"
+              class="list-row items-center rounded-box bg-base-200 px-4 py-3"
+            >
+              <span class="flex size-9 items-center justify-center rounded-box bg-primary/15 text-primary">
+                <Icon name="bolt" :size="16" />
+              </span>
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-sm font-medium">{{ p.name }}</span>
+                  <span
+                    class="badge badge-sm badge-soft"
+                    :class="p.role === 'util' ? 'badge-info' : 'badge-primary'"
+                  >
+                    {{ p.role === "util" ? "工具档" : "主对话" }}
+                  </span>
+                  <span class="badge badge-sm badge-ghost font-mono">T={{ p.temperature }}</span>
+                </div>
+                <p class="mt-0.5 mb-0 truncate font-mono text-[11px] text-base-content/50">
+                  {{ p.model }} @ {{ p.base_url }}
+                </p>
+              </div>
+              <div class="flex items-center justify-end gap-1">
+                <button class="btn btn-ghost btn-xs" @click="startEdit(p)">
+                  <Icon name="edit" :size="13" />编辑
+                </button>
+                <button class="btn btn-ghost btn-xs text-error" @click="remove(p)">
+                  <Icon name="trash" :size="13" />删除
+                </button>
+              </div>
+            </li>
+          </ul>
+
+          <p v-else-if="!editing" class="m-0 text-sm text-base-content/50">
+            还没有接入点。新增一个，或用
+            <code class="font-mono text-primary">DataHub/providers.example.toml</code> 作模板。
+          </p>
+
+          <!-- 新增 / 编辑表单（API key 本地明文可见编辑） -->
+          <form v-if="editing" class="flex flex-col gap-3 rounded-box bg-base-200 p-4" @submit.prevent="save">
+            <h3 class="m-0 text-sm font-medium">
+              {{ providers.some((p) => p.name === draft.name) ? "编辑接入点" : "新增接入点" }}
+            </h3>
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div>
+                <label class="label" for="p-name">名称 *</label>
+                <input
+                  id="p-name"
+                  class="input input-sm w-full"
+                  v-model="draft.name"
+                  placeholder="如 deepseek"
+                  :disabled="providers.some((p) => p.name === draft.name)"
+                />
+              </div>
+              <div>
+                <label class="label" for="p-model">模型 *</label>
+                <input id="p-model" class="input input-sm w-full" v-model="draft.model" placeholder="deepseek-chat" />
+              </div>
+            </div>
+            <div>
+              <label class="label" for="p-base">Base URL *</label>
+              <input
+                id="p-base"
+                class="input input-sm w-full"
+                v-model="draft.base_url"
+                placeholder="https://api.deepseek.com/v1"
+              />
+            </div>
+            <div>
+              <label class="label" for="p-key">API Key</label>
+              <input
+                id="p-key"
+                class="input input-sm w-full"
+                v-model="draft.api_key"
+                placeholder="sk-…（本地明文保存，请自行保管）"
+              />
+            </div>
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div>
+                <label class="label" for="p-temp">温度</label>
+                <input
+                  id="p-temp"
+                  class="input input-sm w-full"
+                  v-model.number="draft.temperature"
+                  type="number"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                />
+              </div>
+              <div>
+                <label class="label" for="p-role">用途</label>
+                <select id="p-role" class="select select-sm w-full" v-model="draft.role">
+                  <option value="chat">chat · 主对话</option>
+                  <option value="util">util · 总结/捕获（便宜档）</option>
+                </select>
+              </div>
+            </div>
+            <div class="flex justify-end gap-2">
+              <button class="btn btn-primary btn-sm" type="submit">保存</button>
+              <button class="btn btn-ghost btn-sm" type="button" @click="editing = false">取消</button>
+            </div>
+          </form>
         </div>
-      </form>
-    </section>
+      </section>
 
-    <!-- 用户人格（只读；编辑入口后续里程碑补） -->
-    <section class="block">
-      <header class="block-head">
-        <h2>用户人格</h2>
-      </header>
-      <ul class="plist">
-        <li v-for="p in personas" :key="p.name" class="prow plain">
-          <div class="pmain">
-            <span class="pname">{{ p.name }}</span>
-            <span class="pmodel">{{ p.description }}</span>
+      <!-- 用户人格（只读；编辑入口后续里程碑补） -->
+      <section class="card card-border bg-base-100">
+        <div class="card-body gap-4 p-5">
+          <div>
+            <h2 class="card-title gap-2 text-sm font-medium">
+              <Icon name="users" :size="16" class="text-base-content/45" />
+              用户人格
+            </h2>
+            <p class="mt-1 mb-0 text-xs text-base-content/50">
+              位于 <code class="font-mono">DataHub/personas/</code>，开场后由角色卡按需读取。
+            </p>
           </div>
-        </li>
-      </ul>
-    </section>
+          <ul v-if="personas.length > 0" class="list p-0">
+            <li
+              v-for="p in personas"
+              :key="p.name"
+              class="list-row items-center rounded-box bg-base-200 px-4 py-3"
+            >
+              <span class="flex size-9 items-center justify-center rounded-box bg-base-content/10 text-base-content/70">
+                <Icon name="users" :size="16" />
+              </span>
+              <div class="min-w-0">
+                <p class="m-0 text-sm font-medium">{{ p.name }}</p>
+                <p class="mt-0.5 mb-0 text-xs text-base-content/50">{{ p.description }}</p>
+              </div>
+            </li>
+          </ul>
+          <p v-else class="m-0 text-sm text-base-content/50">还没有人格文件。</p>
+        </div>
+      </section>
 
-    <!-- 全局设置（只读展示；可编辑项随界面完善逐步开放） -->
-    <section class="block" v-if="settings">
-      <header class="block-head">
-        <h2>全局设置</h2>
-      </header>
-      <div class="kv">
-        <span class="k">语言</span><span>{{ settings.locale }}</span>
-        <span class="k">主题</span><span>{{ settings.theme }}</span>
-        <span class="k">叙事模式</span><span>{{ settings.narrative_mode }}</span>
+      <!-- 全局设置（只读展示；可编辑项随界面完善逐步开放） -->
+      <section v-if="settings" class="card card-border bg-base-100">
+        <div class="card-body gap-4 p-5">
+          <h2 class="card-title gap-2 text-sm font-medium">
+            <Icon name="database" :size="16" class="text-base-content/45" />
+            全局设置
+          </h2>
+          <ul class="list p-0">
+            <li class="list-row items-center rounded-box bg-base-200 px-4 py-3">
+              <span class="text-sm text-base-content/55">语言</span>
+              <span class="text-right text-sm font-medium">{{ settings.locale }}</span>
+            </li>
+            <li class="list-row items-center rounded-box bg-base-200 px-4 py-3">
+              <span class="text-sm text-base-content/55">叙事模式</span>
+              <span class="text-right text-sm font-medium">{{ settings.narrative_mode }}</span>
+            </li>
+            <li class="list-row items-center rounded-box bg-base-200 px-4 py-3">
+              <span class="text-sm text-base-content/55">会话风格</span>
+              <span class="text-right text-sm font-medium">{{ settings.theme }}</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+    </div>
+
+    <!-- 删除确认 -->
+    <dialog ref="confirmEl" class="modal">
+      <div class="modal-box">
+        <h3 class="text-base font-semibold">删除接入点</h3>
+        <p class="mt-2 text-sm text-base-content/70">
+          确认删除「{{ pendingDelete?.name ?? "" }}」？这会直接改写
+          <code class="font-mono">DataHub/providers.toml</code>，无法撤销。
+        </p>
+        <div class="modal-action">
+          <button class="btn btn-sm" @click="confirmEl?.close()">取消</button>
+          <button class="btn btn-error btn-sm" @click="confirmRemove">删除</button>
+        </div>
       </div>
-    </section>
-  </main>
+      <form method="dialog" class="modal-backdrop">
+        <button>关闭</button>
+      </form>
+    </dialog>
+  </div>
 </template>
-
-<style scoped>
-.page {
-  flex: 1;
-  width: min(720px, 100%);
-  margin: 0 auto;
-  padding: 20px 16px 40px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-.block {
-  background: var(--hj-panel);
-  border: 1px solid var(--hj-line);
-  border-radius: 12px;
-  padding: 16px 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.block-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.block-head h2 {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 600;
-}
-.empty {
-  color: var(--hj-dim);
-  font-size: 13px;
-  margin: 0;
-}
-code {
-  color: var(--hj-accent);
-  font-family: Consolas, monospace;
-}
-
-.plist {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.prow {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: var(--hj-bg);
-}
-.pmain {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-width: 0;
-}
-.pname {
-  font-weight: 600;
-}
-.badge {
-  flex: none;
-  font-size: 11px;
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: rgba(212, 161, 94, 0.18);
-  color: var(--hj-accent);
-}
-.badge.util {
-  background: rgba(120, 160, 200, 0.18);
-  color: #9ab8d8;
-}
-.pmodel {
-  color: var(--hj-dim);
-  font-size: 12px;
-  font-family: Consolas, monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.pops {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-}
-.temp {
-  color: var(--hj-dim);
-  font-size: 12px;
-  font-family: Consolas, monospace;
-}
-
-.pform {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  padding: 14px;
-  border-radius: 8px;
-  background: var(--hj-bg);
-}
-.pform h3 {
-  grid-column: 1 / -1;
-  margin: 0;
-  font-size: 14px;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--hj-dim);
-}
-.field.half {
-  grid-column: span 1;
-}
-.field input,
-.field select {
-  background: var(--hj-panel);
-  border: 1px solid var(--hj-line-strong);
-  border-radius: 6px;
-  color: var(--hj-fg);
-  padding: 7px 10px;
-  font-size: 13px;
-}
-.field input:disabled {
-  opacity: 0.55;
-}
-.form-ops {
-  grid-column: 1 / -1;
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-}
-
-.kv {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 8px 16px;
-  font-size: 13px;
-}
-.kv .k {
-  color: var(--hj-dim);
-}
-
-@media (max-width: 560px) {
-  .pform {
-    grid-template-columns: 1fr;
-  }
-  .prow {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-}
-</style>

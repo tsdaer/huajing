@@ -2,9 +2,11 @@
 import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
 import { api } from "../api";
 import type { Blackboard, Message, PromptAssembly, SessionMeta, StreamEvent } from "../types";
+import ErrorToast from "../components/ErrorToast.vue";
+import Icon from "../components/Icon.vue";
 
 // M1.5 聊天界面：气泡流 + 流式打字机 + 停止 + 消息编辑/重roll/删除。
-// 黑板与记忆检查器收进右侧抽屉，聊天流为主。
+// 黑板与记忆检查器收进右侧抽屉，聊天流为主。界面全部由 daisyUI 组件构成。
 
 const props = defineProps<{ meta: SessionMeta }>();
 
@@ -30,10 +32,65 @@ const composerEl = ref<HTMLTextAreaElement | null>(null);
 
 const lastIndex = computed(() => messages.value.length - 1);
 
+// ---------- 分页：多轮对话按页翻，每页 20 条消息 ----------
+const PAGE_SIZE = 20;
+const page = ref(1);
+
+const pageCount = computed(() => Math.max(1, Math.ceil(messages.value.length / PAGE_SIZE)));
+const isLastPage = computed(() => page.value >= pageCount.value);
+const pagedMessages = computed(() => {
+  const start = (page.value - 1) * PAGE_SIZE;
+  return messages.value
+    .slice(start, start + PAGE_SIZE)
+    .map((m, offset) => ({ m, index: start + offset }));
+});
+/** 页码窗口：最多 5 个 */
+const pageNumbers = computed(() => {
+  const total = pageCount.value;
+  const span = 5;
+  const start = Math.max(1, Math.min(page.value - 2, total - span + 1));
+  const end = Math.min(total, start + span - 1);
+  return Array.from({ length: Math.max(0, end - start + 1) }, (_, i) => start + i);
+});
+
+/** 翻页：回到最后一页时贴底，往回翻时从头看 */
+async function goPage(target: number) {
+  page.value = Math.min(Math.max(1, target), pageCount.value);
+  await nextTick();
+  const el = streamEl.value;
+  if (el) el.scrollTop = isLastPage.value ? el.scrollHeight : 0;
+}
+
+/** 有新消息时贴到最后一页 */
+async function jumpToLastPage() {
+  await nextTick();
+  page.value = pageCount.value;
+  await scrollToBottom();
+}
+
+watch(pageCount, (n) => {
+  if (page.value > n) page.value = n;
+});
+
 function whoFor(m: Message): string {
   if (m.role === "user") return props.meta.persona || "我";
   if (m.role === "char") return cardName.value;
   return "系统";
+}
+
+function initial(name: string): string {
+  return name.trim().slice(0, 1) || "?";
+}
+
+function avatarClass(m: Message): string {
+  return m.role === "user" ? "bg-primary text-primary-content" : "bg-neutral text-neutral-content";
+}
+
+/** 消息时间戳（秒）→ HH:MM；乐观上屏的消息没有时间戳，返回空串 */
+function fmtTime(ts: number): string {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 /** 重roll 仅对"跟在用户消息后的末尾角色回复"开放 */
@@ -62,6 +119,7 @@ async function loadAll() {
   streamText.value = "";
   editingIndex.value = -1;
   draft.value = "";
+  page.value = 1;
   const id = props.meta.id;
   try {
     const [bb, msgs] = await Promise.all([api.getBlackboard(id), api.readMessages(id)]);
@@ -73,6 +131,7 @@ async function loadAll() {
       actors: bb.actors.join(", "),
     });
     messages.value = [...msgs];
+    page.value = pageCount.value; // 打开会话时停在最新一页
     void refreshInspector();
     void scrollToBottom();
     // 气泡署名用卡片显示名；读取失败退回目录名
@@ -145,7 +204,7 @@ async function send() {
   streamText.value = "";
   // 乐观上屏；终态后以磁盘为准重读
   messages.value = [...messages.value, { turn: -1, role: "user", content, ts: 0 }];
-  void scrollToBottom();
+  void jumpToLastPage();
   let final: StreamEvent;
   try {
     final = await api.sendMessage(props.meta.id, content, onDelta);
@@ -160,6 +219,7 @@ async function reroll() {
   error.value = "";
   generating.value = true;
   streamText.value = "";
+  void jumpToLastPage();
   let final: StreamEvent;
   try {
     final = await api.regenerate(props.meta.id, onDelta);
@@ -270,609 +330,310 @@ watch(() => props.meta.id, loadAll);
 </script>
 
 <template>
-  <div class="chat">
-    <p v-if="error" class="error">{{ error }}</p>
+  <div class="flex h-full min-h-0 flex-col gap-4">
+    <ErrorToast :message="error" @dismiss="error = ''" />
 
-    <header class="chat-head">
-      <div class="who-block">
-        <h2>{{ cardName }}</h2>
-        <span class="scene" v-if="blackboard">
-          第 {{ blackboard.day }} 天 · {{ blackboard.clock || "时间未定" }} ·
-          {{ blackboard.place || "地点未定" }}
-        </span>
-      </div>
-      <div class="head-ops">
-        <button
-          class="tab-btn"
-          :class="{ active: panel === 'board' }"
-          @click="togglePanel('board')"
-        >
-          黑板
-        </button>
-        <button
-          class="tab-btn"
-          :class="{ active: panel === 'inspector' }"
-          @click="togglePanel('inspector')"
-        >
-          检查器
-        </button>
+    <!-- 会话头：角色 + 状态 + 面板开关 -->
+    <header class="card card-border flex-none bg-base-100">
+      <div class="card-body flex-row items-center gap-3 p-3">
+        <div class="avatar avatar-placeholder">
+          <div class="w-10 rounded-full bg-primary/15 text-primary">
+            <span class="text-sm">{{ initial(cardName) }}</span>
+          </div>
+        </div>
+
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-2">
+            <h2 class="truncate text-base font-semibold">{{ cardName }}</h2>
+            <span class="status status-xs status-success"></span>
+            <span class="text-xs text-base-content/50">{{ generating ? "生成中" : "在场" }}</span>
+          </div>
+          <p class="mt-0.5 mb-0 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-base-content/50">
+            <span class="flex items-center gap-1">
+              <Icon name="clock" :size="13" />
+              第 {{ blackboard?.day ?? 1 }} 天 · {{ blackboard?.clock || "时间未定" }}
+            </span>
+            <span class="flex items-center gap-1">
+              <Icon name="pin" :size="13" />{{ blackboard?.place || "地点未定" }}
+            </span>
+            <span v-if="blackboard && blackboard.actors.length > 0" class="flex items-center gap-1">
+              <Icon name="users" :size="13" />{{ blackboard.actors.join(" · ") }}
+            </span>
+          </p>
+        </div>
+
+        <div class="flex flex-none items-center gap-1">
+          <button
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+            data-tip="黑板"
+            :class="{ 'btn-active': panel === 'board' }"
+            @click="togglePanel('board')"
+          >
+            <Icon name="layers" :size="16" />
+          </button>
+          <button
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+            data-tip="记忆检查器"
+            :class="{ 'btn-active': panel === 'inspector' }"
+            @click="togglePanel('inspector')"
+          >
+            <Icon name="cpu" :size="16" />
+          </button>
+        </div>
       </div>
     </header>
 
-    <div class="chat-body">
-      <section class="main">
-        <ul class="stream" ref="streamEl">
-          <li v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
-            <div class="who">{{ whoFor(m) }}</div>
+    <div class="relative flex min-h-0 flex-1 gap-4">
+      <!-- 聊天流 + 输入区 -->
+      <section class="card card-border min-w-0 flex-1 overflow-hidden bg-base-100">
+        <ul ref="streamEl" class="m-0 flex min-h-0 flex-1 list-none flex-col gap-5 overflow-y-auto p-5">
+          <li
+            v-for="{ m, index: i } in pagedMessages"
+            :key="i"
+            class="chat group"
+            :class="m.role === 'user' ? 'chat-end' : 'chat-start'"
+          >
+            <div class="chat-image avatar avatar-placeholder">
+              <div class="w-9 rounded-full" :class="avatarClass(m)">
+                <span class="text-xs">{{ initial(whoFor(m)) }}</span>
+              </div>
+            </div>
+            <div class="chat-header mb-0.5 text-xs font-medium text-base-content/60">{{ whoFor(m) }}</div>
 
             <template v-if="editingIndex === i">
-              <textarea
-                class="editbox"
-                v-model="editDraft"
-                rows="3"
-                @keydown="onEditKeydown"
-              ></textarea>
-              <div class="ops editing">
-                <button class="op accent" @click="saveEdit">保存</button>
-                <button class="op" @click="editingIndex = -1">取消</button>
-                <span class="op-hint">Ctrl+Enter 保存 · Esc 取消</span>
+              <div class="chat-bubble w-full max-w-[min(76%,72ch)] bg-base-200 p-2">
+                <textarea
+                  class="textarea textarea-sm textarea-ghost w-full leading-relaxed"
+                  v-model="editDraft"
+                  rows="3"
+                  @keydown="onEditKeydown"
+                ></textarea>
+              </div>
+              <div class="chat-footer mt-1 flex flex-wrap items-center gap-2">
+                <button class="btn btn-ghost btn-xs text-primary" @click="saveEdit">保存</button>
+                <button class="btn btn-ghost btn-xs" @click="editingIndex = -1">取消</button>
+                <span class="flex items-center gap-1 text-[11px] text-base-content/40">
+                  <kbd class="kbd kbd-xs">Ctrl</kbd>+<kbd class="kbd kbd-xs">Enter</kbd> 保存 ·
+                  <kbd class="kbd kbd-xs">Esc</kbd> 取消
+                </span>
               </div>
             </template>
 
             <template v-else>
-              <div class="bubble">{{ m.content }}</div>
-              <div class="ops" v-if="!generating">
-                <button class="op" @click="startEdit(i)">编辑</button>
-                <button class="op" v-if="canReroll(i, m)" @click="reroll">重roll</button>
-                <button class="op danger" @click="removeMsg(i)">删除</button>
+              <div
+                class="chat-bubble max-w-[min(76%,72ch)] leading-relaxed break-words whitespace-pre-wrap"
+                :class="m.role === 'user' ? 'chat-bubble-primary' : 'bg-base-300 text-base-content'"
+              >
+                {{ m.content }}
+              </div>
+              <div class="chat-footer mt-1 flex items-center gap-2 text-[11px] text-base-content/40">
+                <span v-if="fmtTime(m.ts)">{{ fmtTime(m.ts) }}</span>
+                <span
+                  v-if="!generating"
+                  class="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 max-lg:opacity-70"
+                >
+                  <button class="btn btn-ghost btn-xs" @click="startEdit(i)">
+                    <Icon name="edit" :size="13" />编辑
+                  </button>
+                  <button v-if="canReroll(i, m)" class="btn btn-ghost btn-xs" @click="reroll">
+                    <Icon name="refresh" :size="13" />重roll
+                  </button>
+                  <button class="btn btn-ghost btn-xs text-error" @click="removeMsg(i)">
+                    <Icon name="trash" :size="13" />删除
+                  </button>
+                </span>
               </div>
             </template>
           </li>
 
-          <!-- 流式中的角色回复 -->
-          <li v-if="generating" class="msg char">
-            <div class="who">{{ cardName }}</div>
-            <div class="bubble streaming">
-              {{ streamText }}<span class="cursor" aria-hidden="true"></span>
+          <!-- 流式中的角色回复（只在最后一页显示） -->
+          <li v-if="generating && isLastPage" class="chat chat-start">
+            <div class="chat-image avatar avatar-placeholder">
+              <div class="w-9 rounded-full bg-neutral text-neutral-content">
+                <span class="text-xs">{{ initial(cardName) }}</span>
+              </div>
+            </div>
+            <div class="chat-header mb-0.5 text-xs font-medium text-base-content/60">{{ cardName }}</div>
+            <div
+              class="chat-bubble max-w-[min(76%,72ch)] border border-primary/40 bg-base-300 leading-relaxed break-words whitespace-pre-wrap text-base-content"
+            >
+              {{ streamText }}<span class="ml-0.5 inline-block h-[1em] w-0.5 animate-pulse bg-primary align-[-0.15em]" aria-hidden="true"></span>
+            </div>
+            <div class="chat-footer mt-1 flex items-center gap-2 text-[11px] text-base-content/45">
+              <span class="loading loading-dots loading-xs text-primary"></span>
+              正在写…
             </div>
           </li>
 
-          <li v-if="messages.length === 0 && !generating" class="empty-stream">
+          <li v-if="messages.length === 0 && !generating" class="mt-10 self-center text-sm text-base-content/45">
             还没有消息。说点什么，把这场戏开起来。
           </li>
         </ul>
 
-        <form class="composer" @submit.prevent="send">
-          <textarea
-            ref="composerEl"
-            v-model="draft"
-            rows="1"
-            placeholder="说点什么… Enter 发送，Shift+Enter 换行"
-            aria-label="消息输入框"
-            @keydown="onComposerKeydown"
-            @input="autoGrow"
-          ></textarea>
-          <button v-if="!generating" class="send" type="submit" :disabled="!draft.trim()">
-            发送
-          </button>
-          <button v-else class="stop" type="button" @click="stop">停止</button>
+        <!-- 分页：多轮对话按页翻 -->
+        <div
+          v-if="messages.length > 0"
+          class="flex flex-none flex-wrap items-center justify-between gap-2 border-t border-base-300 px-3 py-2"
+        >
+          <span class="text-[11px] text-base-content/45">
+            第 {{ page }}/{{ pageCount }} 页 · 共 {{ messages.length }} 条 · 每页 {{ PAGE_SIZE }} 条
+          </span>
+          <div class="join">
+            <button class="btn join-item btn-xs" :disabled="page <= 1" @click="goPage(page - 1)">
+              <Icon name="chevron" :size="13" class="rotate-180" />上一页
+            </button>
+            <button
+              v-for="n in pageNumbers"
+              :key="n"
+              class="btn join-item btn-xs"
+              :class="{ 'btn-active': n === page }"
+              :aria-current="n === page ? 'page' : undefined"
+              @click="goPage(n)"
+            >
+              {{ n }}
+            </button>
+            <button class="btn join-item btn-xs" :disabled="page >= pageCount" @click="goPage(page + 1)">
+              下一页<Icon name="chevron" :size="13" />
+            </button>
+          </div>
+        </div>
+
+        <!-- 输入区：daisyUI textarea + 圆形发送键 -->
+        <form class="flex-none border-t border-base-300 p-3" @submit.prevent="send">
+          <div class="flex items-end gap-2">
+            <textarea
+              ref="composerEl"
+              class="textarea max-h-40 w-full flex-1 resize-none leading-relaxed"
+              v-model="draft"
+              rows="1"
+              placeholder="说点什么…"
+              aria-label="消息输入框"
+              @keydown="onComposerKeydown"
+              @input="autoGrow"
+            ></textarea>
+            <button
+              v-if="!generating"
+              class="btn btn-circle btn-sm btn-primary"
+              type="submit"
+              :disabled="!draft.trim()"
+              aria-label="发送"
+            >
+              <Icon name="send" :size="16" />
+            </button>
+            <button
+              v-else
+              class="btn btn-circle btn-sm btn-error"
+              type="button"
+              aria-label="停止生成"
+              @click="stop"
+            >
+              <span class="size-3 rounded-xs bg-current"></span>
+            </button>
+          </div>
+          <p class="mt-2 mb-0 flex flex-wrap items-center gap-1.5 text-[11px] text-base-content/45">
+            <kbd class="kbd kbd-xs">Enter</kbd> 发送 ·
+            <kbd class="kbd kbd-xs">Shift</kbd>+<kbd class="kbd kbd-xs">Enter</kbd> 换行
+          </p>
         </form>
       </section>
 
       <!-- 右侧抽屉：黑板 / 记忆检查器 -->
-      <aside v-if="panel" class="panel">
-        <header class="panel-head">
-          <div class="tabs">
-            <button
-              :class="{ active: panel === 'board' }"
-              @click="panel = 'board'"
-            >
+      <aside
+        v-if="panel"
+        class="card card-border flex w-80 flex-none flex-col overflow-hidden bg-base-100 max-[900px]:absolute max-[900px]:inset-y-0 max-[900px]:right-0 max-[900px]:z-10 max-[900px]:w-[min(340px,92vw)]"
+      >
+        <header class="flex flex-none items-center justify-between gap-2 border-b border-base-300 px-3 py-2">
+          <div role="tablist" class="tabs tabs-box tabs-xs">
+            <button role="tab" class="tab" :class="{ 'tab-active': panel === 'board' }" @click="panel = 'board'">
               黑板
             </button>
             <button
-              :class="{ active: panel === 'inspector' }"
+              role="tab"
+              class="tab"
+              :class="{ 'tab-active': panel === 'inspector' }"
               @click="panel = 'inspector'"
             >
               检查器
             </button>
           </div>
-          <button class="close" aria-label="收起面板" @click="panel = ''">×</button>
+          <button class="btn btn-square btn-ghost btn-xs" aria-label="收起面板" @click="panel = ''">
+            <Icon name="close" :size="15" />
+          </button>
         </header>
 
-        <div v-if="panel === 'board'" class="panel-body">
-          <p class="dim">保存后下一轮组装生效；每轮回复后时钟 +10 分钟。</p>
-          <div class="bbform">
-            <div class="row2">
-              <label class="field">
-                <span>第几天</span>
-                <input v-model.number="bbForm.day" type="number" min="1" />
-              </label>
-              <label class="field">
-                <span>时间</span>
-                <input v-model="bbForm.clock" placeholder="21:30" />
-              </label>
+        <div v-if="panel === 'board'" class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+          <p class="m-0 text-xs text-base-content/50">保存后下一轮组装生效；每轮回复后时钟 +10 分钟。</p>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="label" for="bb-day">第几天</label>
+              <input id="bb-day" class="input input-sm w-full" v-model.number="bbForm.day" type="number" min="1" />
             </div>
-            <label class="field">
-              <span>地点</span>
-              <input v-model="bbForm.place" placeholder="图书馆自习区" />
-            </label>
-            <label class="field">
-              <span>在场（逗号分隔）</span>
-              <input v-model="bbForm.actors" placeholder="小雨, 玩家" />
-            </label>
-            <div class="form-ops">
-              <button class="btn accent" :disabled="savingBb" @click="saveBlackboard">
-                {{ savingBb ? "保存中…" : "保存黑板" }}
-              </button>
+            <div>
+              <label class="label" for="bb-clock">时间</label>
+              <input id="bb-clock" class="input input-sm w-full" v-model="bbForm.clock" placeholder="21:30" />
             </div>
+          </div>
+          <div>
+            <label class="label" for="bb-place">地点</label>
+            <input id="bb-place" class="input input-sm w-full" v-model="bbForm.place" placeholder="图书馆自习区" />
+          </div>
+          <div>
+            <label class="label" for="bb-actors">在场（逗号分隔）</label>
+            <input id="bb-actors" class="input input-sm w-full" v-model="bbForm.actors" placeholder="小雨, 玩家" />
+          </div>
+          <div class="flex justify-end">
+            <button class="btn btn-primary btn-sm" :disabled="savingBb" @click="saveBlackboard">
+              <span v-if="savingBb" class="loading loading-spinner loading-xs"></span>
+              {{ savingBb ? "保存中…" : "保存黑板" }}
+            </button>
           </div>
         </div>
 
-        <div v-else class="panel-body">
-          <div class="insp-head">
-            <p class="dim total" v-if="assembly">
-              {{ assemblySource === "last" ? "最近一次发送" : "预览 · 干跑" }} ·
-              {{ assembly.layers.length }} 层 · 约 {{ assembly.total_tokens }} token ·
-              {{ assembly.messages.length }} 条消息
+        <div v-else class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+          <div class="flex items-center justify-between gap-2">
+            <p v-if="assembly" class="m-0 text-xs text-base-content/50">
+              {{ assemblySource === "last" ? "最近一次发送" : "预览 · 干跑" }}
             </p>
-            <button class="btn" @click="preview">刷新预览</button>
+            <button class="btn btn-ghost btn-xs flex-none" @click="preview">
+              <Icon name="refresh" :size="13" />刷新
+            </button>
           </div>
-          <ul class="layers" v-if="assembly">
-            <li v-for="l in assembly.layers" :key="l.id + l.name" class="layer">
-              <details>
-                <summary>
-                  <span class="lid">{{ l.id }}</span>
-                  <span class="lname">{{ l.name }}</span>
-                  <span class="ltok">≈{{ l.tokens }}</span>
-                </summary>
-                <pre>{{ l.content }}</pre>
-              </details>
-            </li>
-          </ul>
-          <p class="dim" v-else>尚无组装数据。</p>
+
+          <template v-if="assembly">
+            <div class="grid grid-cols-3 gap-2">
+              <div class="rounded-box bg-base-200 px-3 py-2">
+                <p class="m-0 text-[11px] text-base-content/45">注入层</p>
+                <p class="m-0 text-lg leading-tight font-semibold">{{ assembly.layers.length }}</p>
+              </div>
+              <div class="rounded-box bg-base-200 px-3 py-2">
+                <p class="m-0 text-[11px] text-base-content/45">估算 token</p>
+                <p class="m-0 text-lg leading-tight font-semibold">{{ assembly.total_tokens }}</p>
+              </div>
+              <div class="rounded-box bg-base-200 px-3 py-2">
+                <p class="m-0 text-[11px] text-base-content/45">消息数</p>
+                <p class="m-0 text-lg leading-tight font-semibold">{{ assembly.messages.length }}</p>
+              </div>
+            </div>
+
+            <div
+              v-for="l in assembly.layers"
+              :key="l.id + l.name"
+              class="collapse collapse-arrow rounded-box bg-base-200"
+            >
+              <input type="checkbox" />
+              <div class="collapse-title flex min-h-0 items-center gap-2.5 px-3 py-2 text-[13px]">
+                <span class="badge badge-xs badge-soft badge-primary font-mono">{{ l.id }}</span>
+                <span class="flex-1 truncate">{{ l.name }}</span>
+                <span class="font-mono text-[11px] text-base-content/45">≈{{ l.tokens }}</span>
+              </div>
+              <div class="collapse-content px-3">
+                <pre class="m-0 rounded-box border border-base-300 bg-base-100 p-2.5 text-xs leading-relaxed break-words whitespace-pre-wrap">{{ l.content }}</pre>
+              </div>
+            </div>
+          </template>
+          <p v-else class="m-0 text-xs text-base-content/50">尚无组装数据。</p>
         </div>
       </aside>
     </div>
   </div>
 </template>
-
-<style scoped>
-.chat {
-  height: 100%;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.error {
-  flex: none;
-}
-
-.chat-head {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 14px 18px;
-  background: var(--hj-panel);
-  border: 1px solid var(--hj-line);
-  border-radius: 12px;
-}
-.who-block {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  min-width: 0;
-}
-.who-block h2 {
-  margin: 0;
-  font-size: 17px;
-}
-.scene {
-  color: var(--hj-dim);
-  font-size: 12px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.head-ops {
-  display: flex;
-  gap: 6px;
-  flex: none;
-}
-.tab-btn {
-  border: 1px solid var(--hj-line);
-  background: transparent;
-  color: var(--hj-dim);
-  border-radius: 8px;
-  padding: 5px 12px;
-  font-size: 12px;
-  cursor: pointer;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-}
-.tab-btn:hover {
-  color: var(--hj-fg);
-}
-.tab-btn.active {
-  color: var(--hj-accent);
-  border-color: var(--hj-accent);
-  background: var(--hj-accent-soft);
-}
-
-.chat-body {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  gap: 12px;
-  position: relative;
-}
-.main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  background: var(--hj-panel);
-  border: 1px solid var(--hj-line);
-  border-radius: 12px;
-  overflow: hidden;
-}
-
-/* 消息流 */
-.stream {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  list-style: none;
-  margin: 0;
-  padding: 18px 18px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.msg {
-  display: flex;
-  flex-direction: column;
-  max-width: 76%;
-  animation: rise 0.18s ease-out;
-}
-.msg.user {
-  align-self: flex-end;
-  align-items: flex-end;
-}
-.msg.char {
-  align-self: flex-start;
-}
-.who {
-  font-size: 11px;
-  color: var(--hj-dim);
-  margin: 0 4px 3px;
-}
-.bubble {
-  padding: 9px 13px;
-  border-radius: 14px;
-  background: var(--hj-panel-2);
-  border: 1px solid var(--hj-line);
-  font-size: 13.5px;
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.msg.char .bubble {
-  border-bottom-left-radius: 4px;
-}
-.msg.user .bubble {
-  background: var(--hj-accent-soft);
-  border-color: rgba(212, 161, 94, 0.35);
-  border-bottom-right-radius: 4px;
-}
-.bubble.streaming {
-  border-color: rgba(212, 161, 94, 0.35);
-}
-.cursor {
-  display: inline-block;
-  width: 2px;
-  height: 1em;
-  margin-left: 2px;
-  vertical-align: -0.15em;
-  background: var(--hj-accent);
-  animation: blink 1s steps(1) infinite;
-}
-
-/* 消息操作：常显但低对比（触屏可达），悬停提亮 */
-.ops {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  margin-top: 3px;
-  opacity: 0.55;
-  transition: opacity 0.15s;
-}
-.msg:hover .ops,
-.ops.editing {
-  opacity: 1;
-}
-.op {
-  border: none;
-  background: transparent;
-  color: var(--hj-dim);
-  font-size: 11px;
-  padding: 2px 7px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.op:hover {
-  color: var(--hj-fg);
-  background: var(--hj-panel-2);
-}
-.op.accent {
-  color: var(--hj-accent);
-}
-.op.danger:hover {
-  color: var(--hj-danger);
-}
-.op-hint {
-  font-size: 11px;
-  color: var(--hj-dim);
-  margin-left: 4px;
-}
-.editbox {
-  width: 100%;
-  min-width: 280px;
-  background: var(--hj-bg);
-  border: 1px solid var(--hj-line-strong);
-  border-radius: 10px;
-  color: var(--hj-fg);
-  padding: 8px 12px;
-  font-size: 13px;
-  line-height: 1.6;
-  resize: vertical;
-}
-
-.empty-stream {
-  align-self: center;
-  color: var(--hj-dim);
-  font-size: 13px;
-  margin-top: 40px;
-}
-
-/* 输入区 */
-.composer {
-  flex: none;
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding: 12px 14px;
-  border-top: 1px solid var(--hj-line);
-}
-.composer textarea {
-  flex: 1;
-  background: var(--hj-bg);
-  border: 1px solid var(--hj-line-strong);
-  border-radius: 10px;
-  color: var(--hj-fg);
-  padding: 9px 12px;
-  font-size: 13.5px;
-  line-height: 1.6;
-  resize: none;
-  max-height: 140px;
-}
-.composer textarea:focus {
-  outline: none;
-  border-color: var(--hj-accent);
-}
-.send,
-.stop {
-  flex: none;
-  border-radius: 10px;
-  padding: 9px 18px;
-  font-size: 13px;
-  cursor: pointer;
-  border: 1px solid var(--hj-accent);
-  transition: filter 0.15s, opacity 0.15s;
-}
-.send {
-  background: var(--hj-accent);
-  color: var(--hj-accent-ink);
-  font-weight: 600;
-}
-.send:hover:not(:disabled) {
-  filter: brightness(1.08);
-}
-.send:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-.stop {
-  background: transparent;
-  color: var(--hj-danger);
-  border-color: var(--hj-danger);
-}
-.stop:hover {
-  background: rgba(201, 111, 111, 0.12);
-}
-
-/* 右侧抽屉面板 */
-.panel {
-  flex: 0 0 320px;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  background: var(--hj-panel);
-  border: 1px solid var(--hj-line);
-  border-radius: 12px;
-  overflow: hidden;
-}
-.panel-head {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--hj-line);
-}
-.tabs {
-  display: flex;
-  gap: 4px;
-}
-.tabs button {
-  border: none;
-  background: transparent;
-  color: var(--hj-dim);
-  font-size: 12px;
-  padding: 4px 10px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.tabs button.active {
-  color: var(--hj-fg);
-  background: var(--hj-panel-2);
-}
-.close {
-  border: none;
-  background: transparent;
-  color: var(--hj-dim);
-  font-size: 16px;
-  line-height: 1;
-  padding: 4px 8px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.close:hover {
-  color: var(--hj-fg);
-  background: var(--hj-panel-2);
-}
-.panel-body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.dim {
-  color: var(--hj-dim);
-  font-size: 12px;
-  margin: 0;
-}
-
-.bbform {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.row2 {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--hj-dim);
-}
-.field input {
-  background: var(--hj-bg);
-  border: 1px solid var(--hj-line-strong);
-  border-radius: 6px;
-  color: var(--hj-fg);
-  padding: 7px 10px;
-  font-size: 13px;
-}
-.form-ops {
-  display: flex;
-  justify-content: flex-end;
-}
-
-.insp-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-.layers {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.layer summary {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  cursor: pointer;
-  padding: 7px 10px;
-  border-radius: 6px;
-  background: var(--hj-bg);
-  font-size: 13px;
-  list-style: none;
-}
-.layer summary::-webkit-details-marker {
-  display: none;
-}
-.layer summary::before {
-  content: "▸";
-  color: var(--hj-dim);
-  font-size: 11px;
-}
-.layer details[open] summary::before {
-  content: "▾";
-}
-.lid {
-  font-family: Consolas, monospace;
-  color: var(--hj-accent);
-  font-size: 12px;
-}
-.lname {
-  flex: 1;
-}
-.ltok {
-  color: var(--hj-dim);
-  font-size: 11px;
-  font-family: Consolas, monospace;
-}
-.layer pre {
-  margin: 6px 0 2px;
-  padding: 10px;
-  border-radius: 6px;
-  background: var(--hj-bg);
-  font-size: 12px;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-@keyframes rise {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-@keyframes blink {
-  50% {
-    opacity: 0;
-  }
-}
-
-/* 窄屏：抽屉浮于聊天之上 */
-@media (max-width: 900px) {
-  .panel {
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: min(340px, 92vw);
-    z-index: 5;
-    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.4);
-  }
-}
-</style>

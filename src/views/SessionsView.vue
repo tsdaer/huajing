@@ -1,18 +1,26 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from "vue";
+import { onMounted, reactive, ref, watch } from "vue";
 import { api } from "../api";
-import type { CardSummary, Persona, SessionMeta } from "../types";
+import {
+  closeNewSession,
+  loadSessions,
+  newSessionOpen,
+  openNewSession,
+  selectedSession,
+  selectSession,
+} from "../sessions";
+import type { CardSummary, Persona } from "../types";
+import ErrorToast from "../components/ErrorToast.vue";
+import Icon from "../components/Icon.vue";
 import SessionView from "./SessionView.vue";
 
-// M1.5 将升级为完整新建向导与聊天界面；当前先提供
-// 列表 + 最小新建表单 + 会话详情（黑板编辑 / 记忆检查器 / 消息只读）。
+// 会话页只放聊天本体：
+// 会话列表在侧栏「会话」子菜单里，新建按钮在顶栏标题旁，这里负责承载新建弹窗。
 
-const sessions = ref<SessionMeta[]>([]);
 const cards = ref<CardSummary[]>([]);
 const personas = ref<Persona[]>([]);
-const selected = ref<SessionMeta | null>(null);
-const creating = ref(false);
 const error = ref("");
+const newEl = ref<HTMLDialogElement | null>(null);
 
 const form = reactive({
   character: "",
@@ -23,25 +31,24 @@ const form = reactive({
   premise: "",
 });
 
-async function refresh() {
-  error.value = "";
-  try {
-    sessions.value = await api.listSessions();
-  } catch (e) {
-    error.value = String(e);
-  }
-}
-
 onMounted(async () => {
-  await refresh();
+  void loadSessions();
   try {
     [cards.value, personas.value] = await Promise.all([api.listCards(), api.listPersonas()]);
     if (!form.character && cards.value.length > 0) {
       form.character = cards.value[0].dir_name;
     }
   } catch {
-    /* 卡/人格读取失败不阻塞列表 */
+    /* 卡/人格读取失败不阻塞弹窗 */
   }
+});
+
+/** 顶栏按钮与原生 dialog 双向同步：Esc、点遮罩关闭时也要把状态收回来 */
+watch(newSessionOpen, (open) => {
+  const el = newEl.value;
+  if (!el) return;
+  if (open && !el.open) el.showModal();
+  else if (!open && el.open) el.close();
 });
 
 async function create() {
@@ -58,243 +65,91 @@ async function create() {
       place: form.place || undefined,
       premise: form.premise || undefined,
     });
-    creating.value = false;
-    await refresh();
-    selected.value = sessions.value.find((s) => s.id === meta.id) ?? meta;
+    closeNewSession();
+    await loadSessions();
+    selectSession(meta.id);
     error.value = "";
   } catch (e) {
     error.value = String(e);
   }
 }
-
-async function open(s: SessionMeta) {
-  selected.value = s;
-}
-
-function fmtDate(iso: string): string {
-  return iso.replace("T", " ").replace("Z", "");
-}
 </script>
 
 <template>
-  <main class="page">
-    <p v-if="error" class="error">{{ error }}</p>
+  <div class="h-full min-h-0 p-4 lg:p-6">
+    <ErrorToast :message="error" @dismiss="error = ''" />
 
-    <div class="cols">
-      <!-- 左：会话列表 + 新建 -->
-      <section class="col">
-        <header class="col-head">
-          <h2>会话</h2>
-          <button class="btn accent" @click="creating = !creating">
-            {{ creating ? "收起" : "＋ 新建" }}
-          </button>
-        </header>
+    <div class="mx-auto flex h-full min-h-0 w-full max-w-[1400px] flex-col">
+      <SessionView v-if="selectedSession" :meta="selectedSession" />
 
-        <form v-if="creating" class="newform" @submit.prevent="create">
-          <label class="field">
-            <span>角色卡 *</span>
-            <select v-model="form.character">
+      <div
+        v-else
+        class="card card-dash flex flex-1 flex-col items-center justify-center gap-2 bg-base-100 p-8 text-center"
+      >
+        <Icon name="sparkle" :size="24" class="text-base-content/25" />
+        <p class="m-0 text-sm text-base-content/50">挑一场戏，接着往下演。</p>
+        <p class="m-0 text-xs text-base-content/40">在左侧「会话」里选一场，或者新建一场。</p>
+        <button class="btn btn-primary btn-sm" @click="openNewSession">
+          <Icon name="plus" :size="15" />新建会话
+        </button>
+      </div>
+    </div>
+
+    <!-- 新建会话弹窗（由顶栏按钮打开） -->
+    <dialog ref="newEl" class="modal" @close="closeNewSession">
+      <div class="modal-box max-w-lg">
+        <h3 class="text-base font-semibold">新建会话</h3>
+        <p class="mt-1 text-xs text-base-content/50">选角色卡与用户人格，设定开场的时间与地点。</p>
+
+        <form class="mt-4 flex flex-col gap-3" @submit.prevent="create">
+          <div>
+            <label class="label" for="new-character">角色卡 *</label>
+            <select id="new-character" class="select select-sm w-full" v-model="form.character">
               <option v-for="c in cards" :key="c.dir_name" :value="c.dir_name">
                 {{ c.name }}{{ c.degraded ? "（降级）" : "" }}
               </option>
             </select>
-          </label>
-          <label class="field">
-            <span>用户人格</span>
-            <select v-model="form.persona">
+          </div>
+          <div>
+            <label class="label" for="new-persona">用户人格</label>
+            <select id="new-persona" class="select select-sm w-full" v-model="form.persona">
               <option value="">（不使用）</option>
               <option v-for="p in personas" :key="p.name" :value="p.name">{{ p.name }}</option>
             </select>
-          </label>
-          <div class="row2">
-            <label class="field">
-              <span>第几天</span>
-              <input v-model.number="form.day" type="number" min="1" />
-            </label>
-            <label class="field">
-              <span>时间（HH:MM）</span>
-              <input v-model="form.clock" placeholder="21:30" />
-            </label>
           </div>
-          <label class="field">
-            <span>地点</span>
-            <input v-model="form.place" placeholder="图书馆自习区" />
-          </label>
-          <label class="field">
-            <span>起因（premise，可空）</span>
-            <input v-model="form.premise" placeholder="闭馆前的一小时" />
-          </label>
-          <div class="form-ops">
-            <button class="btn accent" type="submit">创建</button>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="label" for="new-day">第几天</label>
+              <input id="new-day" class="input input-sm w-full" v-model.number="form.day" type="number" min="1" />
+            </div>
+            <div>
+              <label class="label" for="new-clock">时间（HH:MM）</label>
+              <input id="new-clock" class="input input-sm w-full" v-model="form.clock" placeholder="21:30" />
+            </div>
+          </div>
+          <div>
+            <label class="label" for="new-place">地点</label>
+            <input id="new-place" class="input input-sm w-full" v-model="form.place" placeholder="图书馆自习区" />
+          </div>
+          <div>
+            <label class="label" for="new-premise">起因（premise，可空）</label>
+            <input
+              id="new-premise"
+              class="input input-sm w-full"
+              v-model="form.premise"
+              placeholder="闭馆前的一小时"
+            />
+          </div>
+
+          <div class="modal-action">
+            <button class="btn btn-sm" type="button" @click="closeNewSession">取消</button>
+            <button class="btn btn-primary btn-sm" type="submit">创建</button>
           </div>
         </form>
-
-        <ul class="slist">
-          <li
-            v-for="s in sessions"
-            :key="s.id"
-            :class="{ active: selected?.id === s.id }"
-            @click="open(s)"
-          >
-            <div class="sname">{{ s.characters.join(" × ") }}</div>
-            <div class="smeta">
-              {{ fmtDate(s.created_at) }}{{ s.persona ? ` · ${s.persona}` : "" }}
-            </div>
-          </li>
-          <li v-if="sessions.length === 0" class="empty">还没有会话，点「＋ 新建」开一场。</li>
-        </ul>
-      </section>
-
-      <!-- 右：选中会话详情 -->
-      <section class="col wide">
-        <SessionView v-if="selected" :meta="selected" />
-        <p v-else class="placeholder">选择或创建一个会话，查看黑板与记忆检查器。</p>
-      </section>
-    </div>
-  </main>
+      </div>
+      <form method="dialog" class="modal-backdrop">
+        <button>关闭</button>
+      </form>
+    </dialog>
+  </div>
 </template>
-
-<style scoped>
-.page {
-  flex: 1;
-  min-height: 0;
-  width: min(1180px, 100%);
-  margin: 0 auto;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.cols {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  gap: 12px;
-  align-items: stretch;
-}
-.col {
-  background: var(--hj-panel);
-  border: 1px solid var(--hj-line);
-  border-radius: 12px;
-  padding: 14px 16px;
-  flex: 0 0 280px;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.col.wide {
-  flex: 1;
-  min-width: 0;
-  padding: 0;
-  background: transparent;
-  border: none;
-  display: flex;
-  flex-direction: column;
-}
-.col-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.col-head h2 {
-  margin: 0;
-  font-size: 16px;
-}
-.placeholder {
-  color: var(--hj-dim);
-  font-size: 13px;
-  text-align: center;
-  margin: 40px 0;
-}
-
-.newform {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
-  border-radius: 8px;
-  background: var(--hj-bg);
-}
-.row2 {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--hj-dim);
-}
-.field input,
-.field select {
-  background: var(--hj-panel);
-  border: 1px solid var(--hj-line-strong);
-  border-radius: 6px;
-  color: var(--hj-fg);
-  padding: 6px 10px;
-  font-size: 13px;
-}
-.form-ops {
-  display: flex;
-  justify-content: flex-end;
-}
-
-.slist {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-}
-.slist li {
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: var(--hj-bg);
-  border: 1px solid transparent;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-}
-.slist li:hover {
-  background: var(--hj-panel-2);
-}
-.slist li.active {
-  background: var(--hj-accent-soft);
-  border-color: rgba(212, 161, 94, 0.4);
-}
-.slist li.empty {
-  color: var(--hj-dim);
-  font-size: 13px;
-  cursor: default;
-}
-.sname {
-  font-size: 14px;
-  font-weight: 600;
-}
-.smeta {
-  color: var(--hj-dim);
-  font-size: 11px;
-  margin-top: 2px;
-  font-family: Consolas, monospace;
-}
-
-@media (max-width: 760px) {
-  .cols {
-    flex-direction: column;
-    overflow-y: auto;
-  }
-  .col {
-    flex: none;
-    width: 100%;
-  }
-  .col.wide {
-    min-height: 68vh;
-  }
-}
-</style>
