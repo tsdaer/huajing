@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { api } from "../api";
-import type { Persona, Provider, ProviderTest, Settings } from "../types";
+import type { Persona, Provider, ProviderTest, RuntimeInfo, Settings } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
 
@@ -37,6 +37,7 @@ async function refresh() {
     ]);
     wizardDone.value = settings.value.wizard_done;
     proxyDraft.value = settings.value.proxy ?? "";
+    runtime.value = await api.runtimeInfo();
     // 全新用户：直接落在「填 key」这一步，省掉找入口的时间
     if (needsSetup.value) startCreate();
   } catch (e) {
@@ -50,6 +51,15 @@ function startCreate() {
   Object.assign(draft, blank());
   editing.value = true;
 }
+
+// ---------- 运行环境 ----------
+const runtime = ref<RuntimeInfo | null>(null);
+
+const buildStamp = computed(() => {
+  const ts = runtime.value?.buildTs;
+  if (!ts) return "该构建未提供";
+  return new Date(ts * 1000).toLocaleString();
+});
 
 // ---------- 出网代理 ----------
 const proxyDraft = ref("");
@@ -396,6 +406,42 @@ async function confirmRemove() {
               <button class="btn btn-ghost btn-sm" type="button" @click="editing = false">取消</button>
             </div>
           </form>
+        </div>
+      </section>
+
+      <!-- 运行环境：排查「改了没用」的第一眼（进程真正在用的路径与构建时间） -->
+      <section class="card card-border bg-base-100">
+        <div class="card-body gap-3 p-5">
+          <div>
+            <h2 class="card-title gap-2 text-sm font-medium">
+              <Icon name="database" :size="16" class="text-base-content/45" />
+              运行环境
+            </h2>
+            <p class="mt-1 mb-0 text-xs text-base-content/50">
+              这是当前进程真正在读的数据目录。若与你编辑的仓库目录不一致，改卡不会生效。
+            </p>
+          </div>
+          <dl class="m-0 flex flex-col gap-1.5 text-xs">
+            <div class="flex items-baseline gap-2">
+              <dt class="w-20 flex-none text-base-content/45">数据目录</dt>
+              <dd class="m-0 min-w-0 flex-1 truncate font-mono text-[11px]" :title="runtime?.dataRoot">
+                {{ runtime?.dataRoot ?? "—" }}
+              </dd>
+            </div>
+            <div class="flex items-baseline gap-2">
+              <dt class="w-20 flex-none text-base-content/45">构建时间</dt>
+              <dd class="m-0 font-mono text-[11px]">{{ buildStamp }}</dd>
+            </div>
+            <div class="flex items-baseline gap-2">
+              <dt class="w-20 flex-none text-base-content/45">已装载</dt>
+              <dd class="m-0 text-[11px]">
+                {{ runtime?.cardCount ?? 0 }} 张卡 · {{ runtime?.sessionCount ?? 0 }} 场会话
+              </dd>
+            </div>
+          </dl>
+          <p v-if="!runtime?.buildTs" class="m-0 text-[11px] text-warning">
+            这个构建没有返回构建时间——说明它早于该功能，建议重新构建后再测。
+          </p>
         </div>
       </section>
 

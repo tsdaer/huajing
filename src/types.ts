@@ -11,6 +11,24 @@ export interface Provider {
   role: string;
 }
 
+/** 应用信息（commands.rs · app_info）：buildTs 为编译时刻（unix 秒，界面用它判断构建新旧） */
+export interface AppInfo {
+  name: string;
+  slogan: string;
+  version: string;
+  buildTs: number;
+  dataRoot: string;
+}
+
+/** 运行环境（commands.rs · runtime_info） */
+export interface RuntimeInfo {
+  dataRoot: string;
+  cardCount: number;
+  sessionCount: number;
+  now: number;
+  buildTs: number;
+}
+
 /** 接入点连通性自检结果（commands.rs · test_provider） */
 export interface ProviderTest {
   ok: boolean;

@@ -237,7 +237,16 @@ export function setupMock() {
           name: "化境 Huajing",
           slogan: "扮谁，便入谁之境。",
           version: "0.1.0-mock",
+          buildTs: Math.floor(Date.now() / 1000),
           dataRoot: "DataHub（浏览器 mock）",
+        };
+      case "runtime_info":
+        return {
+          dataRoot: "DataHub（浏览器 mock）",
+          cardCount: cards.length,
+          sessionCount: 1,
+          now: Math.floor(Date.now() / 1000),
+          buildTs: Math.floor(Date.now() / 1000),
         };
       case "list_providers":
         return providers;

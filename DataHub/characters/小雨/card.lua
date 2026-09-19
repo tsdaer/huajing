@@ -39,7 +39,7 @@ return {
     -- 每次组装上下文时调用：把内部状态注入 B5 槽（设计 §4.1）
     on_context = function(ctx, state)
       ctx.inject("system",
-        string.format("【角色内部状态】好感度 %d/100%s",
+        string.format("【角色内部状态】羁绊 %d/100",
           state.favorability,
           state.favorability >= 80 and "（你已隐隐察觉自己很在意对方）" or ""))
     end,

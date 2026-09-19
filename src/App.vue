@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, ref, watch } from "vue";
 import { api } from "./api";
-import { CARD_FILE_RE, requestImport, startCardWatch } from "./cards";
+import { CARD_FILE_RE, importNotice, requestImport, startCardWatch } from "./cards";
 import Icon from "./components/Icon.vue";
 import TitleBar from "./components/TitleBar.vue";
 import { loadSessions, openNewSession, selectedId, selectSession, sessions } from "./sessions";
@@ -51,6 +51,15 @@ function openSession(s: SessionMeta) {
 }
 
 const info = ref<Awaited<ReturnType<typeof api.appInfo>> | null>(null);
+
+/** 构建时间（本地时区，精确到分钟）：真机排查时先看它——旧构建一眼可见 */
+const buildLabel = computed(() => {
+  const ts = info.value?.buildTs;
+  if (!ts) return ""; // 旧构建没有这个字段
+  const d = new Date(ts * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+});
 onMounted(async () => {
   try {
     info.value = await api.appInfo();
@@ -77,8 +86,15 @@ async function startDropWatch() {
       }
       dragging.value = false;
       if (event.payload.type !== "drop") return;
-      const hit = event.payload.paths.find((p) => CARD_FILE_RE.test(p));
-      if (hit) requestImport(hit);
+      const paths = event.payload.paths;
+      const hit = paths.find((p) => CARD_FILE_RE.test(p));
+      if (hit) {
+        importNotice.value = "";
+        requestImport(hit);
+      } else if (paths.length > 0) {
+        // 拖了别的文件：说清楚为什么不理会
+        importNotice.value = `只支持 SillyTavern 的 PNG / JSON 角色卡，已忽略：${paths[0]}`;
+      }
     });
   } catch {
     /* 浏览器 mock 下没有 Tauri 窗口事件 */
@@ -89,6 +105,18 @@ async function startDropWatch() {
 <template>
   <div class="flex h-full flex-col">
     <TitleBar />
+
+    <!-- 拖入被忽略时的说明 -->
+    <div
+      v-if="importNotice"
+      class="fixed inset-x-0 bottom-4 z-50 mx-auto w-fit max-w-[92vw]"
+      role="status"
+    >
+      <div class="alert alert-warning shadow-lg">
+        <span class="text-xs">{{ importNotice }}</span>
+        <button class="btn btn-ghost btn-xs" @click="importNotice = ''">知道了</button>
+      </div>
+    </div>
 
     <!-- 拖入卡文件的提示（M1.8）：松手即打开导入向导 -->
     <div
@@ -214,7 +242,7 @@ async function startDropWatch() {
           <div class="border-t border-base-300 p-2">
             <div
               class="flex items-center gap-3 rounded-box bg-base-200 p-2 is-drawer-close:tooltip is-drawer-close:tooltip-right"
-              :data-tip="`v${info?.version ?? '0.1.0'}`"
+              :data-tip="`v${info?.version ?? '0.1.0'}${buildLabel ? ' · 构建 ' + buildLabel : ''}`"
             >
               <span
                 class="flex size-9 shrink-0 items-center justify-center rounded-full bg-neutral text-xs text-neutral-content"
@@ -224,7 +252,8 @@ async function startDropWatch() {
               <div class="min-w-0 flex-1 is-drawer-close:hidden">
                 <p class="truncate text-sm font-medium">本地模式</p>
                 <p class="truncate text-[11px] text-base-content/45">
-                  v{{ info?.version ?? "0.1.0" }} · 明文数据
+                  v{{ info?.version ?? "0.1.0" }}
+                  <template v-if="buildLabel"> · 构建 {{ buildLabel }}</template>
                 </p>
               </div>
               <span class="status status-sm status-success is-drawer-close:hidden"></span>

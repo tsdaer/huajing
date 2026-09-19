@@ -3,6 +3,7 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  AppInfo,
   Blackboard,
   CardDetail,
   CardDraft,
@@ -14,6 +15,7 @@ import type {
   PromptAssembly,
   Provider,
   ProviderTest,
+  RuntimeInfo,
   SessionMeta,
   Settings,
   StreamEvent,
@@ -29,7 +31,9 @@ export type NewSessionOptions = {
 }
 
 export const api = {
-  appInfo: () => invoke<{ name: string; slogan: string; version: string; dataRoot: string }>("app_info"),
+  appInfo: () => invoke<AppInfo>("app_info"),
+  /** 运行环境速览（设置页「运行环境」） */
+  runtimeInfo: () => invoke<RuntimeInfo>("runtime_info"),
 
   listProviders: () => invoke<Provider[]>("list_providers"),
   /** 按名称 upsert，返回更新后的全量列表 */

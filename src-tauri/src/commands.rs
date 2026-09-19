@@ -19,8 +19,26 @@ pub fn app_info() -> serde_json::Value {
         "name": "化境 Huajing",
         "slogan": "扮谁，便入谁之境。",
         "version": env!("CARGO_PKG_VERSION"),
+        // 编译期注入（build.rs）：界面显示它，就能一眼看出跑的是哪一版
+        "buildTs": env!("HUAJING_BUILD_TS").parse::<u64>().unwrap_or(0),
         "dataRoot": store::data_root(),
     })
+}
+
+/// 运行环境速览（设置页「运行环境」）：这是当前进程真正在用的路径与计数，
+/// 排查「我改了卡怎么没用」时第一眼看这里——很可能是应用读的不是你改的那份。
+#[tauri::command]
+pub fn runtime_info() -> Result<serde_json::Value, String> {
+    let root = root();
+    let sessions = store::list_sessions(&root).map_err(|e| e.to_string())?.len();
+    let cards = card::list_cards(&root).len();
+    Ok(serde_json::json!({
+        "dataRoot": root,
+        "cardCount": cards,
+        "sessionCount": sessions,
+        "now": store::unix_now(),
+        "buildTs": env!("HUAJING_BUILD_TS").parse::<u64>().unwrap_or(0),
+    }))
 }
 
 fn root() -> std::path::PathBuf {
