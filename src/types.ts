@@ -91,3 +91,17 @@ export interface CardDetail {
   degraded: boolean;
   degrade_reason?: string | null;
 }
+
+// ---------- LLM 流式（llm.rs · 设计 §11）----------
+
+/** OpenAI 格式对话消息 */
+export interface ChatMessage {
+  role: string;
+  content: string;
+}
+
+/** send_message 推送的流事件 */
+export type StreamEvent =
+  | { event: "delta"; text: string }
+  | { event: "done"; full: string; cancelled: boolean }
+  | { event: "error"; message: string };
