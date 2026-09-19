@@ -43,3 +43,51 @@ export interface Message {
   ts: number;
   scene_id?: string;
 }
+
+// ---------- 角色卡（card.rs · 设计 §3）----------
+
+/** 示例对话中的一行（role: user | char） */
+export interface ExampleLine {
+  role: string;
+  content: string;
+}
+
+/** 按情绪/场景分组的示例对话 */
+export interface ExampleTurn {
+  tag?: string | null;
+  messages: ExampleLine[];
+}
+
+/** card.lua 静态字段（行为层留在 Lua 侧，不进此结构） */
+export interface Card {
+  spec: string;
+  name: string;
+  avatar?: string | null;
+  creator?: string | null;
+  tags: string[];
+  world?: string | null;
+  scenario: string;
+  personality: string;
+  first_mes: string;
+  example_dialogue: ExampleTurn[];
+}
+
+/** 卡片目录清单条目 */
+export interface CardSummary {
+  dir_name: string;
+  name: string;
+  tags: string[];
+  creator?: string | null;
+  has_hooks: boolean;
+  degraded: boolean;
+}
+
+/** 卡片详情（不含源码） */
+export interface CardDetail {
+  dir_name: string;
+  card: Card;
+  default_state: Record<string, unknown>;
+  hook_names: string[];
+  degraded: boolean;
+  degrade_reason?: string | null;
+}

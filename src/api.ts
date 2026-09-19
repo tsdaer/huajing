@@ -2,7 +2,15 @@
 // （v2 默认 JS 侧 camelCase 参数名映射 Rust 侧 snake_case 形参）
 
 import { invoke } from "@tauri-apps/api/core";
-import type { Message, Persona, Provider, SessionMeta, Settings } from "./types";
+import type {
+  CardDetail,
+  CardSummary,
+  Message,
+  Persona,
+  Provider,
+  SessionMeta,
+  Settings,
+} from "./types";
 
 export type NewSessionOptions = {
   character: string;
@@ -25,6 +33,9 @@ export const api = {
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
 
   listPersonas: () => invoke<Persona[]>("list_personas"),
+
+  listCards: () => invoke<CardSummary[]>("list_cards"),
+  getCard: (dirName: string) => invoke<CardDetail>("get_card", { dirName }),
 
   newSession: (opts: NewSessionOptions) => invoke<SessionMeta>("new_session", opts),
   listSessions: () => invoke<SessionMeta[]>("list_sessions"),

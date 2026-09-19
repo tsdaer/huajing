@@ -1,11 +1,18 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { api } from "../api";
+import type { CardSummary } from "../types";
 
 const info = ref<Awaited<ReturnType<typeof api.appInfo>> | null>(null);
+const cards = ref<CardSummary[]>([]);
 
 onMounted(async () => {
   info.value = await api.appInfo();
+  try {
+    cards.value = await api.listCards();
+  } catch {
+    cards.value = []; // 卡目录为空或读取失败时静默
+  }
 });
 </script>
 
@@ -18,6 +25,18 @@ onMounted(async () => {
       <div class="row"><span class="k">核心</span><span>Rust (Tauri 2) ↔ Vue 3 通道已打通</span></div>
       <div class="row"><span class="k">版本</span><span>v{{ info.version }} · M1 施工中</span></div>
       <div class="row"><span class="k">数据</span><span class="path">{{ info.dataRoot }}</span></div>
+    </section>
+
+    <section class="card" v-if="cards.length > 0">
+      <div class="row head"><span class="k">角色卡</span><span>{{ cards.length }} 张已装载</span></div>
+      <div class="row" v-for="c in cards" :key="c.dir_name">
+        <span class="k">{{ c.name }}</span>
+        <span class="tags">
+          <span v-if="c.degraded" class="tag warn">降级</span>
+          <span v-if="c.has_hooks" class="tag">hooks</span>
+          <span v-for="t in c.tags" :key="t" class="tag">{{ t }}</span>
+        </span>
+      </div>
     </section>
 
     <p class="hint">
@@ -63,6 +82,26 @@ onMounted(async () => {
   display: flex;
   gap: 12px;
   align-items: baseline;
+}
+.row.head {
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.tags {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.tag {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(212, 161, 94, 0.14);
+  color: var(--hj-accent);
+}
+.tag.warn {
+  background: rgba(200, 90, 90, 0.2);
+  color: #d89090;
 }
 .k {
   color: var(--hj-dim);
