@@ -13,6 +13,7 @@ import type {
   Persona,
   PromptAssembly,
   Provider,
+  ProviderTest,
   SessionMeta,
   Settings,
   StreamEvent,
@@ -34,6 +35,9 @@ export const api = {
   /** 按名称 upsert，返回更新后的全量列表 */
   saveProvider: (provider: Provider) => invoke<Provider[]>("save_provider", { provider }),
   deleteProvider: (name: string) => invoke<Provider[]>("delete_provider", { name }),
+
+  /** 接入点连通性自检（发一条最小请求，非流式） */
+  testProvider: (provider: Provider) => invoke<ProviderTest>("test_provider", { provider }),
 
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),

@@ -30,7 +30,13 @@ const providers: Provider[] = [
   },
 ];
 
-const settings: Settings = { locale: "zh-CN", theme: "huajing", narrative_mode: "台词体", wizard_done: true };
+const settings: Settings = {
+  locale: "zh-CN",
+  theme: "huajing",
+  narrative_mode: "台词体",
+  wizard_done: true,
+  proxy: null,
+};
 
 const personas: Persona[] = [
   { name: "夜读者", description: "安静的图书馆常客，话少，观察细。" },
@@ -250,7 +256,8 @@ export function setupMock() {
       case "get_settings":
         return settings;
       case "save_settings":
-        return args;
+        Object.assign(settings, args as Partial<Settings>);
+        return settings;
       case "list_personas":
         return personas;
       case "list_cards":
@@ -315,6 +322,17 @@ export function setupMock() {
         return assembly(messages);
       case "last_prompt":
         return null;
+      case "test_provider":
+        return {
+          ok: true,
+          message: "连接成功（mock 12 ms）",
+          url: `${(args as { provider?: Provider }).provider?.base_url ?? ""}/chat/completions`,
+          model: (args as { provider?: Provider }).provider?.model ?? "",
+          detail: "（mock 不真的发请求）",
+          elapsed_ms: 12,
+          proxy: [],
+          proxy_used: null,
+        };
       case "watch_cards":
       case "unwatch_cards":
         return null;

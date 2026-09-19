@@ -33,6 +33,38 @@ fn default_role() -> String {
     "chat".into()
 }
 
+/// 真正会被请求的补全地址（自检与真实发送共用，避免两处规则漂移）
+pub fn endpoint(provider: &Provider) -> String {
+    format!("{}/chat/completions", normalize_base_url(&provider.base_url))
+}
+
+/// 兼容地址里漏写 `/v1` 的情况：DeepSeek / OpenAI 这类云服务的 OpenAI 兼容路径
+/// 挂在 `/v1` 下，用户从文档里复制时常只抄到域名。只对**已知主机**补，
+/// 自建网关一律不猜（补错了反而更难查）。
+fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let host = host.to_ascii_lowercase();
+    let host = host.split(':').next().unwrap_or("");
+    let cloud = [
+        "api.deepseek.com",
+        "api.openai.com",
+        "api.moonshot.cn",
+        "open.bigmodel.cn",
+    ];
+    if path.is_empty() && cloud.contains(&host) {
+        return format!("{trimmed}/v1");
+    }
+    trimmed.to_string()
+}
+
 /// 对话消息（OpenAI 格式：system | user | assistant）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -151,15 +183,10 @@ pub async fn chat_stream(
     messages: &[ChatMessage],
     mut on_delta: impl FnMut(&str),
     cancel: &AtomicBool,
+    extra_proxy: Option<&str>,
 ) -> Result<StreamOutcome, String> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("HTTP 客户端创建失败：{e}"))?;
-    let url = format!(
-        "{}/chat/completions",
-        provider.base_url.trim_end_matches('/')
-    );
+    let (client, _proxy) = build_client(extra_proxy).await?;
+    let url = endpoint(provider);
     let body = serde_json::json!({
         "model": provider.model,
         "messages": messages,
@@ -172,7 +199,7 @@ pub async fn chat_stream(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("请求失败（{}）：{e}", provider.name))?;
+        .map_err(|e| format!("请求失败（{}）：{}", provider.name, error_chain(&e)))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let detail = resp.text().await.unwrap_or_default();
@@ -214,6 +241,225 @@ pub async fn chat_stream(
     Ok(StreamOutcome { text: full, cancelled })
 }
 
+/// 把 reqwest 的错误链摊平成一行：只印顶层 `Display` 会丢掉真正的原因
+/// （DNS 失败 / 连接被拒 / TLS 握手失败 / 证书不受信 都在 source 链里）。
+/// 这是「请求失败」类问题的唯一线索来源，务必保留。
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut cursor = err.source();
+    while let Some(cause) = cursor {
+        let text = cause.to_string();
+        // 相邻层级偶有重复文案，去重后更易读
+        if parts.last().map(|p| p != &text).unwrap_or(true) {
+            parts.push(text);
+        }
+        cursor = cause.source();
+    }
+    parts.join(" ← ")
+}
+
+/// 非流式补全（连通性自检用；正式对话一律走 [`chat_stream`]）
+pub async fn chat_once(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    extra_proxy: Option<&str>,
+) -> Result<String, String> {
+    let (client, _proxy) = build_client(extra_proxy).await?;
+    let url = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
+    let body = serde_json::json!({
+        "model": provider.model,
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": 16,
+        "stream": false,
+    });
+    let resp = client
+        .post(&url)
+        .bearer_auth(&provider.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败（{}）：{}", provider.name, error_chain(&e)))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "{} 返回 {}：{}",
+            provider.name,
+            status,
+            truncate(&detail, 300)
+        ));
+    }
+    Ok(truncate(&resp.text().await.unwrap_or_default(), 200))
+}
+
+/// 环境变量里的代理（reqwest 的 system-proxy 也会读它们）
+fn proxy_from_env() -> Option<(String, String)> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some((value.to_string(), format!("环境变量 {key}")));
+            }
+        }
+    }
+    None
+}
+
+/// Windows 的「系统代理」（Internet 选项）。它不落环境变量，reqwest 的
+/// system-proxy 读不到——而国内用户恰恰常在这里开着本地代理（Clash/v2ray 等），
+/// 于是直连必然超时。这里读注册表把它捡回来。
+#[cfg(windows)]
+fn proxy_from_system() -> Option<(String, String)> {
+    use std::process::Command;
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let out = Command::new("reg").args(["query", key]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let enabled = text
+        .lines()
+        .find(|l| l.contains("ProxyEnable"))
+        .and_then(|l| l.split_whitespace().last())
+        .map(|v| v.trim() == "0x1")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let server = text
+        .lines()
+        .find(|l| l.contains("ProxyServer") && !l.contains("ProxyServer."))
+        .and_then(|l| l.split_once("REG_SZ"))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())?;
+    // 形如 `127.0.0.1:7890`（也可能带协议或 `http=...;https=...` 分号写法）
+    let first = server.split(';').next().unwrap_or("").trim();
+    let hostport = first.rsplit('=').next().unwrap_or(first).trim();
+    if hostport.is_empty() {
+        return None;
+    }
+    let url = if hostport.starts_with("http://") || hostport.starts_with("socks") {
+        hostport.to_string()
+    } else {
+        format!("http://{hostport}")
+    };
+    Some((url, "Windows 系统代理".into()))
+}
+
+#[cfg(not(windows))]
+fn proxy_from_system() -> Option<(String, String)> {
+    None
+}
+
+/// 本地代理是否真的在监听：没开代理软件时直接连（否则会把本来能通的请求也弄断）
+async fn proxy_reachable(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("socks5://"))
+        .or_else(|| url.strip_prefix("socks5h://"))
+        .or_else(|| url.strip_prefix("socks4://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.to_string()),
+        None => (authority.to_string(), "8080".to_string()),
+    };
+    // 先解析成 SocketAddr 再连：避免为 tuple 形式引入 ToSocketAddrs 的额外类型约束
+    let Ok(mut addrs) = tokio::net::lookup_host((host.as_str(), 0u16)).await else {
+        return false;
+    };
+    let Some(addr) = addrs.next() else {
+        return false;
+    };
+    let socket = match port.parse::<u16>() {
+        Ok(p) => std::net::SocketAddr::new(addr.ip(), p),
+        Err(_) => return false,
+    };
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            tokio::net::TcpStream::connect(socket)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// 这台机器上配了的代理（自检与界面展示用；不含凭据）
+pub fn proxy_env() -> Vec<String> {
+    let mut out = Vec::new();
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                out.push(format!("{key}={}", scrub_credentials(&value)));
+            }
+        }
+    }
+    if let Some((url, _)) = proxy_from_system() {
+        out.push(format!("系统代理={}", scrub_credentials(&url)));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 最终采用的代理：显式设置 > 环境变量 > 系统代理（且必须真的在监听）。
+/// 返回 `(代理 URL, 来源说明)`；`extra` 是用户在设置页手填的代理。
+async fn resolve_proxy(extra: Option<&str>) -> Option<(String, String)> {
+    if let Some(raw) = extra.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some((raw.to_string(), "设置页手填".into()));
+    }
+    if let Some(found) = proxy_from_env() {
+        return Some(found); // 环境变量是用户显式意图，即使代理没开也照用（报错更直白）
+    }
+    match proxy_from_system() {
+        Some((url, source)) if proxy_reachable(&url).await => Some((url, source)),
+        _ => None,
+    }
+}
+
+/// 建一个 HTTP 客户端（连同一个会话的多次请求共用一份；Tauri State 持有）
+pub async fn build_client(extra_proxy: Option<&str>) -> Result<(reqwest::Client, Option<String>), String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .user_agent(concat!("huajing/", env!("CARGO_PKG_VERSION")));
+    let mut used = None;
+    if let Some((url, source)) = resolve_proxy(extra_proxy).await {
+        let proxy = reqwest::Proxy::all(&url)
+            .map_err(|e| format!("代理地址不可用（{source}：{}）：{e}", scrub_credentials(&url)))?;
+        builder = builder.proxy(proxy);
+        used = Some(format!("{}（{source}）", scrub_credentials(&url)));
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("HTTP 客户端创建失败：{e}"))?;
+    Ok((client, used))
+}
+
+/// 代理地址里的账号密码不进界面/日志
+fn scrub_credentials(raw: &str) -> String {
+    match (raw.find("//"), raw.rfind('@')) {
+        (Some(start), Some(at)) if at > start + 2 => {
+            format!("{}//***@{}", &raw[..start], &raw[at + 1..])
+        }
+        _ => raw.to_string(),
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -226,6 +472,152 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_url_v1_is_normalized_only_for_known_hosts() {
+        let p = |base: &str| Provider {
+            name: "t".into(),
+            base_url: base.into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            temperature: 0.0,
+            role: "chat".into(),
+        };
+        // 漏写 /v1 的云服务地址：补上
+        assert_eq!(
+            endpoint(&p("https://api.deepseek.com")),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint(&p("https://api.deepseek.com/")),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint(&p("https://API.OpenAI.com")),
+            "https://API.OpenAI.com/v1/chat/completions",
+            "主机名大小写不敏感"
+        );
+        // 已经写了路径：原样拼接
+        assert_eq!(
+            endpoint(&p("https://api.deepseek.com/v1")),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // 自建网关：不猜，原样使用（Ollama 的 /v1 是必填的，用户自己写）
+        assert_eq!(
+            endpoint(&p("http://localhost:11434/v1")),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint(&p("http://192.168.1.9:8000")),
+            "http://192.168.1.9:8000/chat/completions"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_hides_password() {
+        assert_eq!(
+            scrub_credentials("http://user:pass@127.0.0.1:7890"),
+            "http://***@127.0.0.1:7890"
+        );
+        assert_eq!(scrub_credentials("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+    }
+
+    #[test]
+    fn error_chain_flattens_sources() {
+        #[derive(Debug)]
+        struct Layer(String, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as &(dyn std::error::Error + 'static))
+            }
+        }
+        let err = Layer(
+            "error sending request".into(),
+            Some(Box::new(Layer(
+                "invalid peer certificate".into(),
+                Some(Box::new(Layer("unknown issuer".into(), None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&err),
+            "error sending request ← invalid peer certificate ← unknown issuer"
+        );
+    }
+
+    /// 真实网络请求（默认跳过：`HUAJING_NET_TEST=1 cargo test -- --ignored`）。
+    /// 存在的意义是钉住「HTTPS 传输层被真的编译进来了」——reqwest 一旦被关掉
+    /// default-tls，任何 https 请求都会在发送阶段失败，而这个回归只能靠真实请求发现。
+    /// 端到端：按真实链路（设置 → 环境变量 → 系统代理）建客户端并发一次真实请求。
+    /// 这是「发不出去」类问题的回归网。
+    #[test]
+    #[ignore = "需要出网：HUAJING_NET_TEST=1 cargo test -- --ignored"]
+    fn client_factory_end_to_end() {
+        if std::env::var("HUAJING_NET_TEST").is_err() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (client, used) = build_client(None).await.expect("建客户端");
+            println!("采用代理：{used:?}");
+            match client.get("https://www.example.com/").send().await {
+                Ok(r) => println!("状态：{}", r.status()),
+                Err(e) => panic!("请求失败：{}", error_chain(&e)),
+            }
+        });
+    }
+
+    /// 系统代理探测（Windows 注册表 + 健康检查）。没有开系统代理的环境下自动跳过。
+    #[test]
+    #[ignore = "依赖本机系统代理：HUAJING_NET_TEST=1 cargo test -- --ignored"]
+    fn system_proxy_detection_smoke() {
+        if std::env::var("HUAJING_NET_TEST").is_err() {
+            return;
+        }
+        match proxy_from_system() {
+            Some((url, source)) => {
+                println!("系统代理：{url}（{source}）");
+                assert!(url.starts_with("http://") || url.starts_with("socks"), "{url}");
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                println!("在监听：{}", rt.block_on(proxy_reachable(&url)));
+            }
+            None => println!("本机未启用系统代理（跳过）"),
+        }
+    }
+
+    #[test]
+    #[ignore = "需要出网：HUAJING_NET_TEST=1 cargo test -- --ignored"]
+    fn https_transport_is_wired() {
+        if std::env::var("HUAJING_NET_TEST").is_err() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("建 tokio 运行时");
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("建客户端");
+            // 只要能拿到状态码就说明 TCP + TLS + 证书校验都通了（不需要打到某个 API）
+            match client.get("https://www.example.com/").send().await {
+                Ok(r) => assert!(r.status().is_success() || r.status().is_redirection()),
+                Err(e) => panic!("HTTPS 传输层不可用：{}", error_chain(&e)),
+            }
+        });
+    }
 
     #[test]
     fn sse_single_chunk_multiple_events() {

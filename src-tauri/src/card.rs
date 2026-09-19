@@ -1001,6 +1001,34 @@ return {
     }
 
     #[test]
+    fn every_workspace_card_parses() {
+        // 工作区里可能有用户自己导入/手写的卡（含 ST 导入产物）——它们同样必须可用。
+        // 坏卡在这里失败，比在真机上开聊时才发现要早得多。
+        let datahub = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../DataHub");
+        if !datahub.is_dir() {
+            return;
+        }
+        let summaries = list_cards(&datahub);
+        assert!(!summaries.is_empty(), "工作区至少应有一张示例卡");
+        for s in &summaries {
+            let lc =
+                load_card(&datahub, &s.dir_name).unwrap_or_else(|e| panic!("{}：{e}", s.dir_name));
+            assert!(
+                !lc.degraded,
+                "卡「{}」解析失败：{:?}",
+                s.dir_name,
+                lc.degrade_reason
+            );
+            assert!(!lc.card.name.trim().is_empty(), "卡「{}」没有名字", s.dir_name);
+            assert!(
+                !lc.card.first_mes.trim().is_empty(),
+                "卡「{}」没有开场白（first_mes），建会话会空场",
+                s.dir_name
+            );
+        }
+    }
+
+    #[test]
     fn repo_example_card_parses() {
         let datahub = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../DataHub");
         if !datahub.is_dir() {

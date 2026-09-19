@@ -19,6 +19,7 @@ pub fn run() {
         .manage(watch::CardWatch::default())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
+            commands::test_provider,
             commands::list_providers,
             commands::save_provider,
             commands::delete_provider,

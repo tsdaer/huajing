@@ -153,14 +153,9 @@ function fmtTime(ts: number): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-/** 重roll 仅对"跟在用户消息后的末尾角色回复"开放 */
+/** 可重新生成本轮的情形：末尾角色回复（重roll）、末尾用户消息（上次生成失败后重试） */
 function canReroll(i: number, m: Message): boolean {
-  return (
-    !generating.value &&
-    i === lastIndex.value &&
-    m.role === "char" &&
-    messages.value[i - 1]?.role === "user"
-  );
+  return !generating.value && i === lastIndex.value && (m.role === "char" || m.role === "user");
 }
 
 function togglePanel(p: "board" | "inspector") {
@@ -551,7 +546,7 @@ watch(cardGeneration, () => {
                     <Icon name="edit" :size="13" />编辑
                   </button>
                   <button v-if="canReroll(i, m)" class="btn btn-ghost btn-xs" @click="reroll">
-                    <Icon name="refresh" :size="13" />重roll
+                    <Icon name="refresh" :size="13" />{{ m.role === "char" ? "重roll" : "重试生成" }}
                   </button>
                   <button class="btn btn-ghost btn-xs text-error" @click="removeMsg(i)">
                     <Icon name="trash" :size="13" />删除

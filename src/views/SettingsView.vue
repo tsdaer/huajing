@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { api } from "../api";
-import type { Persona, Provider, Settings } from "../types";
+import type { Persona, Provider, ProviderTest, Settings } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
 
@@ -36,6 +36,7 @@ async function refresh() {
       api.getSettings(),
     ]);
     wizardDone.value = settings.value.wizard_done;
+    proxyDraft.value = settings.value.proxy ?? "";
     // 全新用户：直接落在「填 key」这一步，省掉找入口的时间
     if (needsSetup.value) startCreate();
   } catch (e) {
@@ -48,6 +49,45 @@ onMounted(refresh);
 function startCreate() {
   Object.assign(draft, blank());
   editing.value = true;
+}
+
+// ---------- 出网代理 ----------
+const proxyDraft = ref("");
+const savingProxy = ref(false);
+const proxySaved = ref(false);
+
+async function saveProxy() {
+  if (!settings.value) return;
+  savingProxy.value = true;
+  try {
+    settings.value = await api.saveSettings({
+      ...settings.value,
+      proxy: proxyDraft.value.trim() || null,
+    });
+    proxySaved.value = true;
+    error.value = "";
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    savingProxy.value = false;
+  }
+}
+
+// ---------- 连通性自检（一次「为什么发不出去」的诊断）----------
+const testing = ref("");
+const testResult = ref<{ name: string; result: ProviderTest } | null>(null);
+
+/** 真的发一条最小请求：能区分 key 无效 / 地址写错 / 出网被拦三类故障 */
+async function testProvider(p: Provider) {
+  testing.value = p.name;
+  testResult.value = null;
+  try {
+    testResult.value = { name: p.name, result: await api.testProvider({ ...p }) };
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    testing.value = "";
+  }
 }
 
 // ---------- 首启向导（M1.9：装好 → 填 key → 开聊 ≤ 3 分钟）----------
@@ -184,6 +224,7 @@ async function confirmRemove() {
           </div>
           <p class="m-0 text-[11px] text-base-content/45">
             配置明文存放在 <code class="font-mono">DataHub/providers.toml</code>，也可以直接编辑该文件。
+            若发消息报「请求失败」，先到下面「出网代理」点保存，再点接入点的「测试」看原因。
           </p>
         </div>
       </section>
@@ -205,6 +246,41 @@ async function confirmRemove() {
             <button v-if="!editing" class="btn btn-primary btn-sm flex-none" @click="startCreate">
               <Icon name="plus" :size="15" />新增
             </button>
+          </div>
+
+          <!-- 自检结果：成功给 URL 与耗时，失败给完整原因链与代理线索 -->
+          <div
+            v-if="testResult"
+            class="rounded-box border px-3 py-2.5 text-xs"
+            :class="testResult.result.ok ? 'border-success/40 bg-success/5' : 'border-error/40 bg-error/5'"
+          >
+            <div class="flex items-start justify-between gap-3">
+              <p class="m-0 font-medium">
+                {{ testResult.name }}：{{ testResult.result.message }}
+              </p>
+              <button class="btn btn-ghost btn-xs flex-none" @click="testResult = null">关闭</button>
+            </div>
+            <p class="mt-1 mb-0 font-mono text-[11px] break-all text-base-content/60">
+              POST {{ testResult.result.url }} · 模型 {{ testResult.result.model }}
+            </p>
+            <p
+              v-if="testResult.result.detail"
+              class="mt-1 mb-0 font-mono text-[11px] break-all text-base-content/50"
+            >
+              响应：{{ testResult.result.detail }}
+            </p>
+            <p class="mt-1.5 mb-0 text-[11px] text-base-content/60">
+              本次走：{{ testResult.result.proxy_used || "直连（未使用代理）" }}
+              <template v-if="testResult.result.proxy.length">
+                · 检测到 {{ testResult.result.proxy.join("、") }}
+              </template>
+            </p>
+            <p
+              v-if="!testResult.result.ok"
+              class="mt-1.5 mb-0 text-[11px] text-base-content/60"
+            >
+              常见原因：key 无效 · base_url 少写 <code>/v1</code> · 需要代理才能出网 · 服务未启动（本地模型）。
+            </p>
           </div>
 
           <ul v-if="providers.length > 0" class="list p-0">
@@ -232,6 +308,14 @@ async function confirmRemove() {
                 </p>
               </div>
               <div class="flex items-center justify-end gap-1">
+                <button
+                  class="btn btn-ghost btn-xs"
+                  :disabled="testing === p.name"
+                  @click="testProvider(p)"
+                >
+                  <span v-if="testing === p.name" class="loading loading-spinner loading-xs"></span>
+                  <Icon v-else name="bolt" :size="13" />测试
+                </button>
                 <button class="btn btn-ghost btn-xs" @click="startEdit(p)">
                   <Icon name="edit" :size="13" />编辑
                 </button>
@@ -312,6 +396,40 @@ async function confirmRemove() {
               <button class="btn btn-ghost btn-sm" type="button" @click="editing = false">取消</button>
             </div>
           </form>
+        </div>
+      </section>
+
+      <!-- 出网：代理直连二选一，发不出去时的第一处置点 -->
+      <section class="card card-border bg-base-100">
+        <div class="card-body gap-3 p-5">
+          <div>
+            <h2 class="card-title gap-2 text-sm font-medium">
+              <Icon name="bolt" :size="16" class="text-base-content/45" />
+              出网代理
+            </h2>
+            <p class="mt-1 mb-0 text-xs text-base-content/50">
+              留空即自动：环境变量 → Windows 系统代理（需确认在监听）→ 直连。
+              直连不上 API（连接超时 / 请求失败）时，在这里填本地代理地址。
+            </p>
+          </div>
+          <div class="join w-full">
+            <input
+              class="input join-item input-sm flex-1"
+              v-model="proxyDraft"
+              placeholder="http://127.0.0.1:7890（留空 = 自动）"
+              aria-label="出网代理地址"
+            />
+            <button class="btn join-item btn-sm" :disabled="savingProxy" @click="saveProxy">
+              <span v-if="savingProxy" class="loading loading-spinner loading-xs"></span>
+              保存
+            </button>
+          </div>
+          <p v-if="proxySaved" class="m-0 text-[11px] text-success">
+            已保存。点任意接入点的「测试」确认能否出网。
+          </p>
+          <p v-if="testResult?.result.proxy.length" class="m-0 font-mono text-[11px] text-base-content/50">
+            检测到：{{ testResult.result.proxy.join(" · ") }}
+          </p>
         </div>
       </section>
 

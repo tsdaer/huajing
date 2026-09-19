@@ -11,6 +11,22 @@ export interface Provider {
   role: string;
 }
 
+/** 接入点连通性自检结果（commands.rs · test_provider） */
+export interface ProviderTest {
+  ok: boolean;
+  /** 结论或错误（错误含完整原因链） */
+  message: string;
+  /** 实际请求的 URL（base_url 写错一眼可见） */
+  url: string;
+  model: string;
+  detail: string;
+  elapsed_ms: number;
+  /** 机器上配了的代理（出网失败时的第一条线索） */
+  proxy: string[];
+  /** 本次实际采用的代理（含来源）；null = 直连 */
+  proxy_used?: string | null;
+}
+
 /** 全局配置（store.rs） */
 export interface Settings {
   locale: string;
@@ -18,6 +34,8 @@ export interface Settings {
   narrative_mode: string;
   /** 首启向导是否已走完（M1.9） */
   wizard_done: boolean;
+  /** 出网代理；空则自动（环境变量 → Windows 系统代理 → 直连） */
+  proxy?: string | null;
 }
 
 /** 用户人格（personas/*.json） */

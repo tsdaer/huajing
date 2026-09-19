@@ -23,9 +23,12 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mlua = { version = "0.12.1", default-features = false, features = ["luajit", "serialize", "vendored"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
+# 必须保留 reqwest 的默认特性：default-tls 提供 HTTPS 传输层（关掉它任何 https 请求都会
+# 失败在「error sending request for url」，且错误信息看不出原因）；system-proxy 让请求
+# 走系统代理（国内出网的关键）；charset 处理非 UTF-8 响应体。只额外打开 json 与 stream。
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
 futures-util = "0.3.34"
-tokio = { version = "1.53.1", features = ["time"] }
+tokio = { version = "1.53.1", features = ["time", "net"] }
 toml = "1.1.6"
 notify = "8.2.0"
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode"] }

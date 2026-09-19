@@ -14,7 +14,7 @@
 
 - **M1.8 SillyTavern 卡导入**：新增 `stimport.rs`——PNG 的 tEXt `chara` 块（兼容 `ccv3`，自写 base64 解码，容忍折行）与 JSON（V2/V3/裸字段）解析为草稿；字段映射把 ST 的 description 折进 scenario、personality 空时用描述兜底、`{{char}}`/`{{user}}` 占位符归一化、`mes_example` 按 `<START>` 段拆成 `example_dialogue` 问答对（拆不动的原文与 system_prompt/creator_notes 一起折进 `notes`，不静默丢数据）；生成 `charcard/1.0` 的 `card.lua`（Lua 字面量按字节转义，任意 UTF-8 安全）并在落盘后立刻用自家解析器读回校验，读不回则回滚报错。目录名清洗防路径穿越，同名卡自动 `-2` 后缀不覆盖。`character_book`/`extensions` 等未映射字段在提醒里点名（M2 设定集拆分接手）。前端新增导入向导（`ImportCardDialog.vue`）：拖入文件即弹窗（App 级 `onDragDropEvent`，因为 WebView 的 File API 拿不到本地路径）+ 手动粘贴路径 + 解析预览（设定/开场白/示例对话组数/提醒）+ 确认落盘。新增 10 例测试（V2 字段映射、示例对话拆分与兜底、V3/裸 JSON、生成物读回、恶意文本转义、最小 PNG 往返、base64 容错、同名去重、路径穿越），累计 56 例全绿
 
-- **M1.9 首启向导与打包**：`settings.toml` 增 `wizard_done`；设置页在「还没有可用接入点」时显示三步向导（DeepSeek / Ollama 预设一键填好 Base URL 与模型名，只需补 key，本地服务免 key），保存接入点即自动收尾，也可显式「别再提示」。NSIS 安装包与 MSI 构建通过：`huajing_0.1.0_x64-setup.exe`（2.35 MB）与 `huajing_0.1.0_x64_en-US.msi`（3.32 MB）
+- **M1.9 首启向导与打包**：`settings.toml` 增 `wizard_done`；设置页在「还没有可用接入点」时显示三步向导（DeepSeek / Ollama 预设一键填好 Base URL 与模型名，只需补 key，本地服务免 key），保存接入点即自动收尾，也可显式「别再提示」。NSIS 安装包与 MSI 构建通过：`huajing_0.1.0_x64-setup.exe` 与 `huajing_0.1.0_x64_en-US.msi`（引入 rustls 传输层后为 3.37 MB / 4.58 MB，之前无 TLS 的 2.35 MB 版本其实发不出任何请求）
 
 - 项目初始化：Tauri 2 + Vue 3 + Vite + TypeScript 脚手架；Rust 核心模块桩（card / prompt / llm / store / commands）；DataHub 示例数据（小雨角色卡、default 世界）；设计文档 v0.12 与角色卡制作提示词套件入库
 - 工程文档：ROADMAP、CHANGELOG、M1 执行计划（docs/plan/m1.md）
@@ -32,6 +32,14 @@
 - **主题编辑器（新增「主题」页）**：预设主题来自 `docs/theme_test/theme.css`（`?raw` 内联并运行时解析，33 个主题不进 CSS 产物，页面按需分包）；28 个令牌（20 个颜色 + 圆角 / 尺寸 / 边框 / 立体感 / 噪点）逐项编辑，支持 `oklch(...)` 与 hex，原生取色器用浏览器色彩引擎把任意 CSS 颜色折算成 hex；改动实时写入 `:root` 内联变量并持久化，可一键清除；导出标准 `@plugin "daisyui/theme"` 块供固化进 `style.css`
 - 聊天界面：气泡加时间戳、操作按钮改为悬停浮现（窄屏常显），底部新增 `join` 分页（每页 20 条，打开会话停在最新页、发送后自动跳末页、往回翻从头看）
 - `src/sessions.ts`：会话列表与选中态的共享 store，侧栏子菜单与会话页共用
+
+### Fixed
+
+- **修复：HTTPS 传输层缺失导致一切请求失败**（用户实测报「请求失败（deepseek）：error sending request for url」）。根因是 `reqwest` 被声明为 `default-features = false` 且只开了 `json`/`stream`——**没有编译进任何 TLS 后端**，任何 `https://` 请求都在发送阶段就失败，且错误只有一句无从下手的 `error sending request`。改为保留默认特性（`default-tls` 提供 HTTPS，`system-proxy` 让请求走系统代理，`charset` 处理非 UTF-8 响应体）。同时把这类问题的可诊断性补齐：`error_chain()` 摊平 reqwest 的完整原因链（DNS / 连接被拒 / TLS 握手 / 证书不受信 一目了然）；新增 `test_provider` 命令（设置页每个接入点的「测试」按钮）发一条最小请求并回报**实际请求的 URL、耗时、机器上检测到的代理、本次实际采用的代理**；`endpoint()` 把补全地址规则收成一处（漏写 `/v1` 的已知云服务主机自动补上，自建网关不猜），自检与真实发送共用同一份规则。留了一条 `#[ignore]` 的真实出网回归测试（`HUAJING_NET_TEST=1 cargo test -- --ignored`），钉住「HTTPS 传输层被真的编译进来」——这个回归只有真实请求能发现
+
+- **修复：走不了本机代理导致连接超时**。`reqwest` 的 system-proxy 只读 `HTTP(S)_PROXY` 等环境变量，**读不到 Windows「Internet 选项」里的系统代理**，而国内用户恰恰常在那里开着 Clash/v2ray 之类（本机实测 `ProxyEnable=1 ProxyServer=127.0.0.1:7890`）——于是直连必然超时。现在代理解析链为：设置页手填 > 环境变量 > Windows 系统代理（读注册表，并先用 300ms TCP 探测确认真的在监听，避免代理软件没开时把本来能通的直连也弄断）> 直连。`settings.toml` 增 `proxy` 字段，设置页新增「出网代理」小节。实测：自动识别 `http://127.0.0.1:7890（Windows 系统代理）` 并成功请求 `https://www.example.com/` 得到 200
+
+- **改进：生成失败后可直接重试**。此前 `regenerate` 要求末尾必须是角色回复，而「请求失败」时用户消息已落盘、没有回复，于是只能再发一条新消息。现在末尾是用户消息时即为**重试本轮**（`plan_regenerate` 纯函数 + 单测覆盖两种裁剪）；前端在末尾用户消息上也给出「重试生成」按钮
 
 ### Changed
 

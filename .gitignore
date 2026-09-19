@@ -21,6 +21,9 @@ DataHub/providers.toml
 DataHub/providers.json
 DataHub/sessions/
 
+# 素材暂存（wiki 页原文等，供设定补全管线读取；产物进 DataHub）
+temp/
+
 # 本机工具配置（命令面板 / DSH 技能与状态）
 .dsh/
 .commandcode/

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
 
@@ -42,6 +43,57 @@ pub fn save_provider(provider: Provider) -> Result<Vec<Provider>, String> {
 #[tauri::command]
 pub fn delete_provider(name: String) -> Result<Vec<Provider>, String> {
     store::delete_provider(&root(), &name).map_err(|e| e.to_string())
+}
+
+/// 一次连通性自检的结果（设置页「测试」按钮）
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderTest {
+    pub ok: bool,
+    /// 人类可读的结论或错误（错误含 reqwest 的完整原因链）
+    pub message: String,
+    /// 实际请求的 URL（base_url 少写 /v1 之类一眼可见）
+    pub url: String,
+    pub model: String,
+    /// 服务端原样返回的响应体摘要（成功时用于确认模型确实回了话）
+    pub detail: String,
+    pub elapsed_ms: u64,
+    /// 这台机器上配了的代理（出网失败时的第一条线索）
+    pub proxy: Vec<String>,
+    /// 本次实际采用的代理（含来源）；None = 直连
+    pub proxy_used: Option<String>,
+}
+
+/// 测试一个接入点是否真的能用：发一条最小请求（非流式，60s 上限）。
+/// 覆盖三类常见故障：key 无效 / 地址写错（404 或连不上）/ 出网被拦（TLS 与代理）。
+#[tauri::command]
+pub async fn test_provider(provider: Provider) -> Result<ProviderTest, String> {
+    // 与真实发送走同一份地址与代理规则，自检结果才对得上真实请求
+    let url = llm::endpoint(&provider);
+    let proxy = store::load_settings(&root()).ok().and_then(|s| s.proxy);
+    let proxy_used = llm::build_client(proxy.as_deref())
+        .await
+        .map(|(_, used)| used)
+        .unwrap_or(None);
+    let messages = vec![llm::ChatMessage {
+        role: "user".into(),
+        content: "说「好」一个字即可。".into(),
+    }];
+    let started = std::time::Instant::now();
+    let outcome = llm::chat_once(&provider, &messages, proxy.as_deref()).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok(ProviderTest {
+        ok: outcome.is_ok(),
+        detail: outcome.clone().unwrap_or_default(),
+        message: match &outcome {
+            Ok(_) => format!("连接成功（{} ms）", elapsed_ms),
+            Err(e) => e.clone(),
+        },
+        url,
+        model: provider.model.clone(),
+        elapsed_ms,
+        proxy: llm::proxy_env(),
+        proxy_used,
+    })
 }
 
 // ---------- settings ----------
@@ -520,13 +572,17 @@ async fn stream_reply(
         Err(e) => return Ok(e),
     };
 
-    // 流式补全（取消检查在每个响应块之间）
+    // 流式补全（取消检查在每个响应块之间）。代理跟随设置页：空则自动探测。
+    let proxy = store::load_settings(root)
+        .ok()
+        .and_then(|s| s.proxy)
+        .filter(|p| !p.trim().is_empty());
     let chat = assembly.messages.clone();
     let stream = llm::chat_stream(provider, &chat, |delta| {
         let _ = on_event.send(StreamEvent::Delta {
             text: delta.to_string(),
         });
-    }, &flag)
+    }, &flag, proxy.as_deref())
     .await;
 
     // 清标记；记录本次组装（记忆检查器）
@@ -571,6 +627,30 @@ async fn stream_reply(
         }
         Err(message) => Ok(StreamEvent::Error { message }),
     }
+}
+
+/// 重roll / 重试的历史裁剪（纯函数，便于单测）：
+///
+/// - 末尾是角色回复 → 去掉它（重roll），以最后一条用户消息重新生成；
+/// - 末尾是用户消息 → 上一轮生成失败（例如「请求失败」），直接**重试**这一轮；
+/// - 其它（空、只有开场白）→ 报错。
+///
+/// 返回 `(写回磁盘的消息, 组装用的历史, 轮次, 用户输入)`。
+#[allow(clippy::type_complexity)]
+fn plan_regenerate(
+    messages: &[Message],
+) -> Result<(Vec<Message>, Vec<Message>, u64, String), String> {
+    let mut kept = messages.to_vec();
+    if kept.last().map(|m| m.role.as_str()) == Some("char") {
+        kept.pop();
+    }
+    let Some(user_msg) = kept.last().filter(|m| m.role == "user") else {
+        return Err("末尾没有可重新生成的用户消息".into());
+    };
+    let turn = user_msg.turn;
+    let content = user_msg.content.clone();
+    let prior = kept[..kept.len() - 1].to_vec();
+    Ok((kept, prior, turn, content))
 }
 
 /// 跑一轮 `on_message`（用户消息与回复都已落盘后调用，设计 §3）。
@@ -777,33 +857,18 @@ pub async fn regenerate(
     let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
     let provider = pick_chat_provider(&root)?;
 
-    let mut messages = msg_log
+    let all = msg_log
         .read(&root, &session_id)
         .map_err(|e| e.to_string())?
         .as_slice()
         .to_vec();
-
-    // 末尾必须是角色回复，其前必须有用户消息
-    match messages.last() {
-        Some(m) if m.role == "char" => {
-            messages.pop();
-        }
-        _ => {
-            return Ok(StreamEvent::Error {
-                message: "末尾没有可重roll的角色回复".into(),
-            })
-        }
-    }
-    let Some(user_msg) = messages.last().filter(|m| m.role == "user") else {
-        return Ok(StreamEvent::Error {
-            message: "角色回复前找不到用户消息，无法重roll".into(),
-        });
+    let (rewritten, prior, turn, content) = match plan_regenerate(&all) {
+        Ok(plan) => plan,
+        Err(message) => return Ok(StreamEvent::Error { message }),
     };
-    let (turn, content) = (user_msg.turn, user_msg.content.clone());
-    let prior: Vec<Message> = messages[..messages.len() - 1].to_vec();
 
     // 先移除末尾回复（文件与缓存同步），再组装生成
-    store::write_messages(&root, &session_id, &messages).map_err(|e| e.to_string())?;
+    store::write_messages(&root, &session_id, &rewritten).map_err(|e| e.to_string())?;
     msg_log.invalidate(Some(&session_id));
 
     // 重roll 前先让 on_context 按当前（已删掉末尾回复的）历史跑一轮
@@ -1186,6 +1251,42 @@ return {
             .any(|l| l.id == "B5" && l.content.contains("好感度 51")),
             "本轮注入用的应是上一轮存下的值");
         assert_eq!(store::read_memory_records(&root, &meta.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn regenerate_plan_rolls_back_reply_or_retries_failed_turn() {
+        let user = |turn, content: &str| Message {
+            turn,
+            role: "user".into(),
+            content: content.into(),
+            ts: 0,
+            scene_id: None,
+        };
+        let ch = |turn, content: &str| Message {
+            turn,
+            role: "char".into(),
+            content: content.into(),
+            ts: 0,
+            scene_id: None,
+        };
+
+        // 完整一轮：重roll 去掉末尾回复，组装历史不含本轮用户消息
+        let full = vec![ch(0, "开场"), user(1, "你好"), ch(1, "……嗯")];
+        let (rewritten, prior, turn, content) = plan_regenerate(&full).unwrap();
+        assert_eq!(rewritten.len(), 2, "末尾回复被移除");
+        assert_eq!(prior.len(), 1, "组装历史不含本轮用户消息");
+        assert_eq!((turn, content.as_str()), (1, "你好"));
+
+        // 请求失败：末尾只剩用户消息 → 直接重试这一轮
+        let failed = vec![ch(0, "开场"), user(1, "你好")];
+        let (rewritten, prior, turn, content) = plan_regenerate(&failed).unwrap();
+        assert_eq!(rewritten.len(), 2, "没有回复可删，原样保留");
+        assert_eq!(prior.len(), 1);
+        assert_eq!((turn, content.as_str()), (1, "你好"));
+
+        // 只有开场白 / 空会话：给明确错误，而不是生成出奇怪的一轮
+        assert!(plan_regenerate(&[ch(0, "开场")]).is_err());
+        assert!(plan_regenerate(&[]).is_err());
     }
 
     #[test]

@@ -173,6 +173,10 @@ pub struct Settings {
     /// 首启向导是否已走完（M1.9：填过 key 或显式跳过）
     #[serde(default)]
     pub wizard_done: bool,
+    /// 出网代理（可空）。空则自动：环境变量 > Windows 系统代理（需在监听）> 直连。
+    /// 国内直连不上 API、系统代理又读不到时，在这里手填 `http://127.0.0.1:7890` 即可。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 fn default_locale() -> String {
@@ -192,6 +196,7 @@ impl Default for Settings {
             theme: default_theme(),
             narrative_mode: default_narrative_mode(),
             wizard_done: false,
+            proxy: None,
         }
     }
 }
