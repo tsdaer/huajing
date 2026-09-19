@@ -1823,7 +1823,8 @@ fn fact_lines(e: &CodexEntity, cx: &RenderCtx<'_>) -> Vec<(String, String)> {
 }
 
 /// 当前情绪（§6.3 状态词表命中）：黑板可选键 affect / affects / emotion
-/// 或 psyche.affect，值可为情绪名、名字数组，或 {name=…} 对象数组。
+/// 或 psyche 下的情绪槽，值可为情绪名、名字数组，或 {name=…} 对象数组。
+/// 心理运行时（M2.5）写出的是 psyche.affects（复数），单数 affect 是 M1 遗留形态——两侧都认。
 fn affects_from_bb(bb: &BTreeMap<String, Value>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for key in ["affect", "affects", "emotion"] {
@@ -1831,8 +1832,10 @@ fn affects_from_bb(bb: &BTreeMap<String, Value>) -> Vec<String> {
             push_affects(v, &mut out);
         }
     }
-    if let Some(v) = bb.get("psyche").and_then(|p| p.get("affect")) {
-        push_affects(v, &mut out);
+    for key in ["affects", "affect"] {
+        if let Some(v) = bb.get("psyche").and_then(|p| p.get(key)) {
+            push_affects(v, &mut out);
+        }
     }
     out
 }

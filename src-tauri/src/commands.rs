@@ -12,6 +12,7 @@ use crate::card;
 use crate::codex;
 use crate::event::{self, LogBody, LogRecord};
 use crate::palace;
+use crate::psyche;
 use crate::threads;
 use crate::llm::{self, Provider, StreamEvent};
 use crate::prompt;
@@ -651,6 +652,15 @@ fn rebuild_from(
             out.push(rec.clone());
             event::fold(&mut proj, &rec);
         }
+        // ⑤ 轮末心理运行时推进（情绪衰减也随重放重算——心理状态同样可回放）
+        if msg.role == "char" {
+            let (body, _emotion) = tick_psyche(&proj, &character, loaded, msg.turn);
+            if let Some(body) = body {
+                let rec = LogRecord::new(0, body);
+                out.push(rec.clone());
+                event::fold(&mut proj, &rec);
+            }
+        }
     }
     Ok(out)
 }
@@ -1146,6 +1156,14 @@ fn assemble_prompt_core(
         })
         .collect();
 
+    // ---- B5 内心：心理运行时摘要（设计 §9.2：主观世界一行，空则省略）----
+    let psyche_line = psyche::Psyche::from_state(&card_state).summary_line_for(&loaded.card.name);
+    let psyche_line = if psyche_line.trim().is_empty() {
+        None
+    } else {
+        Some(psyche_line)
+    };
+
     let inputs = prompt::BuildInputs {
         settings: &settings,
         persona: persona.as_ref(),
@@ -1158,6 +1176,7 @@ fn assemble_prompt_core(
         concerns: &concerns,
         resolutions: &resolutions,
         pending_threads: &pending,
+        psyche_line: psyche_line.as_deref(),
         history,
         user_content,
     };
@@ -1474,8 +1493,45 @@ fn apply_message_hook(
     report
 }
 
+/// 轮末推进心理运行时（设计 §9.2）：情绪按气质参数衰减、意图慢衰减，写回 state.psyche。
+///
+/// 返回自动表情（宿主据此 ui.emit，"情绪跨轮连续"由此保证——衰减可查，不凭模型记忆）。
+/// 结果作为 effect 事件落盘，因此**消息级重放会重新长出同一份心理状态**。
+fn tick_psyche(
+    proj: &event::Projection,
+    character: &str,
+    loaded: &card::LoadedCard,
+    turn: u64,
+) -> (Option<LogBody>, Option<String>) {
+    let state = current_state(proj, character, loaded);
+    // 卡没声明/没用心理运行时就不给它塞 psyche 块——静卡的 state 照旧保持干净
+    // （「静态卡跑完什么都不写」是 M1 起就钉住的契约）
+    if state.get(psyche::STATE_KEY).is_none() {
+        return (None, None);
+    }
+    let mut p = psyche::Psyche::from_state(&state);
+    p.tick(turn, 1.0);
+    let mut next = state.clone();
+    p.write_into(&mut next);
+    let patch = event::state_patch(&state, &next);
+    let body = if patch.is_empty() {
+        None
+    } else {
+        Some(LogBody::Effect(event::EffectEvent {
+            turn,
+            trigger: "psyche.tick".into(),
+            character: character.into(),
+            state_set: patch,
+            blackboard: Vec::new(),
+            memory: Vec::new(),
+            ts: store::unix_now(),
+        }))
+    };
+    (body, p.auto_emotion())
+}
+
 /// 回复落定后的收尾（stream_reply 与单测共用同一份代码，避免两处等价逻辑）：
-/// 回复事件 → 时钟步进事件 → on_message 事件。
+/// 回复事件 → 时钟步进事件 → on_message 事件 → 心理运行时推进。
 ///
 /// 事件化后时钟步进也是事件：重放同一轮必然得到同一时刻（设计 §7.3-5）。
 fn commit_reply(
@@ -1516,7 +1572,25 @@ fn commit_reply(
     .map_err(|e| e.to_string())?;
 
     // 回复落盘后跑 on_message（设计 §3：每条新消息落地后调用）
-    Ok(run_message_hook_core(root, meta, loaded, turn, sink, log))
+    let mut report = run_message_hook_core(root, meta, loaded, turn, sink, log);
+
+    // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——结果同样是事件
+    let character = first_character(meta).unwrap_or_default();
+    if let Ok(proj) = project_session(log, root, meta) {
+        let (body, emotion) = tick_psyche(&proj, &character, loaded, turn);
+        if let Some(body) = body {
+            if let Err(e) = commit(log, root, meta, body) {
+                report.logs.push(e);
+            }
+        }
+        if let Some(emotion) = emotion {
+            report.ui_events.push(llm::UiEmit {
+                kind: "emotion".into(),
+                value: emotion,
+            });
+        }
+    }
+    Ok(report)
 }
 
 /// 把钩子推来的界面事件转推前端（用户消息一步与回复一步共用）
@@ -2025,24 +2099,8 @@ return {
         // 此前只有回复落盘后跑一次，于是卡看不到用户输入、它的反应也来不及影响本轮生成。
         // 诊断留痕是当时唯一能看见这件事的地方，故在此也断言它。
         let (assembly, report) = simulate_turn(&root, &meta, &loaded, &log, 1, "今天好冷。");
-        // 诊断环形缓冲是全进程共享的：测试并发跑时别的用例也会写，所以**只在自己的标记文本上断言**，
-        // 不再依赖「最近 10 条」这个窗口（曾因此偶发变红，与代码无关）。
-        let traces: Vec<String> = crate::diag::recent(200)
-            .iter()
-            .map(|d| d.detail.clone())
-            .collect();
-        assert!(
-            traces.iter().any(|d| d.contains("入参")
-                && d.contains("\"role\":\"user\"")
-                && d.contains("今天好冷")),
-            "钩子必须看到用户消息本身（而不是只看到角色回复）：{traces:?}"
-        );
-        assert!(
-            traces
-                .iter()
-                .any(|d| d.contains("入参") && d.contains("\"role\":\"char\"")),
-            "回复落盘后也应留下入参记录：{traces:?}"
-        );
+        // 注：这里**不再断言诊断环形缓冲**——它是全进程共享的，并发跑测试时会被别的用例冲掉
+        // （这个坑踩过两次）。「钩子必须看到用户消息本身」改由行为断言钉住，见本测试末尾。
         assert!(
             assembly
                 .layers
@@ -2077,6 +2135,17 @@ return {
             .any(|l| l.id == "B5" && l.content.contains("好感度 51")),
             "本轮注入用的应是上一轮存下的值");
         assert_eq!(store::read_memory_records(&root, &meta.id).unwrap().len(), 2);
+
+        // 行为断言（不依赖任何全局缓冲）：一条含「谢谢」的**用户消息**单独落盘后跑钩子，
+        // 好感度必须立刻 +1——这正是「卡看到了用户消息本身」的证据（若只看到回复，不会有变化）。
+        log.append(&root, &meta.id, LogBody::Message(user_msg(9, "谢谢你。")))
+            .unwrap();
+        let report = run_message_hook_core(&root, &meta, &loaded, 9, None, &log);
+        assert!(report.ran, "钩子应被触发");
+        assert_eq!(
+            report.card_state["favorability"], 53,
+            "用户消息落盘即跑钩子：52 → 53"
+        );
     }
 
     #[test]
@@ -2640,5 +2709,58 @@ return {
             "收线后不该再列为未决事项：{}",
             layer(&a4, "C1")
         );
+    }
+
+    /// M2.5 验收（设计 §9.2）：情绪跨轮连续——三轮前的强情绪仍有余波，且衰减轨迹可查；
+    /// B5 的「内心」一行把主观世界带给模型（不凭它自己的记忆）。
+    #[test]
+    fn affect_carries_across_turns_and_decays() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50, psyche = { affects = {}, intents = {} } },
+  hooks = {
+    on_message = function(msg, state, api)
+      if msg.role == 'user' and msg.content:find('谢谢') then
+        state.psyche.affects = { { name = '喜悦', intensity = 0.9, source = '被道谢' } }
+      end
+    end,
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+
+        let intensity = |root: &std::path::Path, meta: &store::SessionMeta| -> f64 {
+            stored_state(root, meta)["psyche"]["affects"][0]["intensity"]
+                .as_f64()
+                .unwrap_or(0.0)
+        };
+
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+        let after1 = intensity(&root, &meta);
+        assert!(after1 > 0.5, "轮末已衰减一次但仍强：{after1}");
+
+        simulate_turn(&root, &meta, &loaded, &log, 2, "今天也好。");
+        let (a3, _) = simulate_turn(&root, &meta, &loaded, &log, 3, "嗯。");
+        let after3 = intensity(&root, &meta);
+        assert!(after3 < after1, "应逐轮衰减：{after1} → {after3}");
+        assert!(after3 > 0.2, "三轮后仍应有可测余波：{after3}");
+
+        let b5 = a3
+            .layers
+            .iter()
+            .find(|l| l.id == "B5" && l.name == "内心")
+            .expect("B5「内心」层");
+        assert!(b5.content.contains("喜悦"), "B5 应带上内心摘要：{}", b5.content);
+        assert!(b5.content.contains("小雨"), "摘要应带角色名：{}", b5.content);
+
+        // 面板要的衰减轨迹：每轮都留下采样
+        let hist = stored_state(&root, &meta)["psyche"]["affects"][0]["history"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert!(hist >= 3, "衰减轨迹应随轮次增长：{hist}");
     }
 }

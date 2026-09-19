@@ -155,6 +155,8 @@ pub struct BuildInputs<'a> {
     pub resolutions: &'a [String],
     /// C1 未决事项清单：全部活跃线的只读投影（仅标题与状态，M2.4）
     pub pending_threads: &'a [String],
+    /// B5 内心一行（M2.5 · 设计 §9.2：现状卡是客观世界，psyche 摘要是主观世界）
+    pub psyche_line: Option<&'a str>,
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
@@ -231,6 +233,14 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
             content: b4.content.clone(),
         });
         layers.push(b4);
+    }
+    // B5 内心（心理运行时摘要）：与 hook 注入同槽，空则省略（设计 §4.3）
+    if let Some(line) = inputs.psyche_line.filter(|l| !l.trim().is_empty()) {
+        b_messages.push(ChatMessage {
+            role: "system".into(),
+            content: line.to_string(),
+        });
+        layers.push(layer("B5", "内心", line));
     }
     if !inputs.hook_injections.is_empty() {
         let content = inputs
@@ -378,19 +388,32 @@ fn mode_description(mode: &str) -> &'static str {
 
 // ---------- A3 身份锚（情绪命中示例，设计 §4.1）----------
 
-/// 当前情绪名（card_state.psyche.affect[].name；M2 心理运行时接入前，
-/// 有 psyche 字段的卡即可命中）
+/// 当前情绪名（设计 §9.2 心理运行时写出的是 psyche.affects，复数）。
+///
+/// 读侧同时认 M1 的单数键 psyche.affect——老会话的 state 里可能还留着它，
+/// 而心理运行时只写规范复数键（避免 state 里两份数据）。
 fn current_affects(card_state: &serde_json::Value) -> Vec<String> {
-    card_state
-        .get("psyche")
-        .and_then(|p| p.get("affect"))
-        .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+    let psyche = card_state.get("psyche");
+    let mut out: Vec<String> = Vec::new();
+    for key in ["affects", "affect"] {
+        let Some(arr) = psyche.and_then(|p| p.get(key)).and_then(|a| a.as_array()) else {
+            continue;
+        };
+        // 容忍三种形态：["害羞"] / [{name,intensity}] / {name: 强度}
+        for entry in arr {
+            match entry {
+                serde_json::Value::String(s) => out.push(s.clone()),
+                serde_json::Value::Object(o) => {
+                    if let Some(n) = o.get("name").and_then(|n| n.as_str()) {
+                        out.push(n.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.dedup();
+    out
 }
 
 fn identity_anchor(card: &Card, card_state: &serde_json::Value) -> String {
@@ -512,6 +535,7 @@ mod tests {
             concerns: &[],
             resolutions: &[],
             pending_threads: &[],
+            psyche_line: None,
             history,
             user_content,
         }

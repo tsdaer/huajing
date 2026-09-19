@@ -11,6 +11,7 @@ mod palace;   // 记忆宫殿：记忆对象、召回与视图（M2.1 · 设计 
 mod prompt;   // Prompt Builder 双槽位组装（设计 §4）
 mod psyche;   // 心理运行时：情绪槽、衰减、意图（M2.5 · 设计 §9）
 mod threads;  // 剧情线：生命周期与提及时机（M2.4 · 设计 §8）
+mod statetree; // 状态树：剧情状态机的纯数据与算法（M2.3 · 设计 §7）
 mod stimport; // SillyTavern 角色卡导入（M1.8 · 设计 §13）
 mod store;    // DataHub 明文数据层（设计 §12）
 mod watch;    // DataHub 热加载监听（M1.7）
