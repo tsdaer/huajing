@@ -563,6 +563,8 @@ fn rebuild_from(
 
     let mut out: Vec<LogRecord> = Vec::new();
     let mut proj = event::Projection::default();
+    // 状态树只解析一次（轮末求值与手动收线的补求值共用；每条消息重解析一遍太浪费）
+    let tree = load_tree(loaded, None);
     if !genesis {
         // 老会话补 genesis：初始黑板取当前文件里的那份（M1 没留下更早的黑板）
         let board = blackboard_of(&project(records, root, meta));
@@ -601,8 +603,38 @@ fn rebuild_from(
         let Some(msg) = rec.as_message().cloned() else {
             // 非消息记录：重放点之前的直接折进起点；重放区内的只可能是手动事件
             if rec.turn() < replay_from || !rec.is_derived() {
+                let in_replay_zone = rec.turn() >= replay_from;
                 out.push(rec.clone());
                 event::fold(&mut proj, rec);
+                // 手动收线驱动的转移要随重放重演（M3.0 ⑦）：线事件本身是手动事件
+                // （保留），但它驱动的转移是派生事件（重建丢弃）——钩子重跑不带
+                // thread:<id>:resolved 触发器，编辑历史一次就会把它弄丢。
+                // 这里对着刚折进来的收线事件补求值一次，与 resolve_thread_at ③ 同构；
+                // 重放点之前的收线不补（它驱动的转移记录本来就在 kept 里）。
+                if in_replay_zone {
+                    if let LogBody::Thread(t) = &rec.body {
+                        if t.op == threads::OP_RESOLVE {
+                            if let Some(tree) = tree.as_ref() {
+                                for body in advance_state_tree(
+                                    &proj,
+                                    &character,
+                                    loaded,
+                                    tree,
+                                    t.turn,
+                                    &format!("{}:resolved", t.thread_id),
+                                    None,
+                                    meta.seed,
+                                )
+                                .0
+                                {
+                                    let rec = LogRecord::new(0, body);
+                                    out.push(rec.clone());
+                                    event::fold(&mut proj, &rec);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             continue;
         };
@@ -667,13 +699,13 @@ fn rebuild_from(
                 event::fold(&mut proj, &rec);
             }
             // ⑥ 轮末状态树转移（与 commit_reply 同一份代码 → 重放同一条路径，设计 §7.3-5）
-            if let Some(tree) = load_tree(loaded, None) {
+            if let Some(tree) = tree.as_ref() {
                 // 重放不重推界面事件（编辑历史不该再弹一次表情）
                 for body in advance_state_tree(
                     &proj,
                     &character,
                     loaded,
-                    &tree,
+                    tree,
                     msg.turn,
                     "on_turn_end",
                     None,
@@ -872,15 +904,33 @@ fn memory_objects(
         .filter_map(|v| serde_json::from_value::<palace::MemObject>(v.clone()).ok())
         .collect();
     let base = out.len();
-    // ② 卡内键值事实（api.memory.set）：补见证者与故事时刻，见下方注释
-    out.extend(proj.memory.iter().enumerate().map(|(i, rec)| {
-        let mut obj = palace::from_legacy_fact(&rec.key, &rec.value, &rec.source, rec.turn, rec.ts);
-        obj.id = palace::next_id(base + i + 1);
-        obj.actors = vec![character.to_string()];
-        obj.witnesses = vec![character.to_string()];
-        obj.story_day = now_day;
-        obj
-    }));
+    // ② 卡内键值事实（api.memory.set）：**同 key 的重复写入合并成一条**（最新值），
+    //    次数进 rehearsals（召回打分的「再提及增强」本来就用它，M3.0 ⑥）。
+    //    不合并的话，last_thanked 这类每轮都写的键会以 0.50 显著度逐轮堆条目，
+    //    把 B4 的有效容量稀释掉；读侧（memory_env）也一直是「同 key 后写覆盖」，
+    //    宫殿侧对齐同一语义。value 变了照样只留最新——旧值要靠事件流回放才能看到。
+    let mut fact_writes: std::collections::BTreeMap<&str, (u32, &store::MemRecord)> =
+        std::collections::BTreeMap::new();
+    for rec in &proj.memory {
+        let entry = fact_writes.entry(rec.key.as_str()).or_insert((0, rec));
+        entry.0 += 1;
+        entry.1 = rec;
+    }
+    out.extend(
+        fact_writes
+            .into_values()
+            .enumerate()
+            .map(|(i, (writes, rec))| {
+                let mut obj =
+                    palace::from_legacy_fact(&rec.key, &rec.value, &rec.source, rec.turn, rec.ts);
+                obj.id = palace::next_id(base + i + 1);
+                obj.actors = vec![character.to_string()];
+                obj.witnesses = vec![character.to_string()];
+                obj.story_day = now_day;
+                obj.rehearsals = writes.saturating_sub(1); // 每多写一次 = 多提一次
+                obj
+            }),
+    );
     out
 }
 
@@ -2837,6 +2887,30 @@ fn pick_util_provider(root: &std::path::Path) -> Result<Provider, String> {
         .ok_or_else(|| "未配置可用接入点".to_string())
 }
 
+/// 按轮回放黑板事件，取「第 turn 轮结束时」的故事时间（M3.0 ⑤）。
+///
+/// 批次总结的情景记忆此前一律盖**总结时刻**的章（管线在轮末异步跑，此刻的
+/// 黑板已比事发时刻晚了很多轮）——时间线视图会把它排到错误的桶里，时间衰减
+/// 也从错误的起点开始淡去。这里从事件流里折出第 turn 轮的黑板状态；
+/// 找不到（比 init 还早）则由调用方回退当前黑板。
+fn story_time_at_turn(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    turn: u64,
+) -> Option<(i64, String)> {
+    let records = log.read(root, &meta.id).ok()?;
+    let mut hit: Option<(i64, String)> = None;
+    for r in records.iter() {
+        if let LogBody::Blackboard(b) = &r.body {
+            if b.turn <= turn {
+                hit = Some((b.board.day, b.board.clock.clone()));
+            }
+        }
+    }
+    hit
+}
+
 /// 把总结产物落成事件（与 Tauri 无关，便于单测）：摘要增量、情景记忆、L3 事实、设定提案。
 ///
 /// 一切 LLM 产物都**先落草稿/提案**，注入只认 canon（设计 §6.9）——唯一的例外是 L3 事实与
@@ -2877,13 +2951,18 @@ fn apply_summary_outcome(
         .map(|p| p.episodes.len() + p.memory.len())
         .unwrap_or(0);
     for (i, ep) in outcome.episodes.iter().enumerate() {
+        // 情景记忆盖**事发时刻**的章（M3.0 ⑤）：批次内消息的故事时间从事件流折出，
+        // 而不是管线运行时的当前黑板；事件流里查不到才回退当前（例如 force 总结远古批次）
+        let ep_turn = ep.turns.first().copied().unwrap_or(to_turn);
+        let (ep_day, ep_clock) = story_time_at_turn(log, root, meta, ep_turn)
+            .unwrap_or((story_day, story_clock.to_string()));
         let mut obj = palace::MemObject {
             id: palace::next_id(base + i + 1),
             kind: palace::KIND_EPISODE.to_string(),
             content: ep.content.clone(),
-            turn: ep.turns.first().copied().unwrap_or(to_turn),
-            story_day,
-            story_clock: story_clock.to_string(),
+            turn: ep_turn,
+            story_day: ep_day,
+            story_clock: ep_clock,
             place: ep.place.clone(),
             actors: if ep.actors.is_empty() {
                 vec![character.clone()]
@@ -2916,14 +2995,17 @@ fn apply_summary_outcome(
         )?;
         applied += 1;
     }
+    // L3 事实：批次末的故事时间（事实是批次里学到的，同样不该盖总结时刻的章）
+    let (fact_day, fact_clock) = story_time_at_turn(log, root, meta, to_turn)
+        .unwrap_or((story_day, story_clock.to_string()));
     for (i, fact) in outcome.facts.iter().enumerate() {
         let mut obj = palace::MemObject {
             id: palace::next_id(base + outcome.episodes.len() + i + 1),
             kind: palace::KIND_FACT.to_string(),
             content: format!("{}：{}", fact.key, fact.value),
             turn: to_turn,
-            story_day,
-            story_clock: story_clock.to_string(),
+            story_day: fact_day,
+            story_clock: fact_clock.clone(),
             place: None,
             actors: vec![character.clone()],
             witnesses: vec![character.clone()],
@@ -4604,5 +4686,182 @@ state_tree = {
         );
         let limited = timeline_entries(&log, &root, &meta, Some(1)).unwrap();
         assert_eq!(limited.len(), 1, "limit 应截取最近 N 条");
+    }
+
+    /// M3.0 ⑤：批次总结的情景记忆盖**事发时刻**的故事章，不是总结时刻
+    /// （管线在轮末异步跑，当前黑板可能已经推进了很多天——那不该算到记忆头上）
+    #[test]
+    fn pipeline_episodes_stamp_the_story_time_of_the_event() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+        // 第 1 轮结束：init 20:00 + 步进 10 分钟 = 第 1 天 20:10
+
+        let cx = load_codex(&root, None, "default");
+        let outcome = summarize::sanitize(summarize::SummaryOutcome {
+            summary_delta: String::new(),
+            episodes: vec![summarize::EpisodeDraft {
+                content: "他道了谢，她记住了。".into(),
+                salience: 0.8,
+                emotion: None,
+                place: None,
+                actors: vec!["小雨".into()],
+                witnesses: Vec::new(),
+                links: Vec::new(),
+                thread: None,
+                turns: vec![1],
+            }],
+            facts: vec![summarize::FactDraft {
+                key: "称呼".into(),
+                value: serde_json::json!("朋友"),
+            }],
+            threads: Vec::new(),
+            psyche: Vec::new(),
+            codex: Vec::new(),
+        });
+        // 假装总结发生在很久以后：调用方传来的「当前」黑板已是第 9 天深夜
+        apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, 1, 9, "23:50").unwrap();
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let objects: Vec<palace::MemObject> = proj
+            .episodes
+            .iter()
+            .filter_map(|v| serde_json::from_value::<palace::MemObject>(v.clone()).ok())
+            .collect();
+        let episode = objects
+            .iter()
+            .find(|m| m.kind == palace::KIND_EPISODE)
+            .expect("情景记忆应落宫殿");
+        assert_eq!(episode.turn, 1, "溯源轮次取批次首个轮次");
+        assert_eq!(episode.story_day, 1, "事发在第 1 天，不是总结时的第 9 天");
+        assert_eq!(episode.story_clock, "20:10", "故事时刻取第 1 轮结束时的黑板");
+        let fact = objects
+            .iter()
+            .find(|m| m.kind == palace::KIND_FACT)
+            .expect("L3 事实应落宫殿");
+        assert_eq!(fact.story_day, 1, "L3 事实盖批次末的章，也不是总结时刻");
+    }
+
+    /// M3.0 ⑥：last_thanked 类每轮都写的键值记忆合并成一条（最新值 + rehearsals），
+    /// 不再以 0.50 显著度逐轮堆条目稀释 B4 的有效容量
+    #[test]
+    fn repeated_hook_memory_keys_merge_into_one_object() {
+        let mut proj = event::Projection::default();
+        for (turn, value) in [(1u64, 1u64), (2, 2), (3, 3)] {
+            proj.memory.push(store::MemRecord {
+                kind: "fact".into(),
+                key: "last_thanked".into(),
+                value: serde_json::json!(value),
+                source: "hook.on_message".into(),
+                turn,
+                ts: turn,
+            });
+        }
+        proj.memory.push(store::MemRecord {
+            kind: "fact".into(),
+            key: "borrowed_book".into(),
+            value: serde_json::json!("《城南旧志》"),
+            source: "hook.on_message".into(),
+            turn: 1,
+            ts: 1,
+        });
+
+        let objs = memory_objects(&proj, "小雨", 3);
+        assert_eq!(objs.len(), 2, "两个键、不堆条目：{objs:?}");
+        let thanked = objs
+            .iter()
+            .find(|o| o.links.iter().any(|l| l.contains("last_thanked")))
+            .expect("last_thanked 应在对象里");
+        assert_eq!(thanked.rehearsals, 2, "写了 3 次 = 再提及 2 次（召回打分据此增强）");
+        assert_eq!(thanked.turn, 3, "保留最新一次写入的轮次与值");
+        let other = objs
+            .iter()
+            .find(|o| o.links.iter().any(|l| l.contains("borrowed_book")))
+            .expect("borrowed_book 应在对象里");
+        assert_eq!(other.rehearsals, 0, "只写一次的键没有再提及加成");
+    }
+
+    /// M3.0 ⑦：编辑历史后，「收线驱动的转移」仍在——重放对着保留的手动线事件
+    /// 补求值一次（与 resolve_thread_at ③ 同构），不因钩子重跑不带该触发器而丢失
+    #[test]
+    fn editing_history_keeps_thread_resolution_driven_transition() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '轻松日常。',
+        transitions = {
+          { to = '释然', priority = 5, when = 'event:thread.周五还书:resolved' },
+        },
+      },
+      ['释然'] = { parent = '日常', directive = '事情说开了。' },
+    },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+
+        // 手动开线 → 收线：转移由 thread:resolved 事件驱动，落进事件流
+        open_thread_at(
+            &log,
+            &root,
+            &meta,
+            "周五还书",
+            "玩家忘带借书卡。",
+            &["小雨".into()],
+            Some(0.8),
+        )
+        .unwrap();
+        let cache = TreeCache::default();
+        let runtime = SessionRuntime::default();
+        resolve_thread_at(
+            &log,
+            &root,
+            &meta,
+            "thread.周五还书",
+            "玩家如约还书。",
+            &cache,
+            &runtime,
+        )
+        .unwrap();
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let driven: Vec<&event::TransitionEvent> = proj
+            .transitions
+            .iter()
+            .filter(|t| t.to == vec!["日常".to_string(), "释然".to_string()])
+            .collect();
+        assert_eq!(driven.len(), 1, "收线应恰好驱动一次转移：{:?}", proj.transitions);
+
+        // 编辑第 1 轮的用户消息 → 重建：线事件是手动事件（保留），它驱动的转移是
+        // 派生事件（丢弃）——重放必须对着线事件补求值，把转移长回来
+        let records = log.read(&root, &meta.id).unwrap();
+        let (pos, turn) = locate_message(&records, 1).expect("第 1 条消息");
+        let mut edited = records.as_ref().clone();
+        if let LogBody::Message(m) = &mut edited[pos].body {
+            m.content = "（改写过的）今天好冷。".into();
+        }
+        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn).unwrap();
+        log.rewrite(&root, &meta.id, &rebuilt).unwrap();
+        sync_now(&log, &root, &meta).unwrap();
+
+        let proj2 = project_session(&log, &root, &meta).unwrap();
+        let driven2: Vec<&event::TransitionEvent> = proj2
+            .transitions
+            .iter()
+            .filter(|t| t.to == vec!["日常".to_string(), "释然".to_string()])
+            .collect();
+        assert_eq!(
+            driven2.len(),
+            1,
+            "编辑后收线驱动的转移应原样保留（不丢失、不翻倍）：{:?}",
+            proj2.transitions
+        );
     }
 }
