@@ -701,6 +701,11 @@ const B3_MAX_CARDS: usize = 12;
 const B4_TOP_K: usize = 6;
 /// 设定集别名扫描窗口（设计 §6.3：默认最近 16 条消息）
 const SCAN_WINDOW_MESSAGES: usize = 16;
+
+/// 一次总结调用最多消化的消息数（批次分块；积压再大也按最老的先补，见 run_summary）。
+/// 16 条：真机压测（2026-09-20，deepseek-flash）显示 40 条时推理 token 就能把
+/// 8k 输出预算耗尽——批次越小，六类产物的正文越有把握写完。
+const SUMMARY_CHUNK: usize = 16;
 /// 滞回轮数（设计 §6.3：实体激活后保持 N 轮再退场）
 const CODEX_HOLD_ROUNDS: u32 = 3;
 
@@ -746,7 +751,7 @@ fn world_fingerprint(dir: &std::path::Path) -> u64 {
 pub struct CodexCache(Mutex<HashMap<String, (u64, Arc<codex::Codex>)>>);
 
 /// 逐文件解析实体：.lua 走沙箱（设计 §6.2 双格式），坏文件跳过并留诊断，不让一个手滑的文件瘫痪整局
-fn parse_entities(dir: &std::path::Path) -> Vec<codex::CodexEntity> {
+pub(crate) fn parse_entities(dir: &std::path::Path) -> Vec<codex::CodexEntity> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -1520,9 +1525,13 @@ fn spawn_summary(root: &std::path::Path, session_id: &str, flags: &SummaryFlags)
     }
     let root = root.to_path_buf();
     let session_id = session_id.to_string();
-    // 后台任务用自己的 EventLog 实例（读盘 + 追加；主缓存靠字节偏移自动跟上）
+    let flags = flags.clone();
+    // 后台任务用自己的 EventLog 实例（读盘 + 追加；主缓存靠字节偏移自动跟上）。
+    // 无论成败都要释放标记：不释放的话，第一次失败后这个会话的总结就永远不再触发。
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_summary(root, session_id, false).await {
+        let outcome = run_summary(root, session_id.clone(), false).await;
+        flags.end(&session_id);
+        if let Err(e) = outcome {
             crate::diag::record("summary", format!("总结失败：{e}"));
         }
     });
@@ -2636,9 +2645,10 @@ pub fn inspector_data(
 
 // ---------- M2.6 自动总结管线（设计 §5.3：滑出 L0 窗口的批次 → 六类产物）----------
 
-/// 管线在跑的会话（防同一会话并发总结：两次重叠的调用会总结出重复的记忆）
-#[derive(Default)]
-pub struct SummaryFlags(Mutex<std::collections::HashSet<String>>);
+/// 管线在跑的会话（防同一会话并发总结：两次重叠的调用会总结出重复的记忆）。
+/// Arc 包一层：后台任务结束时要在 spawn 里释放标记（否则一次失败后管线永久停摆）。
+#[derive(Clone, Default)]
+pub struct SummaryFlags(std::sync::Arc<Mutex<std::collections::HashSet<String>>>);
 
 impl SummaryFlags {
     fn begin(&self, session_id: &str) -> bool {
@@ -2939,7 +2949,7 @@ async fn run_summary(
     let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
     let proj = project_session(&log, &root, &meta)?;
 
-    let (batch, to_turn) = match summary_batch(&proj) {
+    let (mut batch, mut to_turn) = match summary_batch(&proj) {
         Some(b) => b,
         None if !force => return Ok("没有待总结的批次".into()),
         None => {
@@ -2958,6 +2968,14 @@ async fn run_summary(
             (batch, to_turn)
         }
     };
+    // 批次分块：一次失败的总结会让积压越滚越大（从未总结的消息全堆进下一次调用），
+    // 推理型模型的思考 token 随批单调涨——直到永远挤不出正文（真机压测 2026-09-20
+    // 复现：首批成功后一次失败，此后 4 连败全为空正文）。每次只消化最老的
+    // SUMMARY_CHUNK 条，剩下的留给下一轮末继续补，失败也永远有进度。
+    if batch.len() > SUMMARY_CHUNK {
+        batch.truncate(SUMMARY_CHUNK);
+        to_turn = batch.iter().map(|m| m.turn).max().unwrap_or(0);
+    }
     let from_turn = batch.iter().map(|m| m.turn).min().unwrap_or(0);
 
     let provider = pick_util_provider(&root)?;
@@ -2993,7 +3011,10 @@ async fn run_summary(
             role: "user".into(),
             content: prompt_text,
         }],
-        1600,
+        // 推理型模型的思考 token 计入 max_tokens：给太小会「正文为空、全部耗在思考上」
+        //（真机压测 2026-09-20：deepseek-flash 在 1600 下稳定返回空正文）。六类产物
+        // 的 JSON 本体 + 思考各需 2–4k，8192 才留得住正文；批次本身另有 16 条的分块封顶。
+        8192,
         0.3,
         proxy.as_deref(),
     )

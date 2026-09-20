@@ -10,6 +10,8 @@ mod llm;      // OpenAI 兼容 SSE 客户端（设计 §11）
 mod palace;   // 记忆宫殿：记忆对象、召回与视图（M2.1 · 设计 §5）
 mod prompt;   // Prompt Builder 双槽位组装（设计 §4）
 mod psyche;   // 心理运行时：情绪槽、衰减、意图（M2.5 · 设计 §9）
+#[cfg(test)]
+mod smoke_datahub; // DataHub 资产冒烟测试：仓库示例卡与设定集的守卫（设计 §12）
 mod threads;  // 剧情线：生命周期与提及时机（M2.4 · 设计 §8）
 mod statetree; // 状态树：剧情状态机的纯数据与算法（M2.3 · 设计 §7）
 mod stimport; // SillyTavern 角色卡导入（M1.8 · 设计 §13）

@@ -1,4 +1,5 @@
-# 界面与全局配置
 locale = "zh-CN"
-theme = "im"            # IM 聊天风打底（galgame 皮肤后续叠加）
-narrative_mode = "台词体" # 台词体 / 小说体 / 独白体
+theme = "im"
+narrative_mode = "台词体"
+wizard_done = true
+
