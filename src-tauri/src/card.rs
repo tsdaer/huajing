@@ -1343,6 +1343,7 @@ return {
 
     fn msg(content: &str) -> Message {
         Message {
+        name: None,
             turn: 1,
             role: "user".into(),
             content: content.into(),

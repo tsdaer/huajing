@@ -254,6 +254,17 @@ const streamText = ref("");
 const editingIndex = ref(-1);
 const editDraft = ref("");
 
+// ---------- M3.1 群聊：发言人选择（多角色时对谁说话；1v1 恒主角色） ----------
+const speakers = computed(() => props.meta.characters);
+const speaker = ref("");
+watch(
+  speakers,
+  (list) => {
+    if (!list.includes(speaker.value)) speaker.value = list[0] ?? "";
+  },
+  { immediate: true },
+);
+
 const streamEl = ref<HTMLElement | null>(null);
 const composerEl = ref<HTMLTextAreaElement | null>(null);
 
@@ -301,7 +312,7 @@ watch(pageCount, (n) => {
 
 function whoFor(m: Message): string {
   if (m.role === "user") return props.meta.persona || "我";
-  if (m.role === "char") return cardName.value;
+  if (m.role === "char") return m.name || cardName.value;
   return "系统";
 }
 
@@ -437,7 +448,7 @@ async function send() {
   void jumpToLastPage();
   let final: StreamEvent;
   try {
-    final = await api.sendMessage(props.meta.id, content, onDelta);
+    final = await api.sendMessage(props.meta.id, content, onDelta, speaker.value || undefined);
   } catch (e) {
     final = { event: "error", message: String(e) };
   }
@@ -633,6 +644,14 @@ watch(cardGeneration, () => {
         <div class="min-w-0 flex-1">
           <div class="flex items-center gap-2">
             <h2 class="truncate text-base font-semibold">{{ cardName }}</h2>
+            <!-- 群聊阵容（M3.1）：主角色之外还有谁同台 -->
+            <span
+              v-if="speakers.length > 1"
+              class="badge badge-xs badge-soft tooltip tooltip-bottom"
+              :data-tip="`多角色会话：按角色隔离组装（设计 §10.2），输入框上方选择对谁说话`"
+            >
+              +{{ speakers.length - 1 }} 同台
+            </span>
             <span class="status status-xs status-success"></span>
             <span class="text-xs text-base-content/50">{{ generating ? "生成中" : "在场" }}</span>
             <!-- 表情位占位（M1.6）：卡片 api.ui.emit("emotion", …) 的结果 -->
@@ -794,15 +813,30 @@ watch(cardGeneration, () => {
           </div>
         </div>
 
-        <!-- 输入区：daisyUI textarea + 圆形发送键 -->
+        <!-- 输入区：daisyUI textarea + 圆形发送键；多角色时带发言人选择（M3.1 隔离模式） -->
         <form class="flex-none border-t border-base-300 p-3" @submit.prevent="send">
+          <div v-if="speakers.length > 1" class="mb-2 flex flex-wrap items-center gap-1.5">
+            <span class="text-[11px] text-base-content/45">对谁说</span>
+            <div role="tablist" class="tabs tabs-box tabs-xs">
+              <button
+                v-for="dir in speakers"
+                :key="dir"
+                role="tab"
+                class="tab"
+                :class="{ 'tab-active': speaker === dir }"
+                @click="speaker = dir"
+              >
+                {{ dir }}
+              </button>
+            </div>
+          </div>
           <div class="flex items-end gap-2">
             <textarea
               ref="composerEl"
               class="textarea max-h-40 w-full flex-1 resize-none leading-relaxed"
               v-model="draft"
               rows="1"
-              placeholder="说点什么…"
+              :placeholder="speakers.length > 1 ? `对${speaker || '谁'}说点什么…` : '说点什么…'"
               aria-label="消息输入框"
               @keydown="onComposerKeydown"
               @input="autoGrow"

@@ -69,6 +69,9 @@ pub struct TransitionEvent {
     pub to: Vec<String>,
     /// 命中的转移说明（哪个状态的哪条 when）
     pub reason: String,
+    /// 谁的状态树转移了（M3.1 按角色隔离；缺省 = 旧会话的单角色）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character: Option<String>,
     pub ts: u64,
 }
 
@@ -104,6 +107,10 @@ pub struct CodexEvent {
     pub value: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// 见证者（M3.1 · 设计 §10.4）：reveal 只对名单里的角色生效——「某些人知道的事」。
+    /// 空 = 全局知情（旧事件与公开设定的兼容语义）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witnesses: Vec<String>,
     pub ts: u64,
 }
 
@@ -413,8 +420,11 @@ pub struct Projection {
     /// 线 id → 当前快照（后写覆盖）
     pub threads: BTreeMap<String, serde_json::Value>,
     pub thread_log: Vec<ThreadEvent>,
-    /// 秘密揭示集（"实体.秘密" 路径）
+    /// 秘密揭示集（"实体.秘密" 路径）——全局知情（无见证者的 reveal，兼容旧事件流）
     pub known: std::collections::BTreeSet<String>,
+    /// 见证者视角的揭示集（M3.1 · 设计 §10.4）：角色 → 只对她揭示的路径。
+    /// 组装视角的有效知情集 = known ∪ known_of[视角]（[Projection::known_for]）
+    pub known_of: BTreeMap<String, std::collections::BTreeSet<String>>,
     pub codex_log: Vec<CodexEvent>,
     /// L1 滚动摘要（summary 事件按序拼接，设计 §5.3）
     pub summary: String,
@@ -436,6 +446,15 @@ impl Projection {
     /// 最近一条消息
     pub fn last_message(&self) -> Option<&Message> {
         self.messages.last()
+    }
+
+    /// 某个组装视角的有效知情集：全局揭示 ∪ 只对她的揭示（M3.1 视角化）
+    pub fn known_for(&self, character: &str) -> std::collections::BTreeSet<String> {
+        let mut set = self.known.clone();
+        if let Some(extra) = self.known_of.get(character) {
+            set.extend(extra.iter().cloned());
+        }
+        set
     }
 }
 
@@ -508,10 +527,23 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
         LogBody::Codex(c) => {
             match c.op.as_str() {
                 "reveal" => {
-                    p.known.insert(c.target.clone());
+                    if c.witnesses.is_empty() {
+                        p.known.insert(c.target.clone());
+                    } else {
+                        // 见证者视角的揭示（M3.1）：只有名单里的角色知道——串台隔离的数据基础
+                        for w in &c.witnesses {
+                            p.known_of
+                                .entry(w.clone())
+                                .or_default()
+                                .insert(c.target.clone());
+                        }
+                    }
                 }
                 "retract" => {
                     p.known.remove(&c.target);
+                    for set in p.known_of.values_mut() {
+                        set.remove(&c.target);
+                    }
                 }
                 _ => {}
             }
@@ -630,6 +662,7 @@ mod tests {
 
     fn msg(turn: u64, role: &str, content: &str) -> Message {
         Message {
+        name: None,
             turn,
             role: role.into(),
             content: content.into(),
@@ -709,6 +742,7 @@ mod tests {
                 ts: 9,
             }),
             LogBody::Transition(TransitionEvent {
+            character: None,
                 turn: 2,
                 from: vec!["日常".into()],
                 to: vec!["日常".into(), "日常.夜谈".into()],
@@ -725,6 +759,7 @@ mod tests {
                 ts: 9,
             }),
             LogBody::Codex(CodexEvent {
+            witnesses: Vec::new(),
                 turn: 2,
                 op: "reveal".into(),
                 target: "char.小雨.secrets.工作牌".into(),
@@ -964,6 +999,7 @@ mod tests {
         records.push(LogRecord::new(
             0,
             LogBody::Codex(CodexEvent {
+            witnesses: Vec::new(),
                 turn: 1,
                 op: "reveal".into(),
                 target: "char.小雨.secrets.工作牌".into(),
@@ -979,6 +1015,7 @@ mod tests {
         records.push(LogRecord::new(
             0,
             LogBody::Codex(CodexEvent {
+            witnesses: Vec::new(),
                 turn: 2,
                 op: "retract".into(),
                 target: "char.小雨.secrets.工作牌".into(),

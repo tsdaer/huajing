@@ -1880,6 +1880,7 @@ mod tests {
     #[test]
     fn batch_message_converts_from_store_message() {
         let m = crate::store::Message {
+        name: None,
             turn: 7,
             role: "char".into(),
             content: "她笑了笑。".into(),

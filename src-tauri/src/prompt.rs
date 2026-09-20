@@ -256,6 +256,8 @@ pub struct BuildInputs<'a> {
     pub directive: Option<&'a str>,
     /// C1 滚动摘要（M2.6 · 设计 §5.3：总结管线产出的编年史体梗概，空则省略）
     pub summary: Option<&'a str>,
+    /// 隔离模式的「只扮演 X」提示（M3.1 · 设计 §10.2；单角色为 None，A1 不变）
+    pub cast_note: Option<&'a str>,
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
@@ -288,10 +290,15 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     // ② 余量按头部顺序（A1 → A2 → A3）回补，于是排最后的 A3 是第一个被截断的
     //    （§4.1「示例对话……截断至预算」）。
     let a_limit = budget.limit("A");
+    // A1 = 全局契约 + 隔离提示（多角色时「你只扮演 X」，设计 §10.2；单角色无追加）
+    let a1_text = match inputs.cast_note {
+        Some(note) => format!("{}\n\n{}", global_contract(&inputs.settings.narrative_mode), note),
+        None => global_contract(&inputs.settings.narrative_mode),
+    };
     let mut a_parts: Vec<(&'static str, &'static str, String)> = vec![(
         "A1",
         "全局契约",
-        global_contract(&inputs.settings.narrative_mode),
+        a1_text,
     )];
     let a2 = inputs
         .persona
@@ -1116,6 +1123,7 @@ mod tests {
 
     fn msg(role: &str, content: &str, turn: u64) -> Message {
         Message {
+        name: None,
             turn,
             role: role.into(),
             content: content.into(),
@@ -1135,6 +1143,7 @@ mod tests {
         user_content: Option<&'a str>,
     ) -> BuildInputs<'a> {
         BuildInputs {
+        cast_note: None,
             settings,
             persona,
             card,

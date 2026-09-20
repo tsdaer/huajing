@@ -292,6 +292,9 @@ pub struct Message {
     /// 场景分段标识（M1 恒为单场景，可缺省）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene_id: Option<String>,
+    /// 这条消息是谁说的（M3.1 群聊：char 消息的角色署名；缺省 = 会话首个角色）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// 黑板 v0（设计 §4.1 B1 的数据源；UI 可手动编辑，每轮时钟步进）
@@ -431,6 +434,8 @@ pub fn read_memory_records(root: &Path, session_id: &str) -> StoreResult<Vec<Mem
 
 pub struct NewSessionRequest {
     pub character: String,
+    /// 角色阵容（M3.1 群聊；空 = 单角色，取 character；首个是主角色/默认发言人）
+    pub characters: Vec<String>,
     pub persona: Option<String>,
     pub day: Option<i64>,
     pub clock: Option<String>,
@@ -446,10 +451,17 @@ pub fn session_dir(root: &Path, id: &str) -> PathBuf {
 pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionMeta> {
     ensure_layout(root)?;
     let now_secs = unix_now();
+    // 角色阵容：显式给的全量用（去重、保序、主角色在前），没给就退回单角色
+    let mut cast: Vec<String> = if req.characters.is_empty() {
+        vec![req.character.clone()]
+    } else {
+        req.characters.clone()
+    };
+    cast.dedup();
     let meta = SessionMeta {
         id: session_id(now_secs),
         created_at: iso8601(now_secs),
-        characters: vec![req.character.clone()],
+        characters: cast.clone(),
         persona: req.persona.clone(),
         world: None,
         seed: seed_now(),
@@ -469,7 +481,7 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         day: req.day.unwrap_or(1),
         clock: req.clock.clone().unwrap_or_default(),
         place: req.place.clone().unwrap_or_default(),
-        actors: vec![req.character.clone()],
+        actors: cast,
         extra: std::collections::BTreeMap::new(),
     };
     std::fs::write(
@@ -985,6 +997,7 @@ mod tests {
         let meta = new_session(
             &root,
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: Some(1),
@@ -1013,7 +1026,7 @@ mod tests {
             log.append(
                 &root,
                 &meta.id,
-                &Message { turn, role: "user".into(), content: text.into(), ts: 0, scene_id: None },
+                &Message { turn, role: "user".into(), content: text.into(), ts: 0, scene_id: None, name: None },
             )
             .unwrap();
             let msgs = read_messages(&root, &meta.id).unwrap();
@@ -1062,6 +1075,7 @@ mod tests {
         let meta = new_session(
             root.path(),
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: Some("夜读者".into()),
                 day: Some(3),
@@ -1089,6 +1103,7 @@ mod tests {
             root.path(),
             &meta.id,
             &Message {
+            name: None,
                 turn: 1,
                 role: "user".into(),
                 content: "今天好冷。".into(),
@@ -1101,6 +1116,7 @@ mod tests {
             root.path(),
             &meta.id,
             &Message {
+            name: None,
                 turn: 1,
                 role: "char".into(),
                 content: "……嗯。".into(),
@@ -1119,6 +1135,7 @@ mod tests {
         let another = new_session(
             root.path(),
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: None,
@@ -1141,6 +1158,7 @@ mod tests {
         let meta = new_session(
             root.path(),
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: None,
@@ -1209,6 +1227,7 @@ mod tests {
         let meta = new_session(
             root.path(),
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: None,
@@ -1224,6 +1243,7 @@ mod tests {
             root.path(),
             &meta.id,
             &Message {
+            name: None,
                 turn: 1,
                 role: "user".into(),
                 content: "你好".into(),
@@ -1242,6 +1262,7 @@ mod tests {
             root.path(),
             &meta.id,
             &Message {
+            name: None,
                 turn: 1,
                 role: "char".into(),
                 content: "……嗯。".into(),
@@ -1267,6 +1288,7 @@ mod tests {
         let meta = new_session(
             root.path(),
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: None,
@@ -1281,6 +1303,7 @@ mod tests {
             root.path(),
             &meta.id,
             &Message {
+            name: None,
                 turn: 1,
                 role: "user".into(),
                 content: "第一条".into(),
@@ -1311,6 +1334,7 @@ mod tests {
         let meta = new_session(
             root.path(),
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: None,
@@ -1326,6 +1350,7 @@ mod tests {
                 root.path(),
                 &meta.id,
                 &Message {
+                name: None,
                     turn: i + 1,
                     role: "user".into(),
                     content: format!("m{i}"),
@@ -1355,6 +1380,7 @@ mod tests {
         let meta = new_session(
             root.path(),
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: None,
@@ -1370,6 +1396,7 @@ mod tests {
                 root.path(),
                 &meta.id,
                 &Message {
+                name: None,
                     turn: 1,
                     role: "user".into(),
                     content: format!("原文{i}"),
@@ -1421,6 +1448,7 @@ mod tests {
             root.path(),
             &meta.id,
             &Message {
+            name: None,
                 turn: 2,
                 role: "char".into(),
                 content: "新回复".into(),
@@ -1443,6 +1471,7 @@ mod tests {
         let meta = new_session(
             root.path(),
             &NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: None,
@@ -1459,6 +1488,7 @@ mod tests {
                 root.path(),
                 &meta.id,
                 &Message {
+                name: None,
                     turn: i as u64 / 2 + 1,
                     role: if i % 2 == 0 { "user" } else { "char" }.into(),
                     content: format!("消息正文 {:064}", i), // ~100B/行

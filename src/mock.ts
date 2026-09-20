@@ -331,14 +331,16 @@ export function setupMock() {
             seed: 42,
           } satisfies SessionMeta,
         ];
-      case "new_session":
+      case "new_session": {
+        const q = args as { characters?: string[] };
         return {
           id: sessionId,
           created_at: "2026-09-19T10:15:00Z",
-          characters: ["小雨"],
+          characters: q.characters?.length ? q.characters : ["小雨"],
           persona: "夜读者",
           seed: 42,
         } satisfies SessionMeta;
+      }
       case "read_messages":
         return messages;
       case "edit_message": {
@@ -350,6 +352,7 @@ export function setupMock() {
         return messages;
       }
       case "send_message": {
+        // speaker（M3.1 群聊）：mock 里不影响生成内容，只透传
         const turn = (messages[messages.length - 1]?.turn ?? 0) + 1;
         messages.push({ turn, role: "user", content: a.content!, ts: Math.floor(Date.now() / 1000) });
         return streamReply(messages, a.content!, a.onEvent, timers, sessionId);

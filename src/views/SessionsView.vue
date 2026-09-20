@@ -25,6 +25,8 @@ const newEl = ref<HTMLDialogElement | null>(null);
 
 const form = reactive({
   character: "",
+  /** 群聊阵容（M3.1）：勾选的目录名；空 = 只用主角色 */
+  extra: [] as string[],
   persona: "",
   day: 1,
   clock: "",
@@ -48,6 +50,14 @@ async function loadCardsAndPersonas() {
   }
 }
 
+/** 主角色切换时把它从「同台」勾选里摘掉（不能自己陪自己） */
+watch(
+  () => form.character,
+  (main) => {
+    form.extra = form.extra.filter((d) => d !== main);
+  },
+);
+
 // 导入完成（应用级弹窗发出）：卡片清单变了，新建会话的下拉要跟上
 watch(cardGeneration, () => void loadCardsAndPersonas());
 
@@ -65,8 +75,10 @@ async function create() {
     return;
   }
   try {
+    const characters = [form.character, ...form.extra];
     const meta = await api.newSession({
       character: form.character,
+      characters: characters.length > 1 ? characters : undefined,
       persona: form.persona || undefined,
       day: form.day || undefined,
       clock: form.clock || undefined,
@@ -122,6 +134,20 @@ async function create() {
                 {{ c.name }}{{ c.degraded ? "（降级）" : "" }}
               </option>
             </select>
+          </div>
+          <!-- 群聊阵容（M3.1）：勾选同台角色——多角色会话按角色隔离组装 -->
+          <div v-if="cards.length > 1">
+            <span class="label">同台角色（群聊，可多选）</span>
+            <div class="flex flex-wrap gap-x-4 gap-y-1 rounded-box bg-base-200 px-3 py-2">
+              <label
+                v-for="c in cards.filter((x) => x.dir_name !== form.character)"
+                :key="c.dir_name"
+                class="flex cursor-pointer items-center gap-1.5 text-xs"
+              >
+                <input type="checkbox" class="checkbox checkbox-xs" :value="c.dir_name" v-model="form.extra" />
+                {{ c.name }}{{ c.degraded ? "（降级）" : "" }}
+              </label>
+            </div>
           </div>
           <div>
             <label class="label" for="new-persona">用户人格</label>

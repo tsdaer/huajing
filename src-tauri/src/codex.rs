@@ -1011,6 +1011,9 @@ pub struct ActivationContext<'a> {
     pub clock: &'a str,
     /// 黑板快照：live 取值 + variants/when 条件 + {{bb.*}} 占位符
     pub blackboard: &'a BTreeMap<String, Value>,
+    /// 组装视角（M3.1 · 设计 §10.4）：深卡秘密按「她是否知情」判定——
+    /// known_by 名单含她（她自己一直知道）、或她的揭示集里有该路径（经历过 reveal）
+    pub viewer: &'a str,
 }
 
 /// 一张注入卡（检查器逐层可见：激活原因、深度、token）
@@ -1352,12 +1355,16 @@ fn place_contains(e: &CodexEntity, place: &str) -> bool {
 // ---------- 秘密可见性（§6.3 深卡 / §6.4 reveal）----------
 
 /// 当前视角是否知情（决定深卡里是否出现该秘密）：
-/// 1. known_by 含 "*" → 不设限；
-/// 2. ctx.known 命中路径（实体.secrets.秘密 或 实体.秘密）；
+/// 1. known_by 含 "*" → 不设限；含**本视角** → 她一直知道（自己的秘密无需 reveal）；
+/// 2. ctx.known 命中路径（实体.secrets.秘密 或 实体.秘密）——视角化的揭示集；
 /// 3. 本轮 reveal 命中该秘密路径 / 命中其 revealed_by 声明值；
 /// 4. 本轮 reveal 命中实体本身且该秘密 known_by 为空（公开秘密）。
 fn secret_visible(e: &CodexEntity, name: &str, s: &Secret, ctx: &ActivationContext<'_>) -> bool {
-    if s.known_by.iter().any(|k| k.trim() == SECRET_KNOWN_BY_ANY) {
+    if s
+        .known_by
+        .iter()
+        .any(|k| k.trim() == SECRET_KNOWN_BY_ANY || eq_fold(k, ctx.viewer))
+    {
         return true;
     }
     let p1 = format!("{}.secrets.{}", e.id, name);
@@ -1386,6 +1393,16 @@ fn known_secrets(e: &CodexEntity, ctx: &ActivationContext<'_>) -> Vec<String> {
         .filter(|(name, s)| secret_visible(e, name, s, ctx))
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// 该实体的秘密是否在**当前视角的揭示集**里（她经历过那次 reveal——
+/// 区别于先天的 known_by 名单：见证过的要升深卡，天生的只做门控）
+fn witnessed_secret(e: &CodexEntity, ctx: &ActivationContext<'_>) -> bool {
+    e.secrets.keys().any(|name| {
+        let p1 = format!("{}.secrets.{}", e.id, name);
+        let p2 = format!("{}.{}", e.id, name);
+        ctx.known.contains(&p1) || ctx.known.contains(&p2)
+    })
 }
 
 impl Codex {
@@ -1496,6 +1513,22 @@ impl Codex {
                 continue;
             }
             bump(&mut hits, i, W_CONSTANT, Depth::Card, "常驻".to_string());
+        }
+
+        // ---- 源 3b：已知秘密升级（M3.1 · 设计 §6.3 深卡）：实体已被剧情激活、
+        //      且**当前视角的揭示集**里有它的秘密路径（她经历过那次 reveal）→ 升深卡。
+        //      只升级、不激活——知道秘密不等于每轮都要想起它；先天的 known_by 名单
+        //      （她一直知道自己的秘密）不触发升级，仍只做深卡门控（M2 的预算语义）；
+        //      预算挤占由既有降级阶梯兜底（深卡→卡片→1 行→裁撤）。
+        for (&i, h) in hits.iter_mut() {
+            let e = &self.entities[i];
+            if e.secrets.is_empty() {
+                continue;
+            }
+            if h.depth < Depth::Deep && witnessed_secret(e, ctx) {
+                h.depth = Depth::Deep;
+                h.reasons.push("已知:该视角经历过揭示".to_string());
+            }
         }
 
         // ---- 源 1：提及（权重 1）→ 1 行 ----
@@ -2061,6 +2094,7 @@ mod tests {
         clock: String,
         hold_rounds: u32,
         bb: BTreeMap<String, Value>,
+        viewer: String,
     }
 
     impl Cx {
@@ -2076,7 +2110,13 @@ mod tests {
                 clock: "20:00".into(),
                 hold_rounds: 3,
                 bb: BTreeMap::new(),
+                viewer: "小雨".into(),
             }
+        }
+        /// 切换组装视角（M3.1 视角化用例）
+        fn as_viewer(mut self, v: &str) -> Cx {
+            self.viewer = v.into();
+            self
         }
         fn place(mut self, p: &str) -> Cx {
             self.place = Some(p.into());
@@ -2126,6 +2166,7 @@ mod tests {
                 day: self.day,
                 clock: &self.clock,
                 blackboard: &self.bb,
+                viewer: &self.viewer,
             }
         }
     }

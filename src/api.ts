@@ -27,6 +27,8 @@ import type {
 
 export type NewSessionOptions = {
   character: string;
+  /** 角色阵容（M3.1 群聊）：空/缺省 = 单角色；首个是主角色（默认发言人） */
+  characters?: string[];
   persona?: string;
   day?: number;
   clock?: string;
@@ -70,11 +72,12 @@ export const api = {
   deleteMessage: (sessionId: string, index: number) =>
     invoke<Message[]>("delete_message", { sessionId, index }),
 
-  /** 发送消息并流式接收（delta/done/error 经 onEvent 推送；返回值为终态事件） */
-  sendMessage: (sessionId: string, content: string, onEvent: (e: StreamEvent) => void) => {
+  /** 发送消息并流式接收（delta/done/error 经 onEvent 推送；返回值为终态事件）；
+   *  speaker（群聊）：本轮由谁回应，缺省主角色——多角色时组装取她的隔离视角 */
+  sendMessage: (sessionId: string, content: string, onEvent: (e: StreamEvent) => void, speaker?: string) => {
     const channel = new Channel<StreamEvent>();
     channel.onmessage = onEvent;
-    return invoke<StreamEvent>("send_message", { sessionId, content, onEvent: channel });
+    return invoke<StreamEvent>("send_message", { sessionId, content, speaker, onEvent: channel });
   },
   /** 重roll：移除末尾角色回复并重新流式生成（流事件同 sendMessage） */
   regenerate: (sessionId: string, onEvent: (e: StreamEvent) => void) => {

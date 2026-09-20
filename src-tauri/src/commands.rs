@@ -174,6 +174,7 @@ pub fn get_card(dir_name: String) -> Result<card::CardDetail, String> {
 pub fn new_session(
     app: AppHandle,
     character: String,
+    characters: Option<Vec<String>>,
     persona: Option<String>,
     day: Option<i64>,
     clock: Option<String>,
@@ -182,8 +183,14 @@ pub fn new_session(
     log: State<'_, store::EventLog>,
 ) -> Result<store::SessionMeta, String> {
     let root = root();
+    // 角色阵容（M3.1）：显式给的全量用（首个是主角色），没给就单角色——1v1 行为不变
+    let mut cast = characters.unwrap_or_default();
+    if !cast.contains(&character) {
+        cast.insert(0, character.clone());
+    }
     let req = NewSessionRequest {
         character,
+        characters: cast,
         persona,
         day,
         clock,
@@ -207,9 +214,13 @@ pub fn new_session(
     )
     .map_err(|e| e.to_string())?;
 
-    // first_mes 开场白：turn 0 的角色消息（设计 §3；卡片读取失败不阻塞建会话）
-    if let Some(dir) = meta.characters.first() {
-        if let Ok(loaded) = card::load_card(&root, dir) {
+    // 全阵容入席（M3.1）：每张卡都跑 on_load（state 就位、初始化记忆/黑板写入）；
+    // 开场白只取主角色（群聊的开场调度是 M3.4 导演的事）
+    for dir in &meta.characters {
+        let Ok(loaded) = card::load_card(&root, dir) else {
+            continue; // 卡片读取失败不阻塞建会话（M1 起的行为）
+        };
+        if dir == meta.characters.first().expect("阵容非空") {
             let first = loaded.card.first_mes.trim();
             if !first.is_empty() {
                 let opening = Message {
@@ -218,15 +229,23 @@ pub fn new_session(
                     content: first.to_string(),
                     ts: store::unix_now(),
                     scene_id: None,
+                    name: Some(display_name_of(&loaded)),
                 };
                 let _ = log.append(&root, &meta.id, LogBody::Message(opening));
             }
-            // on_load：角色入席（设计 §3「生命周期钩子」）——state 就位、
-            // 卡内可能顺手初始化黑板与长期记忆
-            run_load_hook(&app, &root, &meta, &loaded, &log, "hook.on_load")?;
         }
+        run_load_hook(&app, &root, &meta, &loaded, &log, "hook.on_load")?;
     }
     Ok(meta)
+}
+
+/// 卡的显示名（目录名兜底；消息署名与界面用）
+fn display_name_of(loaded: &card::LoadedCard) -> String {
+    if loaded.card.name.trim().is_empty() {
+        loaded.dir_name.clone()
+    } else {
+        loaded.card.name.clone()
+    }
 }
 
 // ---------- 事件流：投影 / 派生文件 / 重放（M2.0 · 设计 §7.3「可回放」）----------
@@ -237,6 +256,72 @@ fn first_character(meta: &store::SessionMeta) -> Result<String, String> {
         .first()
         .cloned()
         .ok_or_else(|| "会话未配置角色".to_string())
+}
+
+/// 角色阵容的一个成员：目录名 + 已装载卡
+pub struct CastMember {
+    pub dir: String,
+    pub loaded: card::LoadedCard,
+}
+
+/// 角色阵容（M3.1 隔离模式 · 设计 §10.2）：每轮发言 = 发言人独立的上下文组装与请求。
+/// 单角色会话同样是它（一个成员）——1v1 走同一条代码路径，行为与 M2 一致（退化不浪费）。
+pub struct Cast {
+    pub members: Vec<CastMember>,
+}
+
+impl Cast {
+    /// 装载会话的全阵容（发送路径不该静默吞掉阵容缺员，读卡失败即错）
+    pub fn load(root: &std::path::Path, meta: &store::SessionMeta) -> Result<Cast, String> {
+        let mut members = Vec::new();
+        for dir in &meta.characters {
+            let loaded = card::load_card(root, dir).map_err(|e| e.to_string())?;
+            members.push(CastMember {
+                dir: dir.clone(),
+                loaded,
+            });
+        }
+        if members.is_empty() {
+            return Err("会话未配置角色".to_string());
+        }
+        Ok(Cast { members })
+    }
+
+    pub fn first(&self) -> &CastMember {
+        &self.members[0]
+    }
+
+    pub fn get(&self, dir: &str) -> Option<&CastMember> {
+        self.members.iter().find(|m| m.dir == dir)
+    }
+
+    /// 解析本轮发言人：None = 主角色；Some 必须在阵容里
+    pub fn resolve(&self, speaker: Option<&str>) -> Result<&CastMember, String> {
+        match speaker {
+            None => Ok(self.first()),
+            Some(s) => self
+                .get(s)
+                .ok_or_else(|| format!("角色「{s}」不在这个会话的阵容里")),
+        }
+    }
+
+    /// 署名（消息 name 字段与界面显示用；卡名优先，目录名兜底）
+    pub fn display_name(&self, dir: &str) -> String {
+        match self.get(dir) {
+            Some(m) => display_name_of(&m.loaded),
+            None => dir.to_string(),
+        }
+    }
+
+    /// 全阵容署名（A1 契约的「你只扮演 X」提示用）
+    pub fn display_names(&self) -> Vec<String> {
+        self.members.iter().map(|m| display_name_of(&m.loaded)).collect()
+    }
+
+    /// 阵容里是否有多于一个角色（隔离提示与 UI 的判据）
+    pub fn is_multi(&self) -> bool {
+        self.members.len() > 1
+    }
 }
 
 /// 事件流的起始基线：
@@ -490,7 +575,7 @@ pub fn edit_message(
 ) -> Result<Vec<Message>, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let cast = Cast::load(&root, &meta)?;
     let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
     let Some((pos, turn)) = locate_message(&records, index) else {
         return Err(format!("消息下标越界：{index}"));
@@ -499,7 +584,7 @@ pub fn edit_message(
     if let LogBody::Message(m) = &mut edited[pos].body {
         m.content = content;
     }
-    let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn)?;
+    let rebuilt = rebuild_from(&log, &root, &meta, &cast, &edited, turn)?;
     log.rewrite(&root, &session_id, &rebuilt)
         .map_err(|e| e.to_string())?;
     sync_now(&log, &root, &meta)?;
@@ -515,14 +600,14 @@ pub fn delete_message(
 ) -> Result<Vec<Message>, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let cast = Cast::load(&root, &meta)?;
     let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
     let Some((pos, turn)) = locate_message(&records, index) else {
         return Err(format!("消息下标越界：{index}"));
     };
     let mut edited = records.as_ref().clone();
     edited.remove(pos);
-    let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn)?;
+    let rebuilt = rebuild_from(&log, &root, &meta, &cast, &edited, turn)?;
     log.rewrite(&root, &session_id, &rebuilt)
         .map_err(|e| e.to_string())?;
     sync_now(&log, &root, &meta)?;
@@ -541,11 +626,10 @@ fn rebuild_from(
     _log: &store::EventLog, // 重建结果由调用方 rewrite；这里只依据传入的记录重算
     root: &std::path::Path,
     meta: &store::SessionMeta,
-    loaded: &card::LoadedCard,
+    cast: &Cast,
     records: &[LogRecord],
     from_turn: u64,
 ) -> Result<Vec<LogRecord>, String> {
-    let character = first_character(meta)?;
     let genesis = event::has_genesis(records);
     let replay_from = if genesis { from_turn } else { 0 };
 
@@ -563,8 +647,9 @@ fn rebuild_from(
 
     let mut out: Vec<LogRecord> = Vec::new();
     let mut proj = event::Projection::default();
-    // 状态树只解析一次（轮末求值与手动收线的补求值共用；每条消息重解析一遍太浪费）
-    let tree = load_tree(loaded, None);
+    // 各角色的状态树只解析一次（轮末求值与手动收线的补求值共用）
+    let trees: Vec<Option<std::sync::Arc<statetree::StateTree>>> =
+        cast.members.iter().map(|m| load_tree(&m.loaded, None)).collect();
     if !genesis {
         // 老会话补 genesis：初始黑板取当前文件里的那份（M1 没留下更早的黑板）
         let board = blackboard_of(&project(records, root, meta));
@@ -580,22 +665,25 @@ fn rebuild_from(
         out.push(init.clone());
         event::fold(&mut proj, &init);
         // 再补跑一次 on_load：老会话的事件流里没有入席基线，重放得从「角色刚入席」重新开始
-        let state = loaded.default_state.clone();
-        let run = card::run_hook_full(
-            &loaded.source,
-            card::HookCall::OnLoad,
-            &card::HookEnv {
-                state: state.clone(),
-                blackboard: blackboard_env(&board),
-                memory: memory_env(&proj.memory),
-            },
-            meta.seed,
-            &NOOP_SINK,
-        );
-        if let Some(body) = hook_effect(&run, &state, &character, 0, "hook.on_load", true) {
-            let rec = LogRecord::new(0, body);
-            out.push(rec.clone());
-            event::fold(&mut proj, &rec);
+        // （M3.1：全阵容各入席一次）
+        for m in &cast.members {
+            let state = m.loaded.default_state.clone();
+            let run = card::run_hook_full(
+                &m.loaded.source,
+                card::HookCall::OnLoad,
+                &card::HookEnv {
+                    state: state.clone(),
+                    blackboard: blackboard_env(&board),
+                    memory: memory_env(&proj.memory),
+                },
+                meta.seed,
+                &NOOP_SINK,
+            );
+            if let Some(body) = hook_effect(&run, &state, &m.dir, 0, "hook.on_load", true) {
+                let rec = LogRecord::new(0, body);
+                out.push(rec.clone());
+                event::fold(&mut proj, &rec);
+            }
         }
     }
 
@@ -611,14 +699,18 @@ fn rebuild_from(
                 // thread:<id>:resolved 触发器，编辑历史一次就会把它弄丢。
                 // 这里对着刚折进来的收线事件补求值一次，与 resolve_thread_at ③ 同构；
                 // 重放点之前的收线不补（它驱动的转移记录本来就在 kept 里）。
+                // M3.1：全阵容各求值自己的树。
                 if in_replay_zone {
                     if let LogBody::Thread(t) = &rec.body {
                         if t.op == threads::OP_RESOLVE {
-                            if let Some(tree) = tree.as_ref() {
+                            for (i, m) in cast.members.iter().enumerate() {
+                                let Some(tree) = trees[i].as_ref() else {
+                                    continue;
+                                };
                                 for body in advance_state_tree(
                                     &proj,
-                                    &character,
-                                    loaded,
+                                    &m.dir,
+                                    &m.loaded,
                                     tree,
                                     t.turn,
                                     &format!("{}:resolved", t.thread_id),
@@ -644,21 +736,24 @@ fn rebuild_from(
             event::fold(&mut proj, rec);
             continue;
         }
-        // ① 用户消息：on_context 在它之前跑（设计 §4.1 B5 的注入时机）
+        // ① 用户消息：on_context 在它之前跑（设计 §4.1 B5 的注入时机）——全阵容各跑一次
         if msg.role == "user" {
-            let (run, before) = run_context_hook(
-                loaded,
-                &proj,
-                &character,
-                meta.seed,
-                &proj.messages.clone(),
-                &NOOP_SINK,
-            );
-            if let Some(body) = hook_effect(&run, &before, &character, msg.turn, "hook.on_context", false)
-            {
-                let rec = LogRecord::new(0, body);
-                out.push(rec.clone());
-                event::fold(&mut proj, &rec);
+            for m in &cast.members {
+                let (run, before) = run_context_hook(
+                    &m.loaded,
+                    &proj,
+                    &m.dir,
+                    meta.seed,
+                    &proj.messages.clone(),
+                    &NOOP_SINK,
+                );
+                if let Some(body) =
+                    hook_effect(&run, &before, &m.dir, msg.turn, "hook.on_context", false)
+                {
+                    let rec = LogRecord::new(0, body);
+                    out.push(rec.clone());
+                    event::fold(&mut proj, &rec);
+                }
             }
         }
         // ② 消息本身
@@ -682,29 +777,33 @@ fn rebuild_from(
             out.push(rec.clone());
             event::fold(&mut proj, &rec);
         }
-        // ④ on_message（每条新消息落地后，设计 §3）
-        let (run, before) =
-            run_message_hook_at(loaded, &proj, &character, &msg, meta.seed, &NOOP_SINK);
-        if let Some(body) = hook_effect(&run, &before, &character, msg.turn, "hook.on_message", false) {
-            let rec = LogRecord::new(0, body);
-            out.push(rec.clone());
-            event::fold(&mut proj, &rec);
-        }
-        // ⑤ 轮末心理运行时推进（情绪衰减也随重放重算——心理状态同样可回放）
-        if msg.role == "char" {
-            let (body, _emotion) = tick_psyche(&proj, &character, loaded, msg.turn);
-            if let Some(body) = body {
+        // ④ on_message（每条新消息落地后，设计 §3）——全阵容各跑一次
+        for m in &cast.members {
+            let (run, before) =
+                run_message_hook_at(&m.loaded, &proj, &m.dir, &msg, meta.seed, &NOOP_SINK);
+            if let Some(body) = hook_effect(&run, &before, &m.dir, msg.turn, "hook.on_message", false) {
                 let rec = LogRecord::new(0, body);
                 out.push(rec.clone());
                 event::fold(&mut proj, &rec);
             }
-            // ⑥ 轮末状态树转移（与 commit_reply 同一份代码 → 重放同一条路径，设计 §7.3-5）
-            if let Some(tree) = tree.as_ref() {
-                // 重放不重推界面事件（编辑历史不该再弹一次表情）
+        }
+        // ⑤⑥ 轮末：心理推进 + 状态树转移（与 commit_reply 同一份代码 → 重放同一条路径，
+        //     设计 §7.3-5）。全阵容各自推进；重放不重推界面事件（编辑历史不该再弹一次表情）。
+        if msg.role == "char" {
+            for (i, m) in cast.members.iter().enumerate() {
+                let (body, _emotion) = tick_psyche(&proj, &m.dir, &m.loaded, msg.turn);
+                if let Some(body) = body {
+                    let rec = LogRecord::new(0, body);
+                    out.push(rec.clone());
+                    event::fold(&mut proj, &rec);
+                }
+                let Some(tree) = trees[i].as_ref() else {
+                    continue;
+                };
                 for body in advance_state_tree(
                     &proj,
-                    &character,
-                    loaded,
+                    &m.dir,
+                    &m.loaded,
                     tree,
                     msg.turn,
                     "on_turn_end",
@@ -1015,9 +1114,16 @@ fn load_tree(
 
 /// 当前活跃路径：转移事件是权威（投影折叠出「最后一次转移的去向」），
 /// 没有转移时用树根播种（设计 §7.3：路径同样是事件流的函数）。
-fn active_path_of(proj: &event::Projection, tree: &statetree::StateTree) -> Vec<String> {
+fn active_path_of(
+    proj: &event::Projection,
+    tree: &statetree::StateTree,
+    character: &str,
+) -> Vec<String> {
+    // M3.1：转移按角色分道（TransitionEvent.character）；缺省 = 旧会话的单角色，任何视角都认
     proj.transitions
-        .last()
+        .iter()
+        .rev()
+        .find(|t| t.character.as_deref().map(|c| c == character).unwrap_or(true))
         .map(|t| t.to.clone())
         .unwrap_or_else(|| tree.active_path(&tree.root))
 }
@@ -1047,7 +1153,7 @@ fn tree_env(
         event: event_name.to_string(),
         blackboard: blackboard_env(&blackboard_of(proj)),
         state: current_state(proj, character, loaded),
-        known: proj.known.clone(),
+        known: proj.known_for(character),
         codex_active: active_entities.cloned().unwrap_or_default(),
         threads_active,
         threads_resolved,
@@ -1070,7 +1176,7 @@ fn advance_state_tree(
     seed: u64,
 ) -> (Vec<LogBody>, Vec<llm::UiEmit>) {
     let mut emits: Vec<llm::UiEmit> = Vec::new();
-    let path = active_path_of(proj, tree);
+    let path = active_path_of(proj, tree, character);
     let Some(leaf) = path.last().cloned() else {
         return (Vec::new(), emits);
     };
@@ -1113,6 +1219,7 @@ fn advance_state_tree(
         from: path,
         to: to_path.clone(),
         reason: decision.reason,
+        character: Some(character.to_string()),
         ts: store::unix_now(),
     });
     let rec = LogRecord::new(0, transition.clone());
@@ -1131,9 +1238,15 @@ fn advance_state_tree(
         event::fold(&mut local, &rec);
     }
 
-    // ④ 进入新路径即揭示（设计 §6.4：状态树的 reveal 解锁设定）
+    // ④ 进入新路径即揭示（设计 §6.4：状态树的 reveal 解锁设定）。
+    //    M3.1 视角化：见证者 = 黑板在场者 ∪ 转移者本人——她经历过这次揭示，
+    //    不在场的角色不知道（设计 §10.4「秘密真正成为某些人知道的事」）
+    let mut witnesses: Vec<String> = blackboard_of(proj).actors.clone();
+    if !witnesses.iter().any(|w| w == character) {
+        witnesses.push(character.to_string());
+    }
     for target in tree.reveal_of(&to_path) {
-        if !proj.known.contains(&target) {
+        if !proj.known_for(character).contains(&target) {
             out.push(LogBody::Codex(event::CodexEvent {
                 turn,
                 op: "reveal".into(),
@@ -1141,6 +1254,7 @@ fn advance_state_tree(
                 origin: "tree".into(),
                 value: None,
                 note: Some(leaf.clone()),
+                witnesses: witnesses.clone(),
                 ts: store::unix_now(),
             }));
         }
@@ -1316,7 +1430,8 @@ fn assemble_prompt_core(
     sink: &card::UiSink,
     root: &std::path::Path,
     meta: &store::SessionMeta,
-    loaded: &card::LoadedCard,
+    cast: &Cast,
+    speaker: &str,
     history: &[Message],
     proj: &event::Projection,
     user_content: Option<&str>,
@@ -1334,26 +1449,41 @@ fn assemble_prompt_core(
             .find(|p| &p.name == name),
         None => None,
     };
-    let character = first_character(meta)?;
+    // 隔离模式（设计 §10.2）：本轮发言 = 发言人独立的上下文组装。
+    // 全阵容的 on_context 都跑（各自 state 演进、黑板写入是公开的），
+    // 但注入（B5/卡片视角）只取发言人那份——其他角色的内心不进她的请求。
+    let member = cast
+        .get(speaker)
+        .ok_or_else(|| format!("角色「{speaker}」不在这个会话的阵容里"))?;
+    let loaded = &member.loaded;
+    let character = member.dir.clone();
 
     // B5：on_context hook（降级卡与未定义该 hook 的卡都跳过；窗口给最近消息）
-    let (run, before) = run_context_hook(loaded, proj, &character, meta.seed, history, sink);
-    let card_state = run.state.clone().unwrap_or_else(|| before.clone());
     let mut blackboard = blackboard_of(proj);
-    if run.ran() {
-        event::apply_blackboard_sets(&mut blackboard, &run.blackboard);
-    }
-    if let Some(log) = log {
-        if let Some(body) = hook_effect(&run, &before, &character, turn, "hook.on_context", false) {
-            commit(log, root, meta, body)?;
+    let mut speaker_run: Option<(card::HookRun, serde_json::Value)> = None;
+    for m in &cast.members {
+        let (run, before) = run_context_hook(&m.loaded, proj, &m.dir, meta.seed, history, sink);
+        if run.ran() {
+            // 黑板写入是公开事件（设计 §10.1：角色之间共享说出口的与做出来的）
+            event::apply_blackboard_sets(&mut blackboard, &run.blackboard);
+        }
+        if let Some(log) = log {
+            if let Some(body) = hook_effect(&run, &before, &m.dir, turn, "hook.on_context", false) {
+                commit(log, root, meta, body)?;
+            }
+        }
+        if m.dir == speaker {
+            speaker_run = Some((run, before));
         }
     }
+    let (run, before) = speaker_run.expect("发言人必在阵容里");
+    let card_state = run.state.clone().unwrap_or_else(|| before.clone());
 
     // ---- B2 指令层：状态树活跃路径的 directive（设计 §7.4「输出约束」）----
     let tree = load_tree(loaded, tree_cache);
     let active_path = tree
         .as_ref()
-        .map(|t| active_path_of(proj, t))
+        .map(|t| active_path_of(proj, t, &character))
         .unwrap_or_default();
     let directive = tree
         .as_ref()
@@ -1386,10 +1516,12 @@ fn assemble_prompt_core(
     let previously = runtime
         .map(|r| r.previously_active(&meta.id))
         .unwrap_or_default();
-    let known: std::collections::BTreeSet<String> = proj.known.clone();
+    // 有效知情集按组装视角取（M3.1 · 设计 §10.4）：全局揭示 ∪ 只对她的揭示——
+    // 仅 A 见过的事实不进 B 的 B3 深卡，串台在数据结构上不可能。
     // reveals 是**本轮**揭示（命中即强制深卡、权重最高），累积已知集只喂 known——
     // 否则揭示过的实体会每轮都插深卡并挤占 B3 预算。reveal 由状态树在 M2.3 写入事件流。
     let reveals: Vec<String> = Vec::new();
+    let known: std::collections::BTreeSet<String> = proj.known_for(&character);
     let activation = codex::ActivationContext {
         window_text: &window_text,
         place: place.as_deref(),
@@ -1401,6 +1533,7 @@ fn assemble_prompt_core(
         day: blackboard.day,
         clock: &blackboard.clock,
         blackboard: &bb_map,
+        viewer: &character,
     };
     let activated = cx.activate(
         &activation,
@@ -1496,6 +1629,18 @@ fn assemble_prompt_core(
         Some(psyche_line)
     };
 
+    // A1 的隔离提示（M3.1 · 设计 §10.2）：多角色时明确「只扮演谁」——
+    // 其他角色的言行只是她听到、看到的公开事件
+    let cast_note = if cast.is_multi() {
+        let names = cast.display_names().join("、");
+        let me = display_name_of(loaded);
+        Some(format!(
+            "本场景有多位角色在场：{names}。你只扮演「{me}」；其余角色的言行只是你听到、看到的公开事件——不要替他们说话、思考或决定他们的反应。"
+        ))
+    } else {
+        None
+    };
+
     let inputs = prompt::BuildInputs {
         settings: &settings,
         persona: persona.as_ref(),
@@ -1511,6 +1656,7 @@ fn assemble_prompt_core(
         psyche_line: psyche_line.as_deref(),
         directive: directive.as_deref(),
         summary: Some(proj.summary.as_str()),
+        cast_note: cast_note.as_deref(),
         history,
         user_content,
     };
@@ -1594,7 +1740,8 @@ async fn stream_reply(
     app: &AppHandle,
     root: &std::path::Path,
     meta: &store::SessionMeta,
-    loaded: &card::LoadedCard,
+    cast: &Cast,
+    speaker: &str,
     turn: u64,
     provider: &Provider,
     assembly: prompt::PromptAssembly,
@@ -1647,7 +1794,8 @@ async fn stream_reply(
                 match commit_reply(
                     root,
                     meta,
-                    loaded,
+                    cast,
+                    speaker,
                     turn,
                     &outcome.text,
                     Some(&ui_sink(app)),
@@ -1699,32 +1847,41 @@ fn plan_regenerate(
     Ok((kept, prior, turn, content))
 }
 
-/// 跑一轮 `on_message`（用户消息与回复都已落盘后调用，设计 §3）。
-///
-/// 卡片没定义该 hook 时直接返回 ran=false（不新建 Lua 实例）；其余情况：
-/// state 原地改动、`api.memory` / `api.blackboard` / `api.ui.emit` 的写入
-/// 分别落 state.json、palace.jsonl、blackboard.json，并实时推前端。
-/// 任何失败都只进报告（错误边界），不影响本轮对话。
-fn run_message_hook(
+/// 跑一轮 `on_message`（用户消息与回复都已落盘后调用，设计 §3）——**全阵容各跑一次**
+/// （M3.1：每条新消息落地，每个角色都看得到）。返回发言人的报告（卡内状态展示用），
+/// 其他成员的日志并入报告、界面事件照发。
+fn run_message_hooks(
     app: &AppHandle,
     root: &std::path::Path,
     meta: &store::SessionMeta,
-    loaded: &card::LoadedCard,
+    cast: &Cast,
+    speaker: &str,
     turn: u64,
     on_event: Option<&Channel<StreamEvent>>,
     log: &store::EventLog,
 ) -> llm::HookReport {
     let sink = ui_sink(app);
-    let report = run_message_hook_core(root, meta, loaded, turn, Some(&sink), log);
-    if let Some(channel) = on_event {
-        for event in &report.ui_events {
-            let _ = channel.send(StreamEvent::HookEvent {
-                kind: event.kind.clone(),
-                value: event.value.clone(),
-                turn,
-            });
+    let mut speaker_report: Option<llm::HookReport> = None;
+    let mut other_logs: Vec<String> = Vec::new();
+    for m in &cast.members {
+        let report = run_message_hook_core(root, meta, &m.loaded, &m.dir, turn, Some(&sink), log);
+        if let Some(channel) = on_event {
+            for event in &report.ui_events {
+                let _ = channel.send(StreamEvent::HookEvent {
+                    kind: event.kind.clone(),
+                    value: event.value.clone(),
+                    turn,
+                });
+            }
+        }
+        if m.dir == speaker {
+            speaker_report = Some(report);
+        } else {
+            other_logs.extend(report.logs);
         }
     }
+    let mut report = speaker_report.expect("发言人必在阵容里");
+    report.logs.extend(other_logs);
     report
 }
 
@@ -1735,6 +1892,7 @@ fn run_message_hook_core(
     root: &std::path::Path,
     meta: &store::SessionMeta,
     loaded: &card::LoadedCard,
+    character: &str,
     turn: u64,
     sink: Option<&card::UiSink>,
     log: &store::EventLog,
@@ -1773,10 +1931,6 @@ fn run_message_hook_core(
             crate::diag::record("hook", format!("on_message 中止：投影失败：{e}"));
             return report_with_log(turn, e);
         }
-    };
-    let character = match first_character(meta) {
-        Ok(c) => c,
-        Err(e) => return report_with_log(turn, e),
     };
 
     // 钩子入参现场：把卡实际收到的 msg 与 state 原样记下来（JSON）。
@@ -1893,14 +2047,16 @@ fn tick_psyche(
 }
 
 /// 回复落定后的收尾（stream_reply 与单测共用同一份代码，避免两处等价逻辑）：
-/// 回复事件 → 时钟步进事件 → on_message 事件 → 心理运行时推进。
+/// 回复事件（带发言人署名）→ 时钟步进事件 → on_message 事件（全阵容）→
+/// 心理运行时推进（全阵容）→ 状态树轮末求值（全阵容，各自路径）。
 ///
 /// 事件化后时钟步进也是事件：重放同一轮必然得到同一时刻（设计 §7.3-5）。
 #[allow(clippy::too_many_arguments)]
 fn commit_reply(
     root: &std::path::Path,
     meta: &store::SessionMeta,
-    loaded: &card::LoadedCard,
+    cast: &Cast,
+    speaker: &str,
     turn: u64,
     text: &str,
     sink: Option<&card::UiSink>,
@@ -1915,6 +2071,7 @@ fn commit_reply(
         content: text.to_string(),
         ts: store::unix_now(),
         scene_id: None,
+        name: Some(cast.display_name(speaker)),
     };
     log.append(root, &meta.id, LogBody::Message(reply))
         .map_err(|e| format!("回复落盘失败：{e}"))?;
@@ -1937,34 +2094,50 @@ fn commit_reply(
     )
     .map_err(|e| e.to_string())?;
 
-    // 回复落盘后跑 on_message（设计 §3：每条新消息落地后调用）
-    let mut report = run_message_hook_core(root, meta, loaded, turn, sink, log);
-
-    // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——结果同样是事件
-    let character = first_character(meta).unwrap_or_default();
-    if let Ok(proj) = project_session(log, root, meta) {
-        let (body, emotion) = tick_psyche(&proj, &character, loaded, turn);
-        if let Some(body) = body {
-            if let Err(e) = commit(log, root, meta, body) {
-                report.logs.push(e);
-            }
+    // 回复落盘后跑 on_message（设计 §3：每条新消息落地后，全阵容各跑一次）
+    let mut report: Option<llm::HookReport> = None;
+    let mut other_logs: Vec<String> = Vec::new();
+    for m in &cast.members {
+        let r = run_message_hook_core(root, meta, &m.loaded, &m.dir, turn, sink, log);
+        if m.dir == speaker {
+            report = Some(r);
+        } else {
+            other_logs.extend(r.logs);
         }
-        if let Some(emotion) = emotion {
-            report.ui_events.push(llm::UiEmit {
-                kind: "emotion".into(),
-                value: emotion,
-            });
+    }
+    let mut report = report.expect("发言人必在阵容里");
+    report.logs.extend(other_logs);
+
+    // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——全阵容各自推进，结果同样是事件
+    if let Ok(proj) = project_session(log, root, meta) {
+        for m in &cast.members {
+            let (body, emotion) = tick_psyche(&proj, &m.dir, &m.loaded, turn);
+            if let Some(body) = body {
+                if let Err(e) = commit(log, root, meta, body) {
+                    report.logs.push(e);
+                }
+            }
+            if let Some(emotion) = emotion {
+                report.ui_events.push(llm::UiEmit {
+                    kind: "emotion".into(),
+                    value: emotion,
+                });
+            }
         }
     }
 
-    // 轮末：状态树转移求值（设计 §7.3-2「默认转移推迟到轮末」，保证一轮对话内状态稳定）
-    if let Some(tree) = load_tree(loaded, tree_cache) {
-        let active_entities = runtime.map(|r| r.previously_active(&meta.id));
-        if let Ok(proj) = project_session(log, root, meta) {
+    // 轮末：状态树转移求值（设计 §7.3-2「默认转移推迟到轮末」，保证一轮对话内状态稳定）。
+    // M3.1：每个角色各求值自己的树（转移事件带 character，路径按角色分道）
+    let active_entities = runtime.map(|r| r.previously_active(&meta.id));
+    if let Ok(proj) = project_session(log, root, meta) {
+        for m in &cast.members {
+            let Some(tree) = load_tree(&m.loaded, tree_cache) else {
+                continue;
+            };
             let (events, emits) = advance_state_tree(
                 &proj,
-                &character,
-                loaded,
+                &m.dir,
+                &m.loaded,
                 &tree,
                 turn,
                 "on_turn_end",
@@ -2002,6 +2175,7 @@ fn forward_ui_events(channel: &Channel<StreamEvent>, report: &llm::HookReport) {
 /// 发送一条用户消息并流式生成回复。
 /// 流事件经 `on_event` 通道推给前端（delta / done / error），
 /// 返回值即终态事件。用户消息先落盘；回复（含中断时的部分文本）生成后落盘。
+/// `speaker`（M3.1 群聊）：本轮由谁回应——缺省主角色；多角色时组装取她的隔离视角。
 ///
 /// 事件顺序（与重放顺序一致，见 rebuild_from）：
 /// on_context 事件 → 用户消息事件 → on_message 事件 → 回复事件 → 时钟步进事件 → on_message 事件。
@@ -2010,6 +2184,7 @@ pub async fn send_message(
     app: AppHandle,
     session_id: String,
     content: String,
+    speaker: Option<String>,
     on_event: Channel<StreamEvent>,
     flags: State<'_, CancelFlags>,
     log: State<'_, store::EventLog>,
@@ -2021,10 +2196,11 @@ pub async fn send_message(
 ) -> Result<StreamEvent, String> {
     let root = root();
 
-    // 会话与角色卡
+    // 会话与角色阵容（M3.1 隔离模式：speaker 指定本轮谁发言，缺省主角色）
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let character = first_character(&meta)?;
-    let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
+    let cast = Cast::load(&root, &meta)?;
+    let member = cast.resolve(speaker.as_deref())?;
+    let speaker = member.dir.clone();
 
     // 接入点（chat 档；先校验再落盘用户消息，配置错误不产生半截会话）
     let provider = pick_chat_provider(&root)?;
@@ -2032,15 +2208,17 @@ pub async fn send_message(
     crate::diag::record(
         "chat",
         format!(
-            "send_message 会话={} 卡={}（{}，钩子={:?}）",
+            "send_message 会话={} 发言人={} 阵容={:?}（{}，钩子={:?}）",
             session_id,
-            character,
+            speaker,
+            meta.characters,
             root.display(),
-            loaded.hook_names
+            member.loaded.hook_names
         ),
     );
 
-    // 双槽位组装（设计 §4.1）：历史来自事件流投影，高轮次只解析新增行
+    // 双槽位组装（设计 §4.1）：历史来自事件流投影，高轮次只解析新增行。
+    // 隔离模式（设计 §10.2）：组装取发言人视角，其他角色的 B4/B5/内心不进这次请求
     let proj = project_session(&log, &root, &meta)?;
     let history = proj.messages.clone();
     let turn = history.last().map(|m| m.turn).unwrap_or(0) + 1;
@@ -2049,7 +2227,8 @@ pub async fn send_message(
         &ui_sink(&app),
         &root,
         &meta,
-        &loaded,
+        &cast,
+        &speaker,
         &history,
         &proj,
         Some(&content),
@@ -2074,19 +2253,21 @@ pub async fn send_message(
         content: content.clone(),
         ts: store::unix_now(),
         scene_id: None,
+        name: None,
     };
     log.append(&root, &session_id, LogBody::Message(user_msg))
         .map_err(|e| e.to_string())?;
 
     // 设计 §3：`on_message` 在**每条**新消息落地后调用——用户消息同样要跑，
     // 否则卡看不到本轮输入，且它的反应（比如好感度 +1）来不及影响这一轮的生成。
-    let report = run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event), &log);
+    let report = run_message_hooks(&app, &root, &meta, &cast, &speaker, turn, Some(&on_event), &log);
 
     stream_reply(
         &app,
         &root,
         &meta,
-        &loaded,
+        &cast,
+        &speaker,
         turn,
         &provider,
         run.assembly,
@@ -2126,6 +2307,7 @@ fn truncate_turn(records: &[LogRecord], turn: u64, drop_reply: bool) -> Vec<LogR
 
 /// 重roll（设计 §4 消息级操作）：移除末尾角色回复，以最后一条用户消息
 /// 重新流式生成。先删后生成——失败也不会出现两条并列回复。
+/// 发言人取被重roll 回复的署名（多角色时不换人重roll；1v1 无署名 = 主角色）。
 #[tauri::command]
 pub async fn regenerate(
     app: AppHandle,
@@ -2142,12 +2324,19 @@ pub async fn regenerate(
     let root = root();
 
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let character = first_character(&meta)?;
-    let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
+    let cast = Cast::load(&root, &meta)?;
     let provider = pick_chat_provider(&root)?;
 
     let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
     let all = event::messages(&records);
+    // 被重roll 的回复是谁说的：末尾 char 消息的署名（缺省主角色）
+    let rerolled_speaker = all
+        .iter()
+        .rev()
+        .find(|m| m.role == "char")
+        .and_then(|m| m.name.clone());
+    let member = cast.resolve(rerolled_speaker.as_deref())?;
+    let speaker = member.dir.clone();
     let (rewritten, _prior, turn, content) = match plan_regenerate(&all) {
         Ok(plan) => plan,
         Err(message) => return Ok(StreamEvent::Error { message }),
@@ -2169,7 +2358,8 @@ pub async fn regenerate(
         &ui_sink(&app),
         &root,
         &meta,
-        &loaded,
+        &cast,
+        &speaker,
         history,
         &proj,
         Some(&content),
@@ -2187,12 +2377,13 @@ pub async fn regenerate(
         });
     }
     // 上一轮的 on_message 效果已随截断消失，这里补跑：**恰好一次**，不是重复计分
-    let report = run_message_hook(&app, &root, &meta, &loaded, turn, Some(&on_event), &log);
+    let report = run_message_hooks(&app, &root, &meta, &cast, &speaker, turn, Some(&on_event), &log);
     stream_reply(
         &app,
         &root,
         &meta,
-        &loaded,
+        &cast,
+        &speaker,
         turn,
         &provider,
         run.assembly,
@@ -2287,7 +2478,7 @@ pub fn preview_prompt(
 ) -> Result<prompt::PromptAssembly, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let cast = Cast::load(&root, &meta)?;
     let proj = project_session(&log, &root, &meta)?;
     let history = proj.messages.clone();
     let turn = history.last().map(|m| m.turn).unwrap_or(0) + 1;
@@ -2295,7 +2486,8 @@ pub fn preview_prompt(
         &ui_sink(&app),
         &root,
         &meta,
-        &loaded,
+        &cast,
+        cast.first().dir.as_str(),
         &history,
         &proj,
         None,
@@ -2472,14 +2664,19 @@ fn resolve_thread_at(
         }),
     )?;
 
-    // ③ 线了结驱动状态树（设计 §8.5：thread:<id>:resolved 可作转移事件）
-    if let Some(tree) = load_tree(&loaded, Some(tree_cache)) {
-        let active_entities = runtime.previously_active(&meta.id);
-        let proj2 = project_session(log, root, meta)?;
+    // ③ 线了结驱动状态树（设计 §8.5：thread:<id>:resolved 可作转移事件）。
+    //    M3.1：全阵容各求值一次——线了结对每个角色的树都是一次事件
+    let cast = Cast::load(root, meta)?;
+    let active_entities = runtime.previously_active(&meta.id);
+    let proj2 = project_session(log, root, meta)?;
+    for m in &cast.members {
+        let Some(tree) = load_tree(&m.loaded, Some(tree_cache)) else {
+            continue;
+        };
         let (events, _emits) = advance_state_tree(
             &proj2,
-            &character,
-            &loaded,
+            &m.dir,
+            &m.loaded,
             &tree,
             turn,
             &format!("{id}:resolved"), // 设计 §8.5 的 thread:<id>:resolved（id 本身已带 thread. 前缀）
@@ -2632,11 +2829,12 @@ fn inspector_payload(
     let board = blackboard_of(proj);
     let bb_map = blackboard_env(&board);
 
-    // 状态树：活跃路径 + 最近转移历史（新的在前）
+    // 状态树：活跃路径 + 最近转移历史（新的在前）；M3.1 起按角色分道
+    // （检查器暂以主角色视角展示，逐视角切换的完整面板在 M3.10）
     let tree = load_tree(loaded, tree_cache);
     let path = tree
         .as_ref()
-        .map(|t| active_path_of(proj, t))
+        .map(|t| active_path_of(proj, t, &character))
         .unwrap_or_default();
     let state_tree = tree.as_ref().map(|t| {
         serde_json::json!({
@@ -2749,7 +2947,7 @@ fn inspector_payload(
         "codex": { "world": world, "count": entities.len(), "entities": entities },
         "summary": proj.summary,
         "proposals": proj.proposals.values().cloned().collect::<Vec<_>>(),
-        "known": proj.known.iter().cloned().collect::<Vec<_>>(),
+        "known": proj.known_for(&character).into_iter().collect::<Vec<_>>(),
         "blackboard": board,
         "activeEntities": runtime.map(|r| r.previously_active(&meta.id)).unwrap_or_default(),
     }))
@@ -3323,6 +3521,7 @@ return {
         let meta = store::new_session(
             &root,
             &store::NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: Some(1),
@@ -3352,6 +3551,7 @@ return {
                 &root,
                 &meta.id,
                 LogBody::Message(Message {
+                name: None,
                     turn: 0,
                     role: "char".into(),
                     content: first,
@@ -3377,6 +3577,7 @@ return {
         let meta = store::new_session(
             &root,
             &store::NewSessionRequest {
+            characters: Vec::new(),
                 character: "小雨".into(),
                 persona: None,
                 day: Some(1),
@@ -3391,6 +3592,7 @@ return {
 
     fn user_msg(turn: u64, content: &str) -> Message {
         Message {
+        name: None,
             turn,
             role: "user".into(),
             content: content.into(),
@@ -3405,7 +3607,8 @@ return {
 
     /// 一轮完整生成：**与生产共用同一份内核**（assemble_prompt_core / run_message_hook_core /
     /// commit_reply），只把界面事件回调换成空实现。此前单测另写了一份等价逻辑，
-    /// 于是生产漏掉「用户消息那一步」时测试仍然绿——这个坑不再重犯。
+    /// 于是生产漏掉「用户消息那一步」时测试仍然绿——这个坑不再犯。
+    /// 单角色夹具（多角色测试另见 cast_of / simulate_turn_as）。
     fn simulate_turn(
         root: &std::path::Path,
         meta: &store::SessionMeta,
@@ -3414,13 +3617,22 @@ return {
         turn: u64,
         content: &str,
     ) -> (prompt::PromptAssembly, llm::HookReport) {
+        let dir = first_character(meta).unwrap();
+        let cast = Cast {
+            members: vec![CastMember {
+                dir,
+                loaded: loaded.clone(),
+            }],
+        };
+        let speaker = cast.first().dir.clone();
         let proj = project_session(log, root, meta).unwrap();
         let history = proj.messages.clone();
         let run = assemble_prompt_core(
             &noop_sink(),
             root,
             meta,
-            loaded,
+            &cast,
+            &speaker,
             &history,
             &proj,
             Some(content),
@@ -3433,14 +3645,120 @@ return {
         .unwrap();
         log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
             .unwrap();
-        let after_user = run_message_hook_core(root, meta, loaded, turn, None, log);
-        let after_reply = commit_reply(root, meta, loaded, turn, "（回复）", None, log, None, None, None).unwrap();
+        let after_user = run_message_hook_core(root, meta, loaded, &speaker, turn, None, log);
+        let after_reply =
+            commit_reply(root, meta, &cast, &speaker, turn, "（回复）", None, log, None, None, None)
+                .unwrap();
 
         // 报告取「本轮最后一次」（回复后的状态就是前端看到的最终状态）
         let mut report = after_reply;
         report.ran |= after_user.ran;
         report.memory = [after_user.memory, report.memory].concat();
         (run.assembly, report)
+    }
+
+    /// 装载会话阵容（多角色测试用；与生产同一入口）
+    fn cast_of(root: &std::path::Path, meta: &store::SessionMeta) -> Cast {
+        Cast::load(root, meta).unwrap()
+    }
+
+    /// 双卡阵容夹具（M3.1 隔离模式用例）：主角色小雨 + 次角色阿澈，时钟 20:55
+    /// （第一轮末步进到 21:05，越过主角色状态树的 21:00 转移门槛）
+    fn setup_cast2(card_xiaoyu: &str, card_ache: &str) -> (tempfile::TempDir, store::SessionMeta, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        store::ensure_layout(&root).unwrap();
+        for (name, src) in [("小雨", card_xiaoyu), ("阿澈", card_ache)] {
+            let d = root.join(format!("characters/{name}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("card.lua"), src).unwrap();
+        }
+        let meta = store::new_session(
+            &root,
+            &store::NewSessionRequest {
+                character: "小雨".into(),
+                characters: vec!["小雨".into(), "阿澈".into()],
+                persona: None,
+                day: Some(1),
+                clock: Some("20:55".into()),
+                place: Some("自习区".into()),
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = store::EventLog::new();
+        let board = store::load_blackboard(&root, &meta.id).unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 0,
+                reason: "init".into(),
+                board,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        (dir, meta, root)
+    }
+
+    /// 用已装载的卡造单角色阵容（直接调内核的单角色测试用，省一次读盘）
+    fn single_cast(meta: &store::SessionMeta, loaded: &card::LoadedCard) -> Cast {
+        Cast {
+            members: vec![CastMember {
+                dir: first_character(meta).unwrap(),
+                loaded: loaded.clone(),
+            }],
+        }
+    }
+
+    /// 以指定发言人身份跑一轮（M3.1 隔离模式的行为断言用）
+    fn simulate_turn_as(
+        root: &std::path::Path,
+        meta: &store::SessionMeta,
+        cast: &Cast,
+        speaker: &str,
+        log: &store::EventLog,
+        turn: u64,
+        content: &str,
+    ) -> prompt::PromptAssembly {
+        let proj = project_session(log, root, meta).unwrap();
+        let history = proj.messages.clone();
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            root,
+            meta,
+            cast,
+            speaker,
+            &history,
+            &proj,
+            Some(content),
+            turn,
+            Some(log),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
+            .unwrap();
+        let member = cast.get(speaker).unwrap();
+        run_message_hook_core(root, meta, &member.loaded, speaker, turn, None, log);
+        commit_reply(
+            root,
+            meta,
+            cast,
+            speaker,
+            turn,
+            "（回复）",
+            None,
+            log,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        run.assembly
     }
 
     #[test]
@@ -3496,7 +3814,7 @@ return {
         // 好感度必须立刻 +1——这正是「卡看到了用户消息本身」的证据（若只看到回复，不会有变化）。
         log.append(&root, &meta.id, LogBody::Message(user_msg(9, "谢谢你。")))
             .unwrap();
-        let report = run_message_hook_core(&root, &meta, &loaded, 9, None, &log);
+        let report = run_message_hook_core(&root, &meta, &loaded, "小雨", 9, None, &log);
         assert!(report.ran, "钩子应被触发");
         assert_eq!(
             report.card_state["favorability"], 53,
@@ -3525,7 +3843,7 @@ return {
         if let LogBody::Message(m) = &mut edited[pos].body {
             m.content = "今天也是。".into(); // 不再道谢
         }
-        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &edited, turn).unwrap();
         log.rewrite(&root, &meta.id, &rebuilt).unwrap();
         sync_now(&log, &root, &meta).unwrap();
 
@@ -3557,7 +3875,7 @@ return {
         assert_eq!(turn, 1);
         let mut edited = records.as_ref().clone();
         edited.remove(pos);
-        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &edited, turn).unwrap();
         log.rewrite(&root, &meta.id, &rebuilt).unwrap();
         sync_now(&log, &root, &meta).unwrap();
 
@@ -3592,11 +3910,14 @@ return {
         // 重放本轮：on_context → on_message → 回复
         let proj = project_session(&log, &root, &meta).unwrap();
         let history = &proj.messages[..proj.messages.len().saturating_sub(1)];
+        let cast = single_cast(&meta, &loaded);
+        let speaker = cast.first().dir.clone();
         assemble_prompt_core(
             &noop_sink(),
             &root,
             &meta,
-            &loaded,
+            &cast,
+            &speaker,
             history,
             &proj,
             Some(&content),
@@ -3607,8 +3928,8 @@ return {
             None,
         )
         .unwrap();
-        run_message_hook_core(&root, &meta, &loaded, turn, None, &log);
-        commit_reply(&root, &meta, &loaded, turn, "（重roll 的回复）", None, &log, None, None, None)
+        run_message_hook_core(&root, &meta, &loaded, &speaker, turn, None, &log);
+        commit_reply(&root, &meta, &cast, &speaker, turn, "（重roll 的回复）", None, &log, None, None, None)
             .unwrap();
 
         assert_eq!(
@@ -3639,7 +3960,7 @@ return {
         assert_eq!(a.transitions, b.transitions);
 
         // 再重放一遍整段历史（等价于消息级操作后的重建）：状态逐字相同
-        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &records, 1).unwrap();
         let c = event::project_over(&rebuilt, &event::Base::default());
         assert_eq!(c.states, a.states, "重放得到同一份 state");
         assert_eq!(c.blackboard, a.blackboard, "重放得到同一块黑板");
@@ -3669,7 +3990,7 @@ return {
         );
 
         let loaded = card::load_card(&root, "小雨").unwrap();
-        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &records, 1).unwrap();
         assert!(event::has_genesis(&rebuilt), "重建后应补上 init 事件");
         log.rewrite(&root, &meta.id, &rebuilt).unwrap();
         sync_now(&log, &root, &meta).unwrap();
@@ -3683,7 +4004,7 @@ return {
         if let LogBody::Message(m) = &mut edited[pos].body {
             m.content = "算了。".into();
         }
-        let again = rebuild_from(&log, &root, &meta, &loaded, &edited, turn).unwrap();
+        let again = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &edited, turn).unwrap();
         log.rewrite(&root, &meta.id, &again).unwrap();
         sync_now(&log, &root, &meta).unwrap();
         assert_eq!(stored_state(&root, &meta)["favorability"], 50);
@@ -3700,11 +4021,14 @@ return {
         let state_before = stored_state(&root, &meta);
 
         let proj = project_session(&log, &root, &meta).unwrap();
+        let cast = single_cast(&meta, &loaded);
+        let speaker = cast.first().dir.clone();
         let run = assemble_prompt_core(
             &noop_sink(),
             &root,
             &meta,
-            &loaded,
+            &cast,
+            &speaker,
             &proj.messages.clone(),
             &proj,
             None,
@@ -3723,6 +4047,7 @@ return {
     #[test]
     fn regenerate_plan_rolls_back_reply_or_retries_failed_turn() {
         let user = |turn, content: &str| Message {
+        name: None,
             turn,
             role: "user".into(),
             content: content.into(),
@@ -3730,6 +4055,7 @@ return {
             scene_id: None,
         };
         let ch = |turn, content: &str| Message {
+        name: None,
             turn,
             role: "char".into(),
             content: content.into(),
@@ -4191,9 +4517,9 @@ return {
         );
         // reveal 进设定事件 → 投影的揭示集
         assert!(
-            proj.known.contains("char.小雨.secrets.工作牌"),
-            "进入状态应揭示秘密：{:?}",
-            proj.known
+            proj.known_for("小雨").contains("char.小雨.secrets.工作牌"),
+            "进入状态应向见证者揭示秘密：{:?}",
+            proj.known_for("小雨")
         );
         // 转移发生在轮末：本轮组装仍是根状态的指令，下一轮才换
         assert!(a2.layers.iter().find(|l| l.id == "B2").unwrap().content.contains("轻松日常"));
@@ -4233,10 +4559,10 @@ return {
 
         // 重放同一事件流得到同一条路径（设计 §7.3-5）
         let records = log.read(&root, &meta.id).unwrap();
-        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &records, 1).unwrap();
         let c = event::project_over(&rebuilt, &event::Base::default());
         assert_eq!(c.transitions, proj.transitions, "重放得到同一批转移");
-        assert_eq!(c.known, proj.known, "重放得到同一份揭示集");
+        assert_eq!(c.known_for("小雨"), proj.known_for("小雨"), "重放得到同一份揭示集");
     }
 
     /// M2.8 面板数据源：一次给全状态树/线/心理/宫殿/设定集的投影视图
@@ -4384,7 +4710,7 @@ return {
 
         // 模型产物保留：编辑历史的重建不丢弃摘要与提案
         let records = log.read(&root, &meta.id).unwrap();
-        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &records, 1).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &records, 1).unwrap();
         assert!(
             rebuilt
                 .iter()
@@ -4412,6 +4738,7 @@ return {
                 &root,
                 &meta.id,
                 LogBody::Message(Message {
+                name: None,
                     turn,
                     role: "char".into(),
                     content: format!("回复{turn}"),
@@ -4847,7 +5174,7 @@ return {
         if let LogBody::Message(m) = &mut edited[pos].body {
             m.content = "（改写过的）今天好冷。".into();
         }
-        let rebuilt = rebuild_from(&log, &root, &meta, &loaded, &edited, turn).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &edited, turn).unwrap();
         log.rewrite(&root, &meta.id, &rebuilt).unwrap();
         sync_now(&log, &root, &meta).unwrap();
 
@@ -4862,6 +5189,181 @@ return {
             1,
             "编辑后收线驱动的转移应原样保留（不丢失、不翻倍）：{:?}",
             proj2.transitions
+        );
+    }
+    /// M3.1 验收：串台构造用例——隔离模式下，仅 A 见过的事实不出现在 B 的任何注入层
+    /// （设计 §10.1「隔离总原则」：不在提示词里恳求，用数据结构让串台不可能）
+    #[test]
+    fn isolated_assembly_never_leaks_witness_only_facts_to_the_other() {
+        let xiaoyu = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50 },
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '轻松日常。',
+        transitions = {
+          { to = '夜谈', priority = 5,
+            when = function(ev, bb, st)
+              return (bb.clock or '') >= '21:00'
+            end },
+        },
+      },
+      ['夜谈'] = { parent = '日常', directive = '夜深人静。', reveal = { 'char.小雨.secrets.工作牌' } },
+    },
+  },
+}
+"#;
+        let ache = r#"
+return {
+  spec = 'charcard/1.0', name = '阿澈', scenario = '图书馆', personality = '爽朗', first_mes = '（阿澈入席）',
+}
+"#;
+        let (_dir, meta, root) = setup_cast2(xiaoyu, ache);
+        // 世界：小雨实体带秘密（只有她自己一直知道，known_by 名单）
+        let dir = root.join("codex/default/entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("char.小雨.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'char.小雨', type = 'char', name = '小雨',
+  aliases = { '夜班管理员' },
+  one_liner = '大学图书馆夜班管理员。',
+  facts = { look = { impression = '旧毛衣' } },
+  secrets = {
+    ['工作牌'] = { content = '她挂着的旧胸牌，其实是已故母亲的遗物。', known_by = { '小雨' } },
+  },
+}
+"#,
+        )
+        .unwrap();
+
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+        assert!(cast.is_multi(), "双卡阵容");
+
+        // 阿澈离场（黑板手动事件，重放保留）：reveal 的见证者只剩小雨
+        let mut proj = project_session(&log, &root, &meta).unwrap();
+        let mut board = blackboard_of(&proj);
+        board.actors = vec!["小雨".into()];
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 0,
+                reason: "manual".into(),
+                board,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+
+        // 第一轮（小雨发言）：20:55 → 21:05 越过门槛，轮末转移进「夜谈」并 reveal 秘密
+        simulate_turn_as(&root, &meta, &cast, "小雨", &log, 1, "小雨，你的胸牌挺特别的。");
+        proj = project_session(&log, &root, &meta).unwrap();
+        assert!(
+            proj.transitions.iter().any(|t| t.character.as_deref() == Some("小雨")
+                && t.to.last().map(|s| s.as_str()) == Some("夜谈")),
+            "小雨的树应转移进夜谈：{:?}",
+            proj.transitions
+        );
+        let secret_path = "char.小雨.secrets.工作牌";
+        assert!(proj.known.is_empty(), "见证者揭示不进全局集：{:?}", proj.known);
+        assert!(
+            proj.known_for("小雨").contains(secret_path),
+            "小雨的视角应含该秘密：{:?}",
+            proj.known_for("小雨")
+        );
+        assert!(
+            !proj.known_for("阿澈").contains(secret_path),
+            "阿澈的视角不含：{:?}",
+            proj.known_for("阿澈")
+        );
+
+        // 串台断言①：以阿澈视角组装——B3 深卡不得出现只有小雨知道的秘密
+        let b_assembly = simulate_turn_as(&root, &meta, &cast, "阿澈", &log, 2, "小雨今天怎么了？说说呗。");
+        let b3 = b_assembly.layers.iter().find(|l| l.id == "B3").map(|l| l.content.clone());
+        if let Some(b3) = &b3 {
+            assert!(b3.contains("小雨"), "实体本身照常激活（提及）：{b3}");
+            assert!(
+                !b3.contains("已故母亲"),
+                "串台：仅小雨见过的秘密不得进阿澈的 B3 深卡：{b3}"
+            );
+        }
+        // A1 隔离提示：多角色时明确「你只扮演谁」
+        let a1 = b_assembly.layers.iter().find(|l| l.id == "A1").unwrap();
+        assert!(a1.content.contains("你只扮演「阿澈」"), "A1 应带隔离提示：{}", a1.content);
+        // 回复署名：这条 char 消息是阿澈说的
+        proj = project_session(&log, &root, &meta).unwrap();
+        let last_char = proj.messages.iter().rev().find(|m| m.role == "char").unwrap();
+        assert_eq!(last_char.name.as_deref(), Some("阿澈"), "回复应带发言人署名");
+
+        // 串台断言②：以小雨视角组装——她自己的秘密照常在深卡里
+        let a_assembly = simulate_turn_as(&root, &meta, &cast, "小雨", &log, 3, "……那张胸牌。");
+        let b3a = a_assembly.layers.iter().find(|l| l.id == "B3").map(|l| l.content.clone());
+        if let Some(b3a) = &b3a {
+            assert!(
+                b3a.contains("已故母亲"),
+                "小雨的视角应见到自己的秘密（known_by 名单 + 见证 reveal）：{b3a}"
+            );
+        }
+
+        // 串台断言③：B4 回忆——只有小雨见证的记忆，阿澈召不回
+        proj = project_session(&log, &root, &meta).unwrap();
+        let seq = proj.episodes.len() + proj.memory.len() + 1;
+        let memory = palace::MemObject {
+            id: palace::next_id(seq),
+            kind: palace::KIND_EPISODE.to_string(),
+            content: "深夜闭馆时她把画着猫头鹰的书签夹进了他的书".into(),
+            turn: 1,
+            story_day: 1,
+            story_clock: "21:05".into(),
+            place: Some("自习区".into()),
+            actors: vec!["小雨".into()],
+            witnesses: vec!["小雨".into()],
+            salience: 0.9,
+            emotion: None,
+            links: vec!["topic:书签".into()],
+            thread: None,
+            source: "manual".into(),
+            ts: store::unix_now(),
+            rehearsals: 0,
+        };
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Memory(event::MemoryEvent {
+                turn: 1,
+                origin: "manual".into(),
+                object: serde_json::to_value(&memory).unwrap(),
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        let b4_assembly = simulate_turn_as(&root, &meta, &cast, "阿澈", &log, 4, "书签是哪来的？");
+        let b4 = b4_assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B4")
+            .map(|l| l.content.clone())
+            .unwrap_or_default();
+        assert!(
+            !b4.contains("猫头鹰"),
+            "串台：只有小雨见证的记忆不得进阿澈的 B4：{b4}"
+        );
+        let a4_assembly = simulate_turn_as(&root, &meta, &cast, "小雨", &log, 5, "……书签。");
+        let b4a = a4_assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B4")
+            .map(|l| l.content.clone())
+            .unwrap_or_default();
+        assert!(
+            b4a.contains("猫头鹰"),
+            "小雨应召回自己见证的记忆（话题命中）：{b4a}"
         );
     }
 }

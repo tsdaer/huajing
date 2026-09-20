@@ -87,6 +87,8 @@ export interface Message {
   content: string;
   ts: number;
   scene_id?: string;
+  /** 这条消息是谁说的（群聊：char 消息的角色署名；缺省 = 会话首个角色） */
+  name?: string | null;
 }
 
 // ---------- 角色卡（card.rs · 设计 §3）----------
