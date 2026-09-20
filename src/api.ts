@@ -19,6 +19,7 @@ import type {
   Provider,
   ProviderTest,
   RuntimeInfo,
+  SceneView,
   SessionMeta,
   Settings,
   StreamEvent,
@@ -125,6 +126,33 @@ export const api = {
   /** 类型化事件流视图（最新在前，默认 200 条） */
   sessionTimeline: (sessionId: string, limit?: number) =>
     invoke<TimelineEntry[]>("session_timeline", { sessionId, limit }),
+
+  // ---------- 场景与多线（M3.2 · 设计 §10.3：「与此同时」） ----------
+  /** 场景列表 + 当前聚焦场景 */
+  listScenes: (sessionId: string) => invoke<SceneView>("list_scenes", { sessionId }),
+  /** 新建场景（另起舞台；视角随即切过去并插入过渡插页） */
+  createScene: (sessionId: string, title: string, place: string, actors: string[], note?: string) =>
+    invoke<SceneView>("create_scene", { sessionId, title, place, actors, note }),
+  /** 切场：被切走的场景冻结，目标场景插入小说式过渡 */
+  switchScene: (sessionId: string, sceneId: string, note?: string) =>
+    invoke<SceneView>("switch_scene", { sessionId, sceneId, note }),
+  /** 分场：moving 里的角色离场另立新场景，视角跟过去 */
+  splitScene: (
+    sessionId: string,
+    title: string,
+    place: string,
+    moving: string[],
+    note?: string,
+  ) => invoke<SceneView>("split_scene", { sessionId, title, place, moving, note }),
+  /** 合场：from 里的场景并进聚焦场景（在场者并集、时间取较晚、flags 冲突聚焦方赢） */
+  mergeScenes: (sessionId: string, from: string[], note?: string) =>
+    invoke<SceneView>("merge_scenes", { sessionId, from, note }),
+  /** 编辑场景分区（标题/地点/在场者/局部时钟） */
+  updateScene: (
+    sessionId: string,
+    sceneId: string,
+    patch: { title?: string; place?: string; actors?: string[]; day?: number; clock?: string },
+  ) => invoke<SceneView>("update_scene", { sessionId, sceneId, ...patch }),
 
   /** 角色私有 state 现状（卡内状态面板） */
   getCardState: (sessionId: string) => invoke<Record<string, unknown>>("get_card_state", { sessionId }),

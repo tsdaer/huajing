@@ -13,6 +13,8 @@ import type {
   Persona,
   PromptAssembly,
   Provider,
+  Scene,
+  SceneView,
   SessionMeta,
   Settings,
   StreamEvent,
@@ -83,6 +85,41 @@ const messages: Message[] = [
     ts: 1758200160,
   },
 ];
+
+// ---------- 场景与多线（M3.2 · 设计 §10.3）：mock 双场景，演示「与此同时」 ----------
+const mockScenes: Scene[] = [
+  {
+    id: "scene.main",
+    title: "开场",
+    place: "图书馆自习区",
+    actors: ["小雨", "夜读者"],
+    day: 3,
+    clock: "21:30",
+    created_turn: 0,
+    origin: "default",
+    parent: null,
+    status: "active",
+    ts: 1758200000,
+  },
+  {
+    id: "scene.b",
+    title: "旧书店",
+    place: "坡下的旧书店",
+    actors: ["夜读者"],
+    day: 3,
+    clock: "21:20",
+    created_turn: 1,
+    origin: "split",
+    parent: "scene.main",
+    status: "frozen",
+    ts: 1758200050,
+  },
+];
+let activeScene = "scene.main";
+
+function sceneView(): SceneView {
+  return { scenes: mockScenes.map((sc) => ({ ...sc, flags: {} })), active: activeScene };
+}
 
 /** mock 的卡内状态与记忆流（M1.6 面板数据） */
 const mockCardState: Record<string, unknown> = { favorability: 52 };
@@ -352,9 +389,9 @@ export function setupMock() {
         return messages;
       }
       case "send_message": {
-        // speaker（M3.1 群聊）：mock 里不影响生成内容，只透传
+        // speaker（M3.1 群聊）：mock 里不影响生成内容，只透传；消息归属当前场景（M3.2）
         const turn = (messages[messages.length - 1]?.turn ?? 0) + 1;
-        messages.push({ turn, role: "user", content: a.content!, ts: Math.floor(Date.now() / 1000) });
+        messages.push({ turn, role: "user", content: a.content!, ts: Math.floor(Date.now() / 1000), scene_id: activeScene });
         return streamReply(messages, a.content!, a.onEvent, timers, sessionId);
       }
       case "regenerate": {
@@ -403,6 +440,54 @@ export function setupMock() {
         return { ...mockCardState };
       case "list_card_memory":
         return memoryRecords;
+      // ---------- 场景与多线（M3.2 · 设计 §10.3） ----------
+      case "list_scenes":
+        return sceneView();
+      case "create_scene": {
+        const id = `scene.${Date.now()}`;
+        mockScenes.push({
+          id,
+          title: (a as Record<string, string>).title ?? "新场景",
+          place: (a as Record<string, string>).place ?? "",
+          actors: (a as unknown as { actors?: string[] }).actors ?? [],
+          day: blackboard.day,
+          clock: blackboard.clock,
+          created_turn: 0,
+          origin: "manual",
+          parent: null,
+          status: "active",
+          ts: Math.floor(Date.now() / 1000),
+        });
+        for (const sc of mockScenes) sc.status = sc.id === id ? "active" : "frozen";
+        activeScene = id;
+        messages.push({
+          turn: 0,
+          role: "system",
+          content: `——${(a as Record<string, string>).title ?? ""}·${(a as Record<string, string>).place ?? ""}——`,
+          ts: Math.floor(Date.now() / 1000),
+          scene_id: id,
+        });
+        return sceneView();
+      }
+      case "switch_scene": {
+        const target = (a as unknown as { sceneId: string }).sceneId;
+        for (const sc of mockScenes) sc.status = sc.id === target ? "active" : "frozen";
+        activeScene = target;
+        const sc = mockScenes.find((x) => x.id === target);
+        messages.push({
+          turn: 0,
+          role: "system",
+          content: `与此同时，${sc?.place ?? "?"}——`,
+          ts: Math.floor(Date.now() / 1000),
+          scene_id: target,
+        });
+        return sceneView();
+      }
+      case "split_scene":
+      case "merge_scenes":
+        throw new Error("浏览器 mock 不支持分场/合场：请用 pnpm tauri dev");
+      case "update_scene":
+        return sceneView();
       // 记忆检查器（M2.8）：形状与 commands.rs 的 inspector_data 对齐，
       // 让浏览器调试路径也能看到 M2 的七个面板（数据是示意值，不参与对话逻辑）。
       case "inspector_data":

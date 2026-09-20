@@ -10,6 +10,7 @@ mod llm;      // OpenAI 兼容 SSE 客户端（设计 §11）
 mod palace;   // 记忆宫殿：记忆对象、召回与视图（M2.1 · 设计 §5）
 mod prompt;   // Prompt Builder 双槽位组装（设计 §4）
 mod psyche;   // 心理运行时：情绪槽、衰减、意图（M2.5 · 设计 §9）
+mod scene;    // 场景与多线：「与此同时」的隔离顶层单元（M3.2 · 设计 §10.3）
 #[cfg(test)]
 mod smoke_datahub; // DataHub 资产冒烟测试：仓库示例卡与设定集的守卫（设计 §12）
 mod threads;  // 剧情线：生命周期与提及时机（M2.4 · 设计 §8）
@@ -65,6 +66,12 @@ pub fn run() {
             commands::session_timeline,
             commands::get_card_state,
             commands::list_card_memory,
+            commands::list_scenes,
+            commands::create_scene,
+            commands::switch_scene,
+            commands::split_scene,
+            commands::merge_scenes,
+            commands::update_scene,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,

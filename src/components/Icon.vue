@@ -40,6 +40,10 @@ const ICONS: Record<string, string> = {
   palette:
     '<path d="M12 3.5a8.5 8.5 0 0 0 0 17c1.3 0 2-.9 2-1.9 0-1.5-1.4-1.7-1.4-2.8 0-.8.7-1.4 1.6-1.4h1.5a4.8 4.8 0 0 0 4.8-4.8c0-3.4-3.4-6.1-8.5-6.1Z"/><circle cx="7.6" cy="11.4" r="1.1" fill="currentColor" stroke="none"/><circle cx="11.4" cy="7.8" r="1.1" fill="currentColor" stroke="none"/><circle cx="16.2" cy="9.6" r="1.1" fill="currentColor" stroke="none"/>',
   dot: '<circle cx="12" cy="12" r="4"/>',
+  split:
+    '<path d="M7 3.5 3.5 7 7 10.5"/><path d="M3.5 7H14a4 4 0 0 1 4 4v0"/><path d="M7 13.5 3.5 17 7 20.5"/><path d="M3.5 17h6a4 4 0 0 0 4-4"/>',
+  merge:
+    '<path d="M3.5 5.5h6.5a4 4 0 0 1 4 4v0a4 4 0 0 0 4 4h2.5"/><path d="M17.5 10.5l3 3-3 3"/><path d="M3.5 18.5h6.5a4 4 0 0 0 3.2-1.6"/>',
 };
 </script>
 

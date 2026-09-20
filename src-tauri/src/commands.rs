@@ -13,6 +13,7 @@ use crate::codex;
 use crate::event::{self, LogBody, LogRecord};
 use crate::palace;
 use crate::psyche;
+use crate::scene;
 use crate::statetree;
 use crate::summarize;
 use crate::threads;
@@ -208,7 +209,35 @@ pub fn new_session(
         LogBody::Blackboard(event::BlackboardEvent {
             turn: 0,
             reason: "init".into(),
-            board,
+            scene_id: None,
+            board: board.clone(),
+            ts: store::unix_now(),
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 缺省场景落地（M3.2 · 设计 §10.3）：从初始黑板长出 scene.main。
+    // 新会话从第一轮起就有场景归属（消息分段、黑板分区、摘要分卷都有了挂靠点）；
+    // 老会话不迁移，读侧把 scene_id: None 归一到同一个 id。
+    let scene = scene::Scene::from_board(
+        scene::DEFAULT_SCENE_ID,
+        "开场",
+        &board,
+        0,
+        "default",
+        store::unix_now(),
+    );
+    log.append(
+        &root,
+        &meta.id,
+        LogBody::Scene(event::SceneEvent {
+            turn: 0,
+            op: "create".into(),
+            scene_id: scene.id.clone(),
+            scene: Some(scene),
+            others: Vec::new(),
+            origin: "default".into(),
+            note: None,
             ts: store::unix_now(),
         }),
     )
@@ -228,7 +257,7 @@ pub fn new_session(
                     role: "char".into(),
                     content: first.to_string(),
                     ts: store::unix_now(),
-                    scene_id: None,
+                    scene_id: Some(scene::DEFAULT_SCENE_ID.into()),
                     name: Some(display_name_of(&loaded)),
                 };
                 let _ = log.append(&root, &meta.id, LogBody::Message(opening));
@@ -383,10 +412,26 @@ fn sync_derived(
         store::save_blackboard(root, &meta.id, bb).map_err(|e| e.to_string())?;
     }
     store::write_memory_records(root, &meta.id, &proj.memory).map_err(|e| e.to_string())?;
-    // M2.6 的两份派生文件（摘要与设定收件箱）同样由投影写出
-    store::write_summary(root, &meta.id, &proj.summary).map_err(|e| e.to_string())?;
+    // summary.md：世界层大事记 + 各场景分卷（可读排版；注入走 summary_for，不经过这里）
+    let mut summary_text = proj.summary.clone();
+    for (id, volume) in &proj.scene_summaries {
+        if volume.trim().is_empty() {
+            continue;
+        }
+        let title = proj
+            .scenes
+            .get(id)
+            .map(|sc| sc.title.clone())
+            .unwrap_or_else(|| id.clone());
+        summary_text.push_str(&format!("\n\n【{title}】\n{volume}"));
+    }
+    store::write_summary(root, &meta.id, summary_text.trim()).map_err(|e| e.to_string())?;
     let proposals: Vec<serde_json::Value> = proj.proposals.values().cloned().collect();
     store::write_proposals(root, &meta.id, &proposals).map_err(|e| e.to_string())?;
+    // 场景投影（M3.2）：场景表 + 聚焦场景，明文可查
+    let scenes: Vec<scene::Scene> = proj.scenes.values().cloned().collect();
+    store::write_scenes(root, &meta.id, &scenes, proj.active_scene.as_deref())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -430,9 +475,56 @@ fn blackboard_of(proj: &event::Projection) -> store::Blackboard {
         .unwrap_or_else(store::Blackboard::default_board)
 }
 
+/// 会话当前的聚焦场景（多场景会话才有；单场景/老会话 = None，一切读侧退化为世界层）
+fn scene_ctx(proj: &event::Projection) -> Option<String> {
+    proj.active_scene_id().map(str::to_string)
+}
+
+/// 消息流的场景视图（设计 §10.3 消息流分段）：多场景会话只取该场景的消息——
+/// 别的场景发生的事是「与此同时」的叙事盲区，不进本场景的组装与钩子窗口。
+fn scene_messages(messages: &[Message], scene: Option<&str>) -> Vec<Message> {
+    match scene {
+        None => messages.to_vec(),
+        Some(id) => messages
+            .iter()
+            .filter(|m| scene::normalize(m.scene_id.as_deref()) == id)
+            .cloned()
+            .collect(),
+    }
+}
+
+/// 本轮参与轮转的成员：所在场景的在场者（actors 空 = 不设限，兼容旧黑板）。
+/// 被切走的场景冻结——不在场的角色不跑钩子、不推心理、不求值状态树。
+fn present_members<'a>(
+    cast: &'a Cast,
+    proj: &event::Projection,
+    scene: Option<&str>,
+) -> Vec<&'a CastMember> {
+    match scene.and_then(|id| proj.scenes.get(id)) {
+        None => cast.members.iter().collect(),
+        Some(sc) => cast
+            .members
+            .iter()
+            .filter(|m| sc.has_actor(&m.dir))
+            .collect(),
+    }
+}
+
+/// 场景有效的归一 id：会话里真的存在这个场景分区时返回 Some（否则 None——
+/// 老事件/老会话的写入路由回世界层，行为与 M2 完全一致）
+fn scoped_scene(proj: &event::Projection, scene_id: Option<&str>) -> Option<String> {
+    scene_id
+        .filter(|id| proj.scenes.contains_key(*id))
+        .map(str::to_string)
+}
+
 /// 一次钩子运行 → 事件。没改动就不记（事件流只留真发生的事）；
 /// 「入席建基线」（force_baseline）例外：即使与卡上默认值相同也要记，
 /// 因为它定义的正是这个会话的起点。
+///
+/// `scene`（M3.2）：钩子运行所在的场景——黑板写入按它路由到场景分区
+/// （地点/在场者/时钟），实体键照旧归世界层。None = 无场景会话（世界层）。
+#[allow(clippy::too_many_arguments)]
 fn hook_effect(
     run: &card::HookRun,
     before: &serde_json::Value,
@@ -440,6 +532,7 @@ fn hook_effect(
     turn: u64,
     trigger: &str,
     force_baseline: bool,
+    scene: Option<&str>,
 ) -> Option<LogBody> {
     let after = run.state.clone().unwrap_or_else(|| before.clone());
     let state_set = if force_baseline {
@@ -457,6 +550,7 @@ fn hook_effect(
         state_set,
         blackboard: run.blackboard.clone(),
         memory: run.memory.clone(),
+        scene_id: scene.map(str::to_string),
         ts: store::unix_now(),
     }))
 }
@@ -492,23 +586,26 @@ fn run_load_hook_core(
     let proj = project_session(log, root, meta)?;
     let character = first_character(meta)?;
     let state = current_state(&proj, &character, loaded);
+    // 入席发生在聚焦场景里（M3.2）：on_load 的黑板写入按场景路由
+    let scene = scene_ctx(&proj);
     let run = card::run_hook_full(
         &loaded.source,
         card::HookCall::OnLoad,
         &card::HookEnv {
             state: state.clone(),
-            blackboard: blackboard_env(&blackboard_of(&proj)),
+            blackboard: blackboard_env(&proj.effective_board(scene.as_deref())),
             memory: memory_env(&proj.memory),
         },
         meta.seed,
         sink,
     );
-    apply_load_hook(root, meta, log, source, &run, &state)
+    apply_load_hook(root, meta, log, source, &run, &state, scene.as_deref())
 }
 
 /// `on_load` 的落盘：入席是「建立基线」——生效后的 state 作为基线补丁记进事件流
 /// （此后一律以会话为准，改卡的默认值不回头覆盖已有会话）。
 /// 与 [`apply_message_hook`] 分开：on_message 只记「真变了的」，on_load 必记。
+#[allow(clippy::too_many_arguments)]
 fn apply_load_hook(
     root: &std::path::Path,
     meta: &store::SessionMeta,
@@ -516,9 +613,10 @@ fn apply_load_hook(
     source: &str,
     run: &card::HookRun,
     before: &serde_json::Value,
+    scene: Option<&str>,
 ) -> Result<llm::HookReport, String> {
     let character = first_character(meta)?;
-    let proj = match hook_effect(run, before, &character, 0, source, true) {
+    let proj = match hook_effect(run, before, &character, 0, source, true, scene) {
         Some(body) => commit(log, root, meta, body)?,
         None => sync_now(log, root, meta)?,
     };
@@ -659,13 +757,14 @@ fn rebuild_from(
                 turn: 0,
                 reason: "init".into(),
                 board: board.clone(),
+                scene_id: None,
                 ts: store::unix_now(),
             }),
         );
         out.push(init.clone());
         event::fold(&mut proj, &init);
         // 再补跑一次 on_load：老会话的事件流里没有入席基线，重放得从「角色刚入席」重新开始
-        // （M3.1：全阵容各入席一次）
+        // （M3.1：全阵容各入席一次；此刻场景尚未落地，写入路由回世界层）
         for m in &cast.members {
             let state = m.loaded.default_state.clone();
             let run = card::run_hook_full(
@@ -679,7 +778,7 @@ fn rebuild_from(
                 meta.seed,
                 &NOOP_SINK,
             );
-            if let Some(body) = hook_effect(&run, &state, &m.dir, 0, "hook.on_load", true) {
+            if let Some(body) = hook_effect(&run, &state, &m.dir, 0, "hook.on_load", true, None) {
                 let rec = LogRecord::new(0, body);
                 out.push(rec.clone());
                 event::fold(&mut proj, &rec);
@@ -716,6 +815,7 @@ fn rebuild_from(
                                     &format!("{}:resolved", t.thread_id),
                                     None,
                                     meta.seed,
+                                    None,
                                 )
                                 .0
                                 {
@@ -736,9 +836,16 @@ fn rebuild_from(
             event::fold(&mut proj, rec);
             continue;
         }
-        // ① 用户消息：on_context 在它之前跑（设计 §4.1 B5 的注入时机）——全阵容各跑一次
+        // 这条消息所属的场景（M3.2）：分区已落地才有效，否则退回世界层路径。
+        // 场景事件是手动事件、早于消息折进投影，所以此刻的场景表就是当时的场景表。
+        let msg_scene = scoped_scene(
+            &proj,
+            Some(scene::normalize(msg.scene_id.as_deref())),
+        );
+        // ① 用户消息：on_context 在它之前跑（设计 §4.1 B5 的注入时机）——
+        //    本场景在场的成员各跑一次（被切走的场景冻结，不参与轮转）
         if msg.role == "user" {
-            for m in &cast.members {
+            for m in present_members(cast, &proj, msg_scene.as_deref()) {
                 let (run, before) = run_context_hook(
                     &m.loaded,
                     &proj,
@@ -746,10 +853,17 @@ fn rebuild_from(
                     meta.seed,
                     &proj.messages.clone(),
                     &NOOP_SINK,
+                    msg_scene.as_deref(),
                 );
-                if let Some(body) =
-                    hook_effect(&run, &before, &m.dir, msg.turn, "hook.on_context", false)
-                {
+                if let Some(body) = hook_effect(
+                    &run,
+                    &before,
+                    &m.dir,
+                    msg.turn,
+                    "hook.on_context",
+                    false,
+                    msg_scene.as_deref(),
+                ) {
                     let rec = LogRecord::new(0, body);
                     out.push(rec.clone());
                     event::fold(&mut proj, &rec);
@@ -759,38 +873,65 @@ fn rebuild_from(
         // ② 消息本身
         out.push(rec.clone());
         event::fold(&mut proj, rec);
-        // ③ 角色回复：时钟步进（设计 M1：每轮 +10 分钟，跨日进位）
+        // ③ 角色回复：时钟步进（设计 M1：每轮 +10 分钟，跨日进位）——推进的是
+        //    这条消息所在场景的局部时钟（世界层镜像由投影折叠同步）
         if msg.role == "char" && genesis {
-            let mut board = blackboard_of(&proj);
+            let mut board = proj.effective_board(msg_scene.as_deref());
             let (day, clock) = prompt::advance_clock(board.day, &board.clock);
             board.day = day;
             board.clock = clock;
+            let board = scene_board_value(&proj, msg_scene.as_deref(), board);
             let rec = LogRecord::new(
                 0,
                 LogBody::Blackboard(event::BlackboardEvent {
                     turn: msg.turn,
                     reason: "clock".into(),
                     board,
+                    scene_id: msg_scene.clone(),
                     ts: store::unix_now(),
                 }),
             );
             out.push(rec.clone());
             event::fold(&mut proj, &rec);
         }
-        // ④ on_message（每条新消息落地后，设计 §3）——全阵容各跑一次
-        for m in &cast.members {
-            let (run, before) =
-                run_message_hook_at(&m.loaded, &proj, &m.dir, &msg, meta.seed, &NOOP_SINK);
-            if let Some(body) = hook_effect(&run, &before, &m.dir, msg.turn, "hook.on_message", false) {
-                let rec = LogRecord::new(0, body);
-                out.push(rec.clone());
-                event::fold(&mut proj, &rec);
+        // ④ on_message（每条新消息落地后，设计 §3）——本场景在场的成员各跑一次。
+        //    过渡插页（system）不触发钩子：它是场景的叙事接缝，不是任何人说的话
+        //    （live 侧切场只落盘不跑钩子，重放这里保持同一条路径）
+        if msg.role != "system" {
+            for m in present_members(cast, &proj, msg_scene.as_deref()) {
+                let (run, before) = run_message_hook_at(
+                    &m.loaded,
+                    &proj,
+                    &m.dir,
+                    &msg,
+                    meta.seed,
+                    &NOOP_SINK,
+                    msg_scene.as_deref(),
+                );
+                if let Some(body) = hook_effect(
+                    &run,
+                    &before,
+                    &m.dir,
+                    msg.turn,
+                    "hook.on_message",
+                    false,
+                    msg_scene.as_deref(),
+                ) {
+                    let rec = LogRecord::new(0, body);
+                    out.push(rec.clone());
+                    event::fold(&mut proj, &rec);
+                }
             }
         }
         // ⑤⑥ 轮末：心理推进 + 状态树转移（与 commit_reply 同一份代码 → 重放同一条路径，
-        //     设计 §7.3-5）。全阵容各自推进；重放不重推界面事件（编辑历史不该再弹一次表情）。
+        //     设计 §7.3-5）。本场景在场的成员各自推进；重放不重推界面事件。
         if msg.role == "char" {
-            for (i, m) in cast.members.iter().enumerate() {
+            let members: Vec<usize> = present_members(cast, &proj, msg_scene.as_deref())
+                .iter()
+                .filter_map(|m| cast.members.iter().position(|x| x.dir == m.dir))
+                .collect();
+            for i in members {
+                let m = &cast.members[i];
                 let (body, _emotion) = tick_psyche(&proj, &m.dir, &m.loaded, msg.turn);
                 if let Some(body) = body {
                     let rec = LogRecord::new(0, body);
@@ -809,6 +950,7 @@ fn rebuild_from(
                     "on_turn_end",
                     None,
                     meta.seed,
+                    msg_scene.as_deref(),
                 )
                 .0
                 {
@@ -820,6 +962,19 @@ fn rebuild_from(
         }
     }
     Ok(out)
+}
+
+/// 场景感知的黑板快照（M3.2）：场景分区事件的 extra 必须只装场景 flags——
+/// 折叠时它整体替换分区 flags，混入世界层实体键会把实体状态误记成场景事实。
+fn scene_board_value(
+    proj: &event::Projection,
+    scene: Option<&str>,
+    mut board: store::Blackboard,
+) -> store::Blackboard {
+    if let Some(flags) = scene.and_then(|id| proj.scenes.get(id)).map(|sc| sc.flags.clone()) {
+        board.extra = flags;
+    }
+    board
 }
 
 // ---------- 设定集与记忆宫殿的接入（M2.1 / M2.2）----------
@@ -1135,6 +1290,7 @@ fn tree_env(
     loaded: &card::LoadedCard,
     event_name: &str,
     active_entities: Option<&std::collections::BTreeSet<String>>,
+    scene: Option<&str>,
 ) -> card::TreeEnv {
     let mut threads_active = std::collections::BTreeSet::new();
     let mut threads_resolved = std::collections::BTreeSet::new();
@@ -1151,7 +1307,7 @@ fn tree_env(
     }
     card::TreeEnv {
         event: event_name.to_string(),
-        blackboard: blackboard_env(&blackboard_of(proj)),
+        blackboard: blackboard_env(&proj.effective_board(scene)),
         state: current_state(proj, character, loaded),
         known: proj.known_for(character),
         codex_active: active_entities.cloned().unwrap_or_default(),
@@ -1174,13 +1330,15 @@ fn advance_state_tree(
     event_name: &str,
     active_entities: Option<&std::collections::BTreeSet<String>>,
     seed: u64,
+    // 转移发生的场景（M3.2）：判据环境读该场景分区，reveal 见证者 = 该场景在场者
+    scene: Option<&str>,
 ) -> (Vec<LogBody>, Vec<llm::UiEmit>) {
     let mut emits: Vec<llm::UiEmit> = Vec::new();
     let path = active_path_of(proj, tree, character);
     let Some(leaf) = path.last().cloned() else {
         return (Vec::new(), emits);
     };
-    let env = tree_env(proj, character, loaded, event_name, active_entities);
+    let env = tree_env(proj, character, loaded, event_name, active_entities, scene);
     let decision = match card::eval_state_tree(&loaded.source, &path, &env) {
         Ok(Some(d)) => d,
         Ok(None) => return (Vec::new(), emits),
@@ -1204,7 +1362,7 @@ fn advance_state_tree(
 
     // ① on_exit（旧叶）
     let (exit_body, exit_emits) = run_state_hook(
-        loaded, &local, character, &leaf, "on_exit", event_name, turn, seed,
+        loaded, &local, character, &leaf, "on_exit", event_name, turn, seed, scene,
     );
     emits.extend(exit_emits);
     if let Some(body) = exit_body {
@@ -1229,7 +1387,7 @@ fn advance_state_tree(
     // ③ on_enter（新叶）
     let to_leaf = to_path.last().cloned().unwrap_or_default();
     let (enter_body, enter_emits) = run_state_hook(
-        loaded, &local, character, &to_leaf, "on_enter", event_name, turn, seed,
+        loaded, &local, character, &to_leaf, "on_enter", event_name, turn, seed, scene,
     );
     emits.extend(enter_emits);
     if let Some(body) = enter_body {
@@ -1240,8 +1398,9 @@ fn advance_state_tree(
 
     // ④ 进入新路径即揭示（设计 §6.4：状态树的 reveal 解锁设定）。
     //    M3.1 视角化：见证者 = 黑板在场者 ∪ 转移者本人——她经历过这次揭示，
-    //    不在场的角色不知道（设计 §10.4「秘密真正成为某些人知道的事」）
-    let mut witnesses: Vec<String> = blackboard_of(proj).actors.clone();
+    //    不在场的角色不知道（设计 §10.4「秘密真正成为某些人知道的事」）。
+    //    M3.2 场景化：在场者取转移发生场景的分区（被切走的场景不目击）。
+    let mut witnesses: Vec<String> = proj.effective_board(scene).actors.clone();
     if !witnesses.iter().any(|w| w == character) {
         witnesses.push(character.to_string());
     }
@@ -1274,11 +1433,12 @@ fn run_state_hook(
     event_name: &str,
     turn: u64,
     seed: u64,
+    scene: Option<&str>,
 ) -> (Option<LogBody>, Vec<llm::UiEmit>) {
     if !card::card_has_state_hook(&loaded.source, state_id, kind) {
         return (None, Vec::new()); // 卡上没写这个钩子：不新建 Lua 实例
     }
-    let env = tree_env(proj, character, loaded, event_name, None);
+    let env = tree_env(proj, character, loaded, event_name, None, scene);
     let before = current_state(proj, character, loaded);
     let run = card::run_state_hook_full(&loaded.source, state_id, kind, &env, seed, &NOOP_SINK);
     if !run.result.logs.is_empty() {
@@ -1288,7 +1448,15 @@ fn run_state_hook(
         );
     }
     let emits: Vec<llm::UiEmit> = run.result.ui_events.iter().map(ui_emit).collect();
-    let body = hook_effect(&run, &before, character, turn, &format!("state.{kind}"), false);
+    let body = hook_effect(
+        &run,
+        &before,
+        character,
+        turn,
+        &format!("state.{kind}"),
+        false,
+        scene,
+    );
     (body, emits)
 }
 
@@ -1360,6 +1528,7 @@ fn blackboard_env(bb: &store::Blackboard) -> BTreeMap<String, serde_json::Value>
 
 /// 跑 `on_context`（B5 注入时机，设计 §4.1）：返回 (运行结果, 运行前的 state)。
 /// 降级卡与未定义该 hook 的卡返回默认（ran=false），不新建 Lua 实例。
+/// `scene`（M3.2）：钩子看到的是该场景的有效黑板（世界层 ∪ 场景分区）。
 #[allow(clippy::too_many_arguments)]
 fn run_context_hook(
     loaded: &card::LoadedCard,
@@ -1368,6 +1537,7 @@ fn run_context_hook(
     seed: u64,
     history: &[Message],
     sink: &card::UiSink,
+    scene: Option<&str>,
 ) -> (card::HookRun, serde_json::Value) {
     let state = current_state(proj, character, loaded);
     if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_context") {
@@ -1381,7 +1551,7 @@ fn run_context_hook(
         },
         &card::HookEnv {
             state: state.clone(),
-            blackboard: blackboard_env(&blackboard_of(proj)),
+            blackboard: blackboard_env(&proj.effective_board(scene)),
             memory: memory_env(&proj.memory), // 长期记忆读侧：记忆宫殿的键值（同 key 后写覆盖）
         },
         seed,
@@ -1398,6 +1568,7 @@ fn run_message_hook_at(
     msg: &Message,
     seed: u64,
     sink: &card::UiSink,
+    scene: Option<&str>,
 ) -> (card::HookRun, serde_json::Value) {
     let state = current_state(proj, character, loaded);
     if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_message") {
@@ -1408,7 +1579,7 @@ fn run_message_hook_at(
         card::HookCall::OnMessage { msg },
         &card::HookEnv {
             state: state.clone(),
-            blackboard: blackboard_env(&blackboard_of(proj)),
+            blackboard: blackboard_env(&proj.effective_board(scene)),
             memory: memory_env(&proj.memory),
         },
         seed,
@@ -1440,6 +1611,9 @@ fn assemble_prompt_core(
     codex_cache: Option<&CodexCache>,
     runtime: Option<&SessionRuntime>,
     tree_cache: Option<&TreeCache>,
+    // 发言所在的场景（M3.2 · 设计 §10.3）：组装只看这个舞台——
+    // 该场景的消息流分段、黑板分区、摘要分卷；其他场景是「与此同时」的盲区
+    scene: Option<&str>,
 ) -> Result<PromptRun, String> {
     let settings = store::load_settings(root).map_err(|e| e.to_string())?;
     let persona = match &meta.persona {
@@ -1450,25 +1624,38 @@ fn assemble_prompt_core(
         None => None,
     };
     // 隔离模式（设计 §10.2）：本轮发言 = 发言人独立的上下文组装。
-    // 全阵容的 on_context 都跑（各自 state 演进、黑板写入是公开的），
+    // 本场景在场的成员各跑 on_context（各自 state 演进、黑板写入是公开的），
     // 但注入（B5/卡片视角）只取发言人那份——其他角色的内心不进她的请求。
     let member = cast
         .get(speaker)
         .ok_or_else(|| format!("角色「{speaker}」不在这个会话的阵容里"))?;
     let loaded = &member.loaded;
     let character = member.dir.clone();
+    let scene_history = scene_messages(history, scene);
+    let history: &[Message] = &scene_history;
 
-    // B5：on_context hook（降级卡与未定义该 hook 的卡都跳过；窗口给最近消息）
-    let mut blackboard = blackboard_of(proj);
+    // B5：on_context hook（降级卡与未定义该 hook 的卡都跳过；窗口给本场景最近消息）
+    let mut blackboard = proj.effective_board(scene);
     let mut speaker_run: Option<(card::HookRun, serde_json::Value)> = None;
-    for m in &cast.members {
-        let (run, before) = run_context_hook(&m.loaded, proj, &m.dir, meta.seed, history, sink);
+    for m in present_members(cast, proj, scene) {
+        let (run, before) = run_context_hook(
+            &m.loaded, proj, &m.dir, meta.seed, history, sink, scene,
+        );
         if run.ran() {
-            // 黑板写入是公开事件（设计 §10.1：角色之间共享说出口的与做出来的）
+            // 黑板写入是公开事件（设计 §10.1：角色之间共享说出口的与做出来的）——
+            // 合并视图按同一路由语义生效（分区侧由折叠的场景路由事件落盘）
             event::apply_blackboard_sets(&mut blackboard, &run.blackboard);
         }
         if let Some(log) = log {
-            if let Some(body) = hook_effect(&run, &before, &m.dir, turn, "hook.on_context", false) {
+            if let Some(body) = hook_effect(
+                &run,
+                &before,
+                &m.dir,
+                turn,
+                "hook.on_context",
+                false,
+                scene,
+            ) {
                 commit(log, root, meta, body)?;
             }
         }
@@ -1476,7 +1663,7 @@ fn assemble_prompt_core(
             speaker_run = Some((run, before));
         }
     }
-    let (run, before) = speaker_run.expect("发言人必在阵容里");
+    let (run, before) = speaker_run.expect("发言人必在场（调用方已校验）");
     let card_state = run.state.clone().unwrap_or_else(|| before.clone());
 
     // ---- B2 指令层：状态树活跃路径的 directive（设计 §7.4「输出约束」）----
@@ -1641,6 +1828,7 @@ fn assemble_prompt_core(
         None
     };
 
+    let summary_text = proj.summary_for(scene);
     let inputs = prompt::BuildInputs {
         settings: &settings,
         persona: persona.as_ref(),
@@ -1655,7 +1843,8 @@ fn assemble_prompt_core(
         pending_threads: &pending,
         psyche_line: psyche_line.as_deref(),
         directive: directive.as_deref(),
-        summary: Some(proj.summary.as_str()),
+        // 摘要分卷（M3.2 · 设计 §10.4）：世界层大事记 + 本场景分卷；别的场景不进这次请求
+        summary: summary_text.as_deref(),
         cast_note: cast_note.as_deref(),
         history,
         user_content,
@@ -1756,6 +1945,8 @@ async fn stream_reply(
     summary_flags: Option<&SummaryFlags>,
     // 用户消息那一步的钩子报告（回复落盘后另有一次，会一起回给前端）
     user_report: llm::HookReport,
+    // 本轮对话所在的场景（M3.2 · 设计 §10.3）：回复与轮末推进都归属这个舞台
+    scene: Option<&str>,
 ) -> Result<StreamEvent, String> {
     let session_id = meta.id.as_str();
     let flag = match acquire_flag(flags, session_id) {
@@ -1803,6 +1994,7 @@ async fn stream_reply(
                     runtime,
                     tree_cache,
                     summary_flags,
+                    scene,
                 ) {
                     Ok(next) => {
                         forward_ui_events(on_event, &next);
@@ -1847,9 +2039,10 @@ fn plan_regenerate(
     Ok((kept, prior, turn, content))
 }
 
-/// 跑一轮 `on_message`（用户消息与回复都已落盘后调用，设计 §3）——**全阵容各跑一次**
-/// （M3.1：每条新消息落地，每个角色都看得到）。返回发言人的报告（卡内状态展示用），
-/// 其他成员的日志并入报告、界面事件照发。
+/// 跑一轮 `on_message`（用户消息与回复都已落盘后调用，设计 §3）——
+/// **本场景在场的成员各跑一次**（M3.1 全阵容 → M3.2 场景化：被切走的场景冻结，
+/// 不参与轮转）。返回发言人的报告（卡内状态展示用），其他成员的日志并入报告、界面事件照发。
+#[allow(clippy::too_many_arguments)]
 fn run_message_hooks(
     app: &AppHandle,
     root: &std::path::Path,
@@ -1859,11 +2052,14 @@ fn run_message_hooks(
     turn: u64,
     on_event: Option<&Channel<StreamEvent>>,
     log: &store::EventLog,
+    scene: Option<&str>,
 ) -> llm::HookReport {
     let sink = ui_sink(app);
     let mut speaker_report: Option<llm::HookReport> = None;
     let mut other_logs: Vec<String> = Vec::new();
-    for m in &cast.members {
+    // 投影失败时退回空投影（无场景 → 全员在场），与 M3.1 行为一致
+    let proj = project_session(log, root, meta).unwrap_or_default();
+    for m in present_members(cast, &proj, scene) {
         let report = run_message_hook_core(root, meta, &m.loaded, &m.dir, turn, Some(&sink), log);
         if let Some(channel) = on_event {
             for event in &report.ui_events {
@@ -1880,7 +2076,7 @@ fn run_message_hooks(
             other_logs.extend(report.logs);
         }
     }
-    let mut report = speaker_report.expect("发言人必在阵容里");
+    let mut report = speaker_report.expect("发言人必在场（调用方已校验）");
     report.logs.extend(other_logs);
     report
 }
@@ -1932,6 +2128,8 @@ fn run_message_hook_core(
             return report_with_log(turn, e);
         }
     };
+    // 消息落在哪个场景，钩子就在哪个场景里跑（M3.2）：分区已落地才有效
+    let msg_scene = scoped_scene(&proj, Some(scene::normalize(current.scene_id.as_deref())));
 
     // 钩子入参现场：把卡实际收到的 msg 与 state 原样记下来（JSON）。
     // 「条件不成立」这类静默失败，只有看到入参本身才能定死原因。
@@ -1942,6 +2140,7 @@ fn run_message_hook_core(
         &current,
         meta.seed,
         sink.unwrap_or(&NOOP_SINK),
+        msg_scene.as_deref(),
     );
     crate::diag::record(
         "hook",
@@ -1952,7 +2151,7 @@ fn run_message_hook_core(
         ),
     );
 
-    let report = apply_message_hook(log, root, meta, turn, &run, &before);
+    let report = apply_message_hook(log, root, meta, turn, &run, &before, msg_scene.as_deref());
     crate::diag::record(
         "hook",
         format!(
@@ -1983,6 +2182,7 @@ fn report_with_log(turn: u64, log: String) -> llm::HookReport {
 ///
 /// 与 `run_message_hook` 分开，是为了让「钩子副作用真的落盘」这件事能被单测直接钉住
 /// （不必启动 Tauri 运行时）；也正因如此，编辑/删除历史时同一份代码能被重放调用。
+#[allow(clippy::too_many_arguments)]
 fn apply_message_hook(
     log: &store::EventLog,
     root: &std::path::Path,
@@ -1990,6 +2190,7 @@ fn apply_message_hook(
     turn: u64,
     run: &card::HookRun,
     before: &serde_json::Value,
+    scene: Option<&str>,
 ) -> llm::HookReport {
     let mut report = llm::HookReport {
         turn,
@@ -2001,7 +2202,8 @@ fn apply_message_hook(
     };
 
     let character = first_character(meta).unwrap_or_default();
-    if let Some(body) = hook_effect(run, before, &character, turn, "hook.on_message", false) {
+    if let Some(body) = hook_effect(run, before, &character, turn, "hook.on_message", false, scene)
+    {
         if let Err(e) = commit(log, root, meta, body) {
             report.logs.push(e);
         }
@@ -2040,6 +2242,7 @@ fn tick_psyche(
             state_set: patch,
             blackboard: Vec::new(),
             memory: Vec::new(),
+            scene_id: None,
             ts: store::unix_now(),
         }))
     };
@@ -2047,8 +2250,8 @@ fn tick_psyche(
 }
 
 /// 回复落定后的收尾（stream_reply 与单测共用同一份代码，避免两处等价逻辑）：
-/// 回复事件（带发言人署名）→ 时钟步进事件 → on_message 事件（全阵容）→
-/// 心理运行时推进（全阵容）→ 状态树轮末求值（全阵容，各自路径）。
+/// 回复事件（带发言人署名与场景归属）→ 时钟步进事件（发言人所在场景的局部时钟）→
+/// on_message 事件（本场景在场成员）→ 心理运行时推进（在场成员）→ 状态树轮末求值（在场成员）。
 ///
 /// 事件化后时钟步进也是事件：重放同一轮必然得到同一时刻（设计 §7.3-5）。
 #[allow(clippy::too_many_arguments)]
@@ -2064,40 +2267,46 @@ fn commit_reply(
     runtime: Option<&SessionRuntime>,
     tree_cache: Option<&TreeCache>,
     summary_flags: Option<&SummaryFlags>,
+    scene: Option<&str>,
 ) -> Result<llm::HookReport, String> {
     let reply = Message {
         turn,
         role: "char".into(),
         content: text.to_string(),
         ts: store::unix_now(),
-        scene_id: None,
+        scene_id: scene.map(str::to_string),
         name: Some(cast.display_name(speaker)),
     };
     log.append(root, &meta.id, LogBody::Message(reply))
         .map_err(|e| format!("回复落盘失败：{e}"))?;
 
-    // 一轮完成：黑板时钟步进（设计 M1：每轮 +10 分钟，跨日进位）
+    // 一轮完成：黑板时钟步进（设计 M1：每轮 +10 分钟，跨日进位）。
+    // 多场景会话推进的是**本场景的局部时钟**（场景分区快照 + 世界层镜像由折叠同步）；
+    // 单场景/老会话照旧是世界层事件（scene_id = None）。
     let proj = project_session(log, root, meta)?;
-    let mut bb = blackboard_of(&proj);
-    let (day, clock) = prompt::advance_clock(bb.day, &bb.clock);
-    bb.day = day;
-    bb.clock = clock;
+    let scene_id = scoped_scene(&proj, scene);
+    let mut board = proj.effective_board(scene.as_deref());
+    let (day, clock) = prompt::advance_clock(board.day, &board.clock);
+    board.day = day;
+    board.clock = clock;
+    let board = scene_board_value(&proj, scene_id.as_deref(), board);
     log.append(
         root,
         &meta.id,
         LogBody::Blackboard(event::BlackboardEvent {
             turn,
             reason: "clock".into(),
-            board: bb,
+            board,
+            scene_id: scene_id.clone(),
             ts: store::unix_now(),
         }),
     )
     .map_err(|e| e.to_string())?;
 
-    // 回复落盘后跑 on_message（设计 §3：每条新消息落地后，全阵容各跑一次）
+    // 回复落盘后跑 on_message（设计 §3：每条新消息落地后，在场成员各跑一次）
     let mut report: Option<llm::HookReport> = None;
     let mut other_logs: Vec<String> = Vec::new();
-    for m in &cast.members {
+    for m in present_members(cast, &proj, scene_id.as_deref()) {
         let r = run_message_hook_core(root, meta, &m.loaded, &m.dir, turn, sink, log);
         if m.dir == speaker {
             report = Some(r);
@@ -2105,12 +2314,12 @@ fn commit_reply(
             other_logs.extend(r.logs);
         }
     }
-    let mut report = report.expect("发言人必在阵容里");
+    let mut report = report.expect("发言人必在场（调用方已校验）");
     report.logs.extend(other_logs);
 
-    // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——全阵容各自推进，结果同样是事件
+    // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——在场成员各自推进，结果同样是事件
     if let Ok(proj) = project_session(log, root, meta) {
-        for m in &cast.members {
+        for m in present_members(cast, &proj, scene_id.as_deref()) {
             let (body, emotion) = tick_psyche(&proj, &m.dir, &m.loaded, turn);
             if let Some(body) = body {
                 if let Err(e) = commit(log, root, meta, body) {
@@ -2127,10 +2336,11 @@ fn commit_reply(
     }
 
     // 轮末：状态树转移求值（设计 §7.3-2「默认转移推迟到轮末」，保证一轮对话内状态稳定）。
-    // M3.1：每个角色各求值自己的树（转移事件带 character，路径按角色分道）
+    // M3.1：每个角色各求值自己的树（转移事件带 character，路径按角色分道）；
+    // M3.2：判据环境与揭示见证者取本场景分区。
     let active_entities = runtime.map(|r| r.previously_active(&meta.id));
     if let Ok(proj) = project_session(log, root, meta) {
-        for m in &cast.members {
+        for m in present_members(cast, &proj, scene_id.as_deref()) {
             let Some(tree) = load_tree(&m.loaded, tree_cache) else {
                 continue;
             };
@@ -2143,6 +2353,7 @@ fn commit_reply(
                 "on_turn_end",
                 active_entities.as_ref(),
                 meta.seed,
+                scene_id.as_deref(),
             );
             // 转移的界面事件（on_enter 的 ui.emit）与本轮钩子事件一起回给前端
             report.ui_events.extend(emits);
@@ -2218,10 +2429,21 @@ pub async fn send_message(
     );
 
     // 双槽位组装（设计 §4.1）：历史来自事件流投影，高轮次只解析新增行。
-    // 隔离模式（设计 §10.2）：组装取发言人视角，其他角色的 B4/B5/内心不进这次请求
+    // 隔离模式（设计 §10.2）：组装取发言人视角，其他角色的 B4/B5/内心不进这次请求；
+    // 场景化（M3.2 · 设计 §10.3）：组装只看聚焦场景的舞台——别的场景是「与此同时」的盲区
     let proj = project_session(&log, &root, &meta)?;
-    let history = proj.messages.clone();
-    let turn = history.last().map(|m| m.turn).unwrap_or(0) + 1;
+    let scene = scene_ctx(&proj);
+    // 发言人必须在本场景（被切走的场景冻结，不在场的人不能开口）
+    if let Some(id) = &scene {
+        let present = proj.scenes.get(id).map(|sc| sc.has_actor(&speaker));
+        if present == Some(false) {
+            return Err(format!(
+                "「{}」不在当前场景——切到他所在的场景再说话",
+                cast.display_name(&speaker)
+            ));
+        }
+    }
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0) + 1;
     // on_context 在此运行并事件化落盘：卡片可能顺手改了 state/黑板/界面事件
     let run = assemble_prompt_core(
         &ui_sink(&app),
@@ -2229,7 +2451,7 @@ pub async fn send_message(
         &meta,
         &cast,
         &speaker,
-        &history,
+        &proj.messages,
         &proj,
         Some(&content),
         turn,
@@ -2237,6 +2459,7 @@ pub async fn send_message(
         Some(&codex_cache),
         Some(&runtime),
         Some(&tree_cache),
+        scene.as_deref(),
     )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
@@ -2246,13 +2469,13 @@ pub async fn send_message(
         });
     }
 
-    // 用户消息落盘后进入流式请求
+    // 用户消息落盘后进入流式请求（归属当前场景；无场景会话照旧 None）
     let user_msg = Message {
         turn,
         role: "user".into(),
         content: content.clone(),
         ts: store::unix_now(),
-        scene_id: None,
+        scene_id: scene.clone(),
         name: None,
     };
     log.append(&root, &session_id, LogBody::Message(user_msg))
@@ -2260,7 +2483,17 @@ pub async fn send_message(
 
     // 设计 §3：`on_message` 在**每条**新消息落地后调用——用户消息同样要跑，
     // 否则卡看不到本轮输入，且它的反应（比如好感度 +1）来不及影响这一轮的生成。
-    let report = run_message_hooks(&app, &root, &meta, &cast, &speaker, turn, Some(&on_event), &log);
+    let report = run_message_hooks(
+        &app,
+        &root,
+        &meta,
+        &cast,
+        &speaker,
+        turn,
+        Some(&on_event),
+        &log,
+        scene.as_deref(),
+    );
 
     stream_reply(
         &app,
@@ -2279,6 +2512,7 @@ pub async fn send_message(
         Some(&tree_cache),
         Some(&summary_flags),
         report,
+        scene.as_deref(),
     )
     .await
 }
@@ -2351,8 +2585,14 @@ pub async fn regenerate(
         .map_err(|e| e.to_string())?;
     sync_now(&log, &root, &meta)?;
 
-    // 重roll 前先让 on_context 按当前（已删掉末尾回复的）历史跑一轮
+    // 重roll 前先让 on_context 按当前（已删掉末尾回复的）历史跑一轮。
+    // 场景归属跟随被重roll 的那条用户消息（回复与它同场，M3.2）
     let proj = project_session(&log, &root, &meta)?;
+    let scene = all
+        .iter()
+        .rev()
+        .find(|m| m.role == "user" && m.turn == turn)
+        .and_then(|m| scoped_scene(&proj, m.scene_id.as_deref()));
     let history = &proj.messages[..proj.messages.len().saturating_sub(1)]; // 组装历史不含本轮用户消息
     let run = assemble_prompt_core(
         &ui_sink(&app),
@@ -2368,6 +2608,7 @@ pub async fn regenerate(
         Some(&codex_cache),
         Some(&runtime),
         Some(&tree_cache),
+        scene.as_deref(),
     )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
@@ -2377,7 +2618,17 @@ pub async fn regenerate(
         });
     }
     // 上一轮的 on_message 效果已随截断消失，这里补跑：**恰好一次**，不是重复计分
-    let report = run_message_hooks(&app, &root, &meta, &cast, &speaker, turn, Some(&on_event), &log);
+    let report = run_message_hooks(
+        &app,
+        &root,
+        &meta,
+        &cast,
+        &speaker,
+        turn,
+        Some(&on_event),
+        &log,
+        scene.as_deref(),
+    );
     stream_reply(
         &app,
         &root,
@@ -2395,6 +2646,7 @@ pub async fn regenerate(
         Some(&tree_cache),
         Some(&summary_flags),
         report,
+        scene.as_deref(),
     )
     .await
 }
@@ -2418,12 +2670,22 @@ pub fn stop_generation(session_id: String, flags: State<'_, CancelFlags>) -> Res
 // ---------- 黑板 v0（设计 §4.1 B1 数据源）----------
 
 #[tauri::command]
-pub fn get_blackboard(session_id: String) -> Result<store::Blackboard, String> {
-    store::load_blackboard(&root(), &session_id).map_err(|e| e.to_string())
+pub fn get_blackboard(
+    session_id: String,
+    log: State<'_, store::EventLog>,
+) -> Result<store::Blackboard, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    // 返回聚焦场景的有效黑板（世界层 ∪ 场景分区）——界面编辑的就是这个视图
+    Ok(proj.effective_board(scene_ctx(&proj).as_deref()))
 }
 
 /// 手动编辑黑板（全量替换；保存后下一轮组装生效）。
 /// 手改进事件流（reason=manual）——它不是派生结果，重放历史时不会被抹掉。
+///
+/// 场景路由（M3.2）：时间是世界层的；地点/在场者是**聚焦场景分区**的
+/// （多场景会话改的是当前舞台），折叠时世界层镜像自动同步。
 #[tauri::command]
 pub fn update_blackboard(
     session_id: String,
@@ -2435,17 +2697,29 @@ pub fn update_blackboard(
 ) -> Result<store::Blackboard, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let bb = store::Blackboard {
+    let proj = project_session(&log, &root, &meta)?;
+    let scene_id = scene_ctx(&proj);
+    let partition = scene_id
+        .as_deref()
+        .and_then(|id| proj.scenes.get(id))
+        .cloned();
+    let board = store::Blackboard {
         day,
         clock: clock.trim().to_string(),
         place: place.trim().to_string(),
-        actors: actors.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
-        extra: Default::default(),
+        actors: actors
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect(),
+        // 场景分区事件的 extra = 场景 flags（整体替换语义，保留既有 flags）
+        extra: partition
+            .as_ref()
+            .map(|sc| sc.flags.clone())
+            .unwrap_or_default(),
     };
-    let turn = project_session(&log, &root, &meta)?
-        .last_message()
-        .map(|m| m.turn)
-        .unwrap_or(0);
+    let turn = proj.last_message().map(|m| m.turn).unwrap_or(0);
+    let board_scene = if partition.is_some() { scene_id.clone() } else { None };
     let proj = commit(
         &log,
         &root,
@@ -2453,11 +2727,369 @@ pub fn update_blackboard(
         LogBody::Blackboard(event::BlackboardEvent {
             turn,
             reason: "manual".into(),
-            board: bb.clone(),
+            scene_id: board_scene,
+            board: board.clone(),
             ts: store::unix_now(),
         }),
     )?;
-    Ok(proj.blackboard.unwrap_or(bb))
+    Ok(proj.effective_board(scene_id.as_deref()))
+}
+
+// ---------- 场景与多线（M3.2 · 设计 §10.3：「与此同时」）----------
+
+/// 场景视图（前端场景条的数据源）
+#[derive(Serialize)]
+pub struct SceneView {
+    pub scenes: Vec<scene::Scene>,
+    /// 当前聚焦场景（None = 无场景会话，单场景语义）
+    pub active: Option<String>,
+}
+
+fn scene_view(proj: &event::Projection) -> SceneView {
+    SceneView {
+        scenes: proj.scenes.values().cloned().collect(),
+        active: proj.active_scene.clone(),
+    }
+}
+
+/// 小说式过渡插页（切场/分场/合场的叙事接缝）：system 消息，只归属目标场景。
+/// 重放不重跑它的钩子（见 rebuild_from 的 system 跳过），live 侧同样只落盘不跑钩子。
+fn append_transition(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    turn: u64,
+    scene_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let msg = Message {
+        turn,
+        role: "system".into(),
+        content: text.to_string(),
+        ts: store::unix_now(),
+        scene_id: Some(scene_id.to_string()),
+        name: None,
+    };
+    log.append(root, &meta.id, LogBody::Message(msg))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 场景事件 → 重投影 → 场景视图（场景命令的统一收尾）
+fn commit_scene(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    event: event::SceneEvent,
+) -> Result<SceneView, String> {
+    let proj = commit(log, root, meta, LogBody::Scene(event))?;
+    Ok(scene_view(&proj))
+}
+
+#[tauri::command]
+pub fn list_scenes(
+    session_id: String,
+    log: State<'_, store::EventLog>,
+) -> Result<SceneView, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    // 老会话没有场景事件：把世界层黑板补落地为缺省场景（只读视图，不落事件）
+    if !proj.has_scenes() {
+        let board = blackboard_of(&proj);
+        return Ok(SceneView {
+            scenes: vec![scene::Scene::from_board(
+                scene::DEFAULT_SCENE_ID,
+                "开场",
+                &board,
+                0,
+                "default",
+                store::unix_now(),
+            )],
+            active: Some(scene::DEFAULT_SCENE_ID.into()),
+        });
+    }
+    Ok(scene_view(&proj))
+}
+
+/// 新建场景（另起一个舞台；视角随即切过去，插入过渡插页）
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn create_scene(
+    session_id: String,
+    title: String,
+    place: String,
+    actors: Vec<String>,
+    note: Option<String>,
+    log: State<'_, store::EventLog>,
+) -> Result<SceneView, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    let board = proj.effective_board(scene_ctx(&proj).as_deref());
+    let ts = store::unix_now();
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+    let id = scene::new_scene_id(ts);
+    let sc = scene::Scene {
+        id: id.clone(),
+        title: title.trim().to_string(),
+        place: place.trim().to_string(),
+        actors: actors
+            .into_iter()
+            .filter(|a| !a.trim().is_empty())
+            .collect(),
+        day: board.day,
+        clock: board.clock.clone(),
+        flags: BTreeMap::new(),
+        created_turn: turn,
+        origin: "manual".into(),
+        parent: None,
+        status: scene::STATUS_ACTIVE.into(),
+        ts,
+    };
+    let title = sc.title.clone();
+    let place_text = sc.place.clone();
+    commit_scene(
+        &log,
+        &root,
+        &meta,
+        event::SceneEvent {
+            turn,
+            op: "create".into(),
+            scene_id: id.clone(),
+            scene: Some(sc),
+            others: Vec::new(),
+            origin: "manual".into(),
+            note: note.clone(),
+            ts,
+        },
+    )?;
+    append_transition(
+        &log,
+        &root,
+        &meta,
+        turn,
+        &id,
+        &note.unwrap_or_else(|| format!("——{title}·{place_text}——")),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(scene_view(&sync_now(&log, &root, &meta)?))
+}
+
+/// 切场（设计 §10.3：视角切到另一场景，被切走的场景冻结；插入小说式过渡）
+#[tauri::command]
+pub fn switch_scene(
+    session_id: String,
+    scene_id: String,
+    note: Option<String>,
+    log: State<'_, store::EventLog>,
+) -> Result<SceneView, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+    let Some(sc) = proj.scenes.get(&scene_id) else {
+        return Err(format!("场景「{scene_id}」不存在"));
+    };
+    let (place, frozen) = (sc.place.clone(), sc.status == scene::STATUS_FROZEN);
+    commit_scene(
+        &log,
+        &root,
+        &meta,
+        event::SceneEvent {
+            turn,
+            op: "switch".into(),
+            scene_id: scene_id.clone(),
+            scene: None,
+            others: Vec::new(),
+            origin: "manual".into(),
+            note: note.clone(),
+            ts: store::unix_now(),
+        },
+    )?;
+    let transition = note.unwrap_or_else(|| {
+        if frozen {
+            format!("（回到）{place}——")
+        } else {
+            format!("与此同时，{place}——")
+        }
+    });
+    append_transition(&log, &root, &meta, turn, &scene_id, &transition)
+        .map_err(|e| e.to_string())?;
+    Ok(scene_view(&sync_now(&log, &root, &meta)?))
+}
+
+/// 分场（设计 §10.3：一部分角色离场另立场景，视角跟到新场景）
+#[tauri::command]
+pub fn split_scene(
+    session_id: String,
+    title: String,
+    place: String,
+    moving: Vec<String>,
+    note: Option<String>,
+    log: State<'_, store::EventLog>,
+) -> Result<SceneView, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+    let active = scene_ctx(&proj).ok_or("这个会话还没有场景可以分场")?;
+    let parent = proj
+        .scenes
+        .get(&active)
+        .cloned()
+        .ok_or("当前聚焦场景不存在")?;
+    let ts = store::unix_now();
+    let id = scene::new_scene_id(ts);
+    // 校验与快照在这里算一遍（错误当场报）；在场者扣减由折叠按事件重演
+    let (_next_parent, sc) = parent
+        .split_from(&id, title.trim(), place.trim(), &moving, ts)
+        .map_err(|e| e)?;
+    let (title, place_text) = (sc.title.clone(), sc.place.clone());
+    commit_scene(
+        &log,
+        &root,
+        &meta,
+        event::SceneEvent {
+            turn,
+            op: "split".into(),
+            scene_id: id.clone(),
+            scene: Some(sc),
+            others: vec![parent.id.clone()],
+            origin: "manual".into(),
+            note: note.clone(),
+            ts,
+        },
+    )?;
+    append_transition(
+        &log,
+        &root,
+        &meta,
+        turn,
+        &id,
+        &note.unwrap_or_else(|| format!("与此同时，{place_text}——{title}")),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(scene_view(&sync_now(&log, &root, &meta)?))
+}
+
+/// 合场（设计 §10.3：两路场景并进聚焦场景——在场者并集、时间取较晚一路、
+/// flags 冲突聚焦场景赢；被并入的场景归档。**各角色记忆不合并**——
+/// 他们各自记得自己那条线里的事，这正是多线的戏剧价值。）
+#[tauri::command]
+pub fn merge_scenes(
+    session_id: String,
+    from: Vec<String>,
+    note: Option<String>,
+    log: State<'_, store::EventLog>,
+) -> Result<SceneView, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+    let active = scene_ctx(&proj).ok_or("这个会话还没有场景可以合场")?;
+    if from.is_empty() {
+        return Err("没有指定要并入哪些场景".into());
+    }
+    if from.contains(&active) {
+        return Err("不能把场景并进它自己".into());
+    }
+    let target = proj
+        .scenes
+        .get(&active)
+        .cloned()
+        .ok_or("当前聚焦场景不存在")?;
+    let mut sources = Vec::new();
+    for id in &from {
+        let sc = proj
+            .scenes
+            .get(id)
+            .filter(|sc| sc.status != scene::STATUS_MERGED)
+            .ok_or_else(|| format!("场景「{id}」不存在或已归档"))?;
+        sources.push(sc.clone());
+    }
+    let ts = store::unix_now();
+    let target = target.merge_into(&sources, ts);
+    let place = target.place.clone();
+    commit_scene(
+        &log,
+        &root,
+        &meta,
+        event::SceneEvent {
+            turn,
+            op: "merge".into(),
+            scene_id: active.clone(),
+            scene: Some(target),
+            others: from.clone(),
+            origin: "manual".into(),
+            note: note.clone(),
+            ts,
+        },
+    )?;
+    append_transition(
+        &log,
+        &root,
+        &meta,
+        turn,
+        &active,
+        &note.unwrap_or_else(|| format!("两条线在此交汇——{place}——")),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(scene_view(&sync_now(&log, &root, &meta)?))
+}
+
+/// 编辑场景分区（地点/在场者/局部时钟/标题；flags 经黑板面板的场景视图维护）
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn update_scene(
+    session_id: String,
+    scene_id: String,
+    title: Option<String>,
+    place: Option<String>,
+    actors: Option<Vec<String>>,
+    day: Option<i64>,
+    clock: Option<String>,
+    log: State<'_, store::EventLog>,
+) -> Result<SceneView, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+    let mut sc = proj
+        .scenes
+        .get(&scene_id)
+        .cloned()
+        .ok_or_else(|| format!("场景「{scene_id}」不存在"))?;
+    if let Some(t) = title {
+        sc.title = t.trim().to_string();
+    }
+    if let Some(p) = place {
+        sc.place = p.trim().to_string();
+    }
+    if let Some(a) = actors {
+        sc.actors = a.into_iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+    }
+    if let Some(d) = day {
+        sc.day = d;
+    }
+    if let Some(c) = clock {
+        sc.clock = c.trim().to_string();
+    }
+    commit_scene(
+        &log,
+        &root,
+        &meta,
+        event::SceneEvent {
+            turn,
+            op: "update".into(),
+            scene_id: scene_id.clone(),
+            scene: Some(sc),
+            others: Vec::new(),
+            origin: "manual".into(),
+            note: None,
+            ts: store::unix_now(),
+        },
+    )
 }
 
 // ---------- 记忆检查器 v0（设计 §4.2：组装结果逐层可见）----------
@@ -2480,15 +3112,15 @@ pub fn preview_prompt(
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
     let cast = Cast::load(&root, &meta)?;
     let proj = project_session(&log, &root, &meta)?;
-    let history = proj.messages.clone();
-    let turn = history.last().map(|m| m.turn).unwrap_or(0) + 1;
+    let scene = scene_ctx(&proj);
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0) + 1;
     let run = assemble_prompt_core(
         &ui_sink(&app),
         &root,
         &meta,
         &cast,
         cast.first().dir.as_str(),
-        &history,
+        &proj.messages,
         &proj,
         None,
         turn,
@@ -2496,6 +3128,7 @@ pub fn preview_prompt(
         Some(&codex_cache),
         Some(&runtime),
         Some(&tree_cache),
+        scene.as_deref(),
     )?;
     Ok(run.assembly)
 }
@@ -2682,6 +3315,8 @@ fn resolve_thread_at(
             &format!("{id}:resolved"), // 设计 §8.5 的 thread:<id>:resolved（id 本身已带 thread. 前缀）
             Some(&active_entities),
             meta.seed,
+            // 手动收线是全局事件：所有场景的角色树都要求值，不限定场景
+            None,
         );
         for body in events {
             commit(log, root, meta, body)?;
@@ -2768,6 +3403,23 @@ fn timeline_brief(record: &event::LogRecord) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             format!("{}：{}", m.origin, clip(content, 50))
+        }
+        LogBody::Scene(s) => {
+            let title = s
+                .scene
+                .as_ref()
+                .map(|sc| sc.title.clone())
+                .unwrap_or_default();
+            match s.op.as_str() {
+                "switch" => format!("切场 → {}", s.scene_id),
+                "split" => format!("分场 → {}（{}）", title, clip(&s.scene_id, 24)),
+                "merge" => format!(
+                    "合场 ← {} 并入 {}",
+                    s.others.join("、"),
+                    clip(&title, 24)
+                ),
+                _ => format!("{} {}（{}）", s.op, clip(&title, 24), s.origin),
+            }
         }
     }
 }
@@ -3037,23 +3689,54 @@ impl SummaryFlags {
 
 /// 取待总结的批次（滑出 L0 窗口、且未被此前摘要覆盖的消息）。
 /// 设计 §5.3：消息滑出窗口即异步触发一次总结（不阻塞对话）。
-fn summary_batch(proj: &event::Projection) -> Option<(Vec<summarize::BatchMessage>, u64)> {
-    let total = proj.messages.len();
-    if total <= prompt::WINDOW_MESSAGES {
-        return None; // 还没滑出窗口
+/// 场景维度的批次判定（M3.2 · 设计 §10.3/§10.4）：每个场景各记水位、各卷各的摘要。
+/// 「滑出窗口」按**当前舞台**算——非活跃场景（被切走/冻结）的消息本来就不在任何
+/// 上下文窗口里，过水位即可总结；活跃场景保留最近窗口不总结。一次消化最老的一个场景。
+fn summary_batch_scenes(
+    proj: &event::Projection,
+    include_window: bool,
+) -> Option<(String, Vec<summarize::BatchMessage>, u64)> {
+    let active = proj.active_scene_id().map(str::to_string);
+    let mut by_scene: BTreeMap<String, Vec<&Message>> = BTreeMap::new();
+    for m in &proj.messages {
+        by_scene
+            .entry(proj.scene_of_message(m))
+            .or_default()
+            .push(m);
     }
-    let cutoff = total - prompt::WINDOW_MESSAGES;
-    let batch: Vec<summarize::BatchMessage> = proj.messages[..cutoff]
-        .iter()
-        .filter(|m| m.turn > proj.summary_upto)
-        .filter(|m| m.role == "user" || m.role == "char") // OOC/system 不进剧情记忆（§4.1）
-        .map(summarize::BatchMessage::from_message)
-        .collect();
-    if batch.is_empty() {
-        return None;
+    let mut candidates: Vec<(String, Vec<summarize::BatchMessage>, u64)> = Vec::new();
+    for (scene_id, msgs) in &by_scene {
+        let upto = proj.summary_upto_for(scene_id);
+        let mut pending: Vec<&Message> = msgs
+            .iter()
+            .copied()
+            .filter(|m| m.turn > upto)
+            .filter(|m| m.role == "user" || m.role == "char") // OOC/system 不进剧情记忆（§4.1）
+            .collect();
+        // 活跃场景的最近窗口仍在上下文里，不总结；include_window（force）时照常吞掉
+        if Some(scene_id) == active.as_ref() && !include_window {
+            if pending.len() <= prompt::WINDOW_MESSAGES {
+                continue;
+            }
+            let cut = pending.len() - prompt::WINDOW_MESSAGES;
+            pending.truncate(cut);
+        }
+        if pending.is_empty() {
+            continue;
+        }
+        let batch: Vec<summarize::BatchMessage> = pending
+            .into_iter()
+            .map(summarize::BatchMessage::from_message)
+            .collect();
+        let to_turn = batch.iter().map(|m| m.turn).max().unwrap_or(0);
+        candidates.push((scene_id.clone(), batch, to_turn));
     }
-    let to_turn = batch.iter().map(|m| m.turn).max().unwrap_or(0);
-    Some((batch, to_turn))
+    // 最老的场景先沉淀（按批次末轮升序；并列时按场景名，保持确定性）
+    candidates.sort_by(|a, b| {
+        (a.2, &a.0)
+            .cmp(&(b.2, &b.0))
+    });
+    candidates.into_iter().next()
 }
 
 /// 角色的 needs/values（设定集 char 实体的倾向性；心理评价的对照清单，设计 §9.2）
@@ -3113,6 +3796,7 @@ fn story_time_at_turn(
 ///
 /// 一切 LLM 产物都**先落草稿/提案**，注入只认 canon（设计 §6.9）——唯一的例外是 L3 事实与
 /// 情景记忆：它们是「角色的亲身经历」，本就不进设定注入，而是走宫殿召回（§5.2）。
+#[allow(clippy::too_many_arguments)]
 fn apply_summary_outcome(
     log: &store::EventLog,
     root: &std::path::Path,
@@ -3123,6 +3807,8 @@ fn apply_summary_outcome(
     to_turn: u64,
     story_day: i64,
     story_clock: &str,
+    // 本批归属的场景（M3.2 摘要分卷）：场景卷进 scene_summaries，大事记进世界层
+    scene_id: &str,
 ) -> Result<usize, String> {
     let character = first_character(meta)?;
     let mut applied = 0usize;
@@ -3138,6 +3824,24 @@ fn apply_summary_outcome(
                 delta: outcome.summary_delta.clone(),
                 from_turn,
                 to_turn,
+                scene_id: Some(scene_id.to_string()),
+                ts,
+            }),
+        )?;
+        applied += 1;
+    }
+    // 世界层大事记（仅公开事件）：单独成卷，任何场景组装时都能读到
+    if !outcome.chronicle.trim().is_empty() {
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::Summary(event::SummaryEvent {
+                turn: to_turn,
+                delta: outcome.chronicle.clone(),
+                from_turn,
+                to_turn,
+                scene_id: None,
                 ts,
             }),
         )?;
@@ -3352,24 +4056,11 @@ async fn run_summary(
     let loaded = card::load_card(&root, &character).map_err(|e| e.to_string())?;
     let proj = project_session(&log, &root, &meta)?;
 
-    let (mut batch, mut to_turn) = match summary_batch(&proj) {
+    // 场景维度的批次（M3.2）：force 时连活跃场景的最近窗口一并消化
+    let (scene_id, mut batch, mut to_turn) = match summary_batch_scenes(&proj, force) {
         Some(b) => b,
         None if !force => return Ok("没有待总结的批次".into()),
-        None => {
-            // 手动触发：把最近的窗口外消息也总结一遍（force）
-            let cutoff = proj.messages.len();
-            let batch: Vec<summarize::BatchMessage> = proj.messages[..cutoff]
-                .iter()
-                .filter(|m| m.turn > proj.summary_upto)
-                .filter(|m| m.role == "user" || m.role == "char")
-                .map(summarize::BatchMessage::from_message)
-                .collect();
-            if batch.is_empty() {
-                return Ok("没有待总结的消息".into());
-            }
-            let to_turn = batch.iter().map(|m| m.turn).max().unwrap_or(0);
-            (batch, to_turn)
-        }
+        None => return Ok("没有待总结的消息".into()),
     };
     // 批次分块：一次失败的总结会让积压越滚越大（从未总结的消息全堆进下一次调用），
     // 推理型模型的思考 token 随批单调涨——直到永远挤不出正文（真机压测 2026-09-20
@@ -3384,7 +4075,12 @@ async fn run_summary(
     let provider = pick_util_provider(&root)?;
     let world = session_world(&meta);
     let cx = load_codex(&root, None, &world);
-    let board = blackboard_of(&proj);
+    // 故事时钟取该场景的局部时钟（被冻结的场景按它冻结时的时刻总结）
+    let board = proj.effective_board(Some(scene_id.as_str()));
+    let scene_label = proj
+        .scenes
+        .get(&scene_id)
+        .map(|sc| if sc.title.is_empty() { sc.place.clone() } else { sc.title.clone() });
     let active_threads: Vec<String> = proj
         .threads
         .values()
@@ -3397,8 +4093,9 @@ async fn run_summary(
         card_name: &loaded.card.name,
         persona_name: meta.persona.as_deref(),
         premise: meta.premise.as_deref(),
+        scene_label: scene_label.as_deref(),
         story_clock: &board.clock,
-        rolling_summary: &proj.summary,
+        rolling_summary: &proj.summary_for(Some(scene_id.as_str())).unwrap_or_default(),
         active_threads: &active_threads,
         needs: &needs,
     };
@@ -3435,12 +4132,19 @@ async fn run_summary(
         to_turn,
         board.day,
         &board.clock,
+        &scene_id,
     )?;
     crate::diag::record(
         "summary",
-        format!("总结第 {from_turn}–{to_turn} 轮：落 {applied} 条事件（provider={}）", provider.name),
+        format!(
+            "总结第 {from_turn}–{to_turn} 轮（场景 {}）：落 {applied} 条事件（provider={}）",
+            scene_id,
+            provider.name
+        ),
     );
-    Ok(format!("已总结第 {from_turn}–{to_turn} 轮，落 {applied} 条事件"))
+    Ok(format!(
+        "已总结第 {from_turn}–{to_turn} 轮（场景 {scene_id}），落 {applied} 条事件"
+    ))
 }
 
 /// 手动触发一次总结（设置页/排查用；正常路径是轮末自动触发）
@@ -3539,7 +4243,31 @@ return {
             LogBody::Blackboard(event::BlackboardEvent {
                 turn: 0,
                 reason: "init".into(),
-                board,
+                scene_id: None,
+                board: board.clone(),
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        // 缺省场景落地（与 new_session 同构）
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Scene(event::SceneEvent {
+                turn: 0,
+                op: "create".into(),
+                scene_id: scene::DEFAULT_SCENE_ID.into(),
+                scene: Some(scene::Scene::from_board(
+                    scene::DEFAULT_SCENE_ID,
+                    "开场",
+                    &board,
+                    0,
+                    "default",
+                    store::unix_now(),
+                )),
+                others: Vec::new(),
+                origin: "default".into(),
+                note: None,
                 ts: store::unix_now(),
             }),
         )
@@ -3641,14 +4369,16 @@ return {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
             .unwrap();
         let after_user = run_message_hook_core(root, meta, loaded, &speaker, turn, None, log);
-        let after_reply =
-            commit_reply(root, meta, &cast, &speaker, turn, "（回复）", None, log, None, None, None)
-                .unwrap();
+        let after_reply = commit_reply(
+            root, meta, &cast, &speaker, turn, "（回复）", None, log, None, None, None, None,
+        )
+        .unwrap();
 
         // 报告取「本轮最后一次」（回复后的状态就是前端看到的最终状态）
         let mut report = after_reply;
@@ -3694,7 +4424,30 @@ return {
             LogBody::Blackboard(event::BlackboardEvent {
                 turn: 0,
                 reason: "init".into(),
-                board,
+                scene_id: None,
+                board: board.clone(),
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Scene(event::SceneEvent {
+                turn: 0,
+                op: "create".into(),
+                scene_id: scene::DEFAULT_SCENE_ID.into(),
+                scene: Some(scene::Scene::from_board(
+                    scene::DEFAULT_SCENE_ID,
+                    "开场",
+                    &board,
+                    0,
+                    "default",
+                    store::unix_now(),
+                )),
+                others: Vec::new(),
+                origin: "default".into(),
+                note: None,
                 ts: store::unix_now(),
             }),
         )
@@ -3738,6 +4491,7 @@ return {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
@@ -3745,17 +4499,7 @@ return {
         let member = cast.get(speaker).unwrap();
         run_message_hook_core(root, meta, &member.loaded, speaker, turn, None, log);
         commit_reply(
-            root,
-            meta,
-            cast,
-            speaker,
-            turn,
-            "（回复）",
-            None,
-            log,
-            None,
-            None,
-            None,
+            root, meta, cast, speaker, turn, "（回复）", None, log, None, None, None, None,
         )
         .unwrap();
         run.assembly
@@ -3926,11 +4670,14 @@ return {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         run_message_hook_core(&root, &meta, &loaded, &speaker, turn, None, &log);
-        commit_reply(&root, &meta, &cast, &speaker, turn, "（重roll 的回复）", None, &log, None, None, None)
-            .unwrap();
+        commit_reply(
+            &root, &meta, &cast, &speaker, turn, "（重roll 的回复）", None, &log, None, None, None, None,
+        )
+        .unwrap();
 
         assert_eq!(
             stored_state(&root, &meta)["favorability"],
@@ -4033,6 +4780,7 @@ return {
             &proj,
             None,
             2,
+            None,
             None,
             None,
             None,
@@ -4639,6 +5387,7 @@ return {
                     delta: delta.into(),
                     from_turn: turn - 1,
                     to_turn: turn,
+                    scene_id: None,
                     ts: 0,
                 }),
             )
@@ -4749,7 +5498,8 @@ return {
             .unwrap();
         }
         let proj = project_session(&log, &root, &meta).unwrap();
-        let (batch, to_turn) = summary_batch(&proj).expect("应有滑出窗口的批次");
+        let (_scene, batch, to_turn) =
+            summary_batch_scenes(&proj, false).expect("应有滑出窗口的批次");
         assert_eq!(
             batch.len(),
             46 - prompt::WINDOW_MESSAGES,
@@ -4762,6 +5512,7 @@ return {
         let cx = load_codex(&root, None, "default");
         // 造一份总结产物（等价于模型回了合法 JSON 并被 sanitize）
         let outcome = summarize::sanitize(summarize::SummaryOutcome {
+            chronicle: String::new(),
             summary_delta: "她记住了那条约定。".into(),
             episodes: vec![summarize::EpisodeDraft {
                 content: "深夜闭馆时她把便签递过来。".into(),
@@ -4803,12 +5554,20 @@ return {
             }],
         });
         let applied =
-            apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, to_turn, 1, "20:00").unwrap();
+            apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, to_turn, 1, "20:00", "scene.main")
+                .unwrap();
         assert!(applied >= 5, "摘要 + 2 条记忆 + 3 条提案：{applied}");
 
         let proj = project_session(&log, &root, &meta).unwrap();
-        assert!(proj.summary.contains("约定"), "摘要增量应进投影：{}", proj.summary);
-        assert_eq!(proj.summary_upto, to_turn, "记录已总结到哪一轮（批次从它之后取）");
+        // 摘要分卷（M3.2）：场景卷挂在 scene.main 名下，世界层大事记为空
+        let volume = proj.summary_for(Some("scene.main")).unwrap_or_default();
+        assert!(volume.contains("约定"), "场景分卷应进投影：{volume}");
+        assert!(proj.summary.is_empty(), "没有公开事件就不该写世界层大事记");
+        assert_eq!(
+            proj.summary_upto_for("scene.main"),
+            to_turn,
+            "场景水位记到哪一轮（批次从它之后取）"
+        );
         assert_eq!(proj.episodes.len(), 2, "情景记忆 + L3 事实都进记忆对象层");
 
         // 情景记忆能被召回（见证者默认取 actors，视角过滤后仍命中）
@@ -4844,7 +5603,10 @@ return {
         assert_eq!(store::read_proposals(&root, &meta.id).unwrap().len(), 3);
 
         // 第二批：已总结过的部分不再重复总结
-        assert!(summary_batch(&proj).is_none(), "批次已被覆盖，不该重复总结");
+        assert!(
+            summary_batch_scenes(&proj, false).is_none(),
+            "批次已被覆盖，不该重复总结"
+        );
     }
 
     /// M2 验收第 2 条：约定类情节能被正确了结——现状卡同步更新、结果自动入宫殿，
@@ -5027,6 +5789,7 @@ state_tree = {
 
         let cx = load_codex(&root, None, "default");
         let outcome = summarize::sanitize(summarize::SummaryOutcome {
+            chronicle: String::new(),
             summary_delta: String::new(),
             episodes: vec![summarize::EpisodeDraft {
                 content: "他道了谢，她记住了。".into(),
@@ -5048,7 +5811,8 @@ state_tree = {
             codex: Vec::new(),
         });
         // 假装总结发生在很久以后：调用方传来的「当前」黑板已是第 9 天深夜
-        apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, 1, 9, "23:50").unwrap();
+        apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, 1, 9, "23:50", "scene.main")
+            .unwrap();
 
         let proj = project_session(&log, &root, &meta).unwrap();
         let objects: Vec<palace::MemObject> = proj
@@ -5255,6 +6019,7 @@ return {
             LogBody::Blackboard(event::BlackboardEvent {
                 turn: 0,
                 reason: "manual".into(),
+                scene_id: None,
                 board,
                 ts: store::unix_now(),
             }),
@@ -5364,6 +6129,163 @@ return {
         assert!(
             b4a.contains("猫头鹰"),
             "小雨应召回自己见证的记忆（话题命中）：{b4a}"
+        );
+    }
+    // M3.2 验收（commands 层）：消息级重建时，钩子的黑板写入按消息所在场景重演；
+    // 场景事件（手动事件）在重建后原样保留。设计 §10.3 + §7.3-5。
+
+    use super::*;
+    use crate::event::SceneEvent;
+    use crate::scene::{self, Scene};
+
+    fn split_scene_event(turn: u64, from: &Scene, id: &str, title: &str, place: &str, moving: &[&str], ts: u64) -> LogBody {
+        let (_rest, sc) = from
+            .split_from(id, title, place, &moving.iter().map(|s| s.to_string()).collect::<Vec<_>>(), ts)
+            .unwrap();
+        LogBody::Scene(SceneEvent {
+            turn,
+            op: "split".into(),
+            scene_id: id.into(),
+            scene: Some(sc),
+            others: vec![from.id.clone()],
+            origin: "manual".into(),
+            note: None,
+            ts,
+        })
+    }
+
+    #[test]
+    fn rebuild_reroutes_hook_writes_to_their_scene() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let cast = single_cast(&meta, &loaded);
+        let log = store::EventLog::new();
+
+        // 分场：小雨离开 scene.main 另立 scene.b（main 留空不行——单角色会话，
+        // 所以这里直接把缺省场景让给「书店」：把 main 的在场者改成玩家以外的人不行，
+        // 退而求其次：新建场景并切过去（create 语义）。
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let main = proj.scenes.get(scene::DEFAULT_SCENE_ID).cloned().unwrap();
+        let ts = store::unix_now();
+        let (_next, _sc) = {
+            // 单角色没法 split（必须留一人），改走 create：书架另一头的「子场景」
+            let sc = Scene {
+                id: "scene.b".into(),
+                title: "书店".into(),
+                place: "旧书店".into(),
+                actors: vec!["小雨".into()],
+                day: main.day,
+                clock: main.clock.clone(),
+                flags: Default::default(),
+                created_turn: 0,
+                origin: "manual".into(),
+                parent: Some(main.id.clone()),
+                status: scene::STATUS_ACTIVE.into(),
+                ts,
+            };
+            log.append(
+                &root,
+                &meta.id,
+                LogBody::Scene(SceneEvent {
+                    turn: 0,
+                    op: "create".into(),
+                    scene_id: sc.id.clone(),
+                    scene: Some(sc),
+                    others: Vec::new(),
+                    origin: "manual".into(),
+                    note: None,
+                    ts,
+                }),
+            )
+            .unwrap();
+            log.append(
+                &root,
+                &meta.id,
+                LogBody::Scene(SceneEvent {
+                    turn: 0,
+                    op: "switch".into(),
+                    scene_id: "scene.b".into(),
+                    scene: None,
+                    others: Vec::new(),
+                    origin: "manual".into(),
+                    note: None,
+                    ts,
+                }),
+            )
+            .unwrap();
+            ((), ())
+        };
+
+        // 在 scene.b 里对话：HOOK_CARD 的 on_message 收到「谢谢」写 place=天台
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Message(Message {
+                turn: 1,
+                role: "user".into(),
+                content: "谢谢".into(),
+                ts: 1,
+                scene_id: Some("scene.b".into()),
+                name: None,
+            }),
+        )
+        .unwrap();
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &cast,
+            "小雨",
+            &proj.messages,
+            &proj,
+            Some("谢谢"),
+            1,
+            Some(&log),
+            None,
+            None,
+            None,
+            Some("scene.b"),
+        )
+        .unwrap();
+        let _ = run;
+        run_message_hook_core(&root, &meta, &loaded, "小雨", 1, None, &log);
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(
+            proj.scenes["scene.b"].place, "天台",
+            "钩子写入路由到消息所在场景"
+        );
+        assert_eq!(
+            proj.scenes[scene::DEFAULT_SCENE_ID].place,
+            "自习区",
+            "缺省场景分区不被波及"
+        );
+
+        // 编辑那条消息 → 重建：场景事件保留，钩子按场景重演
+        let records = log.read(&root, &meta.id).unwrap();
+        let mut edited = records.as_ref().clone();
+        if let LogBody::Message(m) = &mut edited
+            .iter_mut()
+            .find(|r| r.as_message().map(|m| m.role == "user").unwrap_or(false))
+            .expect("应有用户消息")
+            .body
+        {
+            m.content = "谢谢你啦".into();
+        }
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &edited, 1).unwrap();
+        log.rewrite(&root, &meta.id, &rebuilt).unwrap();
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(proj.scenes.len(), 2, "场景事件在重建后保留");
+        assert_eq!(proj.active_scene.as_deref(), Some("scene.b"));
+        assert_eq!(
+            proj.scenes["scene.b"].place, "天台",
+            "重建重演的钩子写入仍路由到 scene.b"
+        );
+        assert_eq!(
+            proj.scenes[scene::DEFAULT_SCENE_ID].place,
+            "自习区",
+            "重建后缺省场景分区仍不波及"
         );
     }
 }

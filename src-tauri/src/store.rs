@@ -559,6 +559,43 @@ pub fn write_summary(root: &Path, session_id: &str, text: &str) -> StoreResult<(
     Ok(())
 }
 
+/// 全量重写 scenes.json（M3.2：场景投影的派生文件，明文可查）
+pub fn write_scenes(
+    root: &Path,
+    session_id: &str,
+    scenes: &[crate::scene::Scene],
+    active: Option<&str>,
+) -> StoreResult<()> {
+    let dir = session_dir(root, session_id);
+    if !dir.is_dir() {
+        return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
+    }
+    let payload = serde_json::json!({ "active": active, "scenes": scenes });
+    std::fs::write(
+        dir.join("scenes.json"),
+        serde_json::to_string_pretty(&payload)? + "\n",
+    )?;
+    Ok(())
+}
+
+/// 读取 scenes.json（不存在/坏文件返回 None；权威数据在事件流投影里）
+pub fn read_scenes(root: &Path, session_id: &str) -> Option<(Vec<crate::scene::Scene>, Option<String>)> {
+    let path = session_dir(root, session_id).join("scenes.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let scenes = v
+        .get("scenes")?
+        .as_array()?
+        .iter()
+        .filter_map(|s| serde_json::from_value::<crate::scene::Scene>(s.clone()).ok())
+        .collect();
+    let active = v
+        .get("active")
+        .and_then(|a| a.as_str())
+        .map(str::to_string);
+    Some((scenes, active))
+}
+
 /// 读取 summary.md（不存在返回空串）
 pub fn read_summary(root: &Path, session_id: &str) -> StoreResult<String> {
     let path = session_dir(root, session_id).join("summary.md");
@@ -1435,6 +1472,7 @@ mod tests {
                 state_set: vec![],
                 blackboard: vec![],
                 memory: vec![],
+                scene_id: None,
                 ts: 0,
             }),
         ));

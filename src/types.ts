@@ -91,6 +91,35 @@ export interface Message {
   name?: string | null;
 }
 
+/** 场景（scene.rs · M3.2 · 设计 §10.3）：「与此同时」的隔离顶层单元 */
+export interface Scene {
+  id: string;
+  title: string;
+  place: string;
+  /** 在场者（角色目录名；空 = 不设限） */
+  actors: string[];
+  /** 场景局部故事时钟（被冻结的场景停在这一刻） */
+  day: number;
+  clock: string;
+  /** 场景 flags（仅本场景成立的临时事实） */
+  flags?: Record<string, unknown>;
+  created_turn: number;
+  /** default | manual | split | merge */
+  origin: string;
+  /** 分场来源场景 id */
+  parent?: string | null;
+  /** active | frozen | merged（合并进他场的归档留档） */
+  status: string;
+  ts: number;
+}
+
+/** 场景视图（list_scenes / 切场分场合场命令的返回） */
+export interface SceneView {
+  scenes: Scene[];
+  /** 当前聚焦场景（None = 无场景会话） */
+  active?: string | null;
+}
+
 // ---------- 角色卡（card.rs · 设计 §3）----------
 
 /** 示例对话中的一行（role: user | char） */

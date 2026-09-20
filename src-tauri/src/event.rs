@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::card::KvSet;
+use crate::scene::{self, Scene};
 use crate::store::{Blackboard, MemRecord, Message};
 
 /// 事件序号（从 1 起，等于它在流中的位置；重写时整体重排）
@@ -46,6 +47,10 @@ pub struct EffectEvent {
     /// api.memory.set 的写入（M2.1 起由记忆宫殿消费）
     #[serde(default)]
     pub memory: Vec<KvSet>,
+    /// 钩子运行时所在的场景（M3.2 · 设计 §10.3）：黑板写入按它路由到场景分区。
+    /// None = 无场景会话（世界层，兼容旧事件流）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
     pub ts: u64,
 }
 
@@ -56,6 +61,10 @@ pub struct BlackboardEvent {
     /// init（建会话基线）/ manual（界面手改）/ clock（轮末时钟步进）/ hook（钩子触发）
     pub reason: String,
     pub board: Blackboard,
+    /// 场景分区快照（M3.2）：Some(id) 时 board 的地点/在场者/时间/extra（=场景 flags）
+    /// 是**该场景分区**的值，不碰世界层；None = 世界层快照（旧语义，兼容旧事件流）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
     pub ts: u64,
 }
 
@@ -128,6 +137,10 @@ pub struct SummaryEvent {
     pub from_turn: u64,
     #[serde(default)]
     pub to_turn: u64,
+    /// 摘要分卷（M3.2 · 设计 §10.3）：Some(id) = 该场景的分卷；None = 世界层大事记
+    /// （仅公开事件）。None 同时兼容旧事件流（全部落世界层）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
     pub ts: u64,
 }
 
@@ -166,6 +179,31 @@ pub struct MemoryEvent {
     pub ts: u64,
 }
 
+/// 场景生命周期事件（M3.2 · 设计 §10.3：切场/分场/合场/冻结进事件流，回放可重现）。
+///
+/// 与摘要/提案同理：场景的创建与切换是**玩家/导演的动作**，不是消息的派生结果，
+/// 消息级重建永远保留它们（否则编辑一句台词就会把场景史抹掉）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneEvent {
+    pub turn: u64,
+    /// create（落地新场景，含缺省场景补落地）/ switch（切场）/ split（分场）/
+    /// merge（合场）/ freeze / resume
+    pub op: String,
+    /// 事件主角场景：create/split = 新场景；switch/freeze/resume = 目标场景；merge = 合入目标
+    pub scene_id: String,
+    /// 场景全量快照（create/split/merge 必带；折叠时按 id 后写覆盖）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<Scene>,
+    /// split = 分场来源（其在场者要扣掉移出名单）；merge = 被并入的场景（置为 merged）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<String>,
+    #[serde(default = "default_origin")]
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub ts: u64,
+}
+
 fn default_origin() -> String {
     "manual".into()
 }
@@ -182,6 +220,7 @@ pub enum LogBody {
     Summary(SummaryEvent),
     Proposal(ProposalEvent),
     Memory(MemoryEvent),
+    Scene(SceneEvent),
 }
 
 impl From<Message> for LogBody {
@@ -208,6 +247,7 @@ impl LogBody {
             LogBody::Summary(_) => "summary",
             LogBody::Proposal(_) => "proposal",
             LogBody::Memory(_) => "memory",
+            LogBody::Scene(_) => "scene",
         }
     }
 
@@ -223,6 +263,7 @@ impl LogBody {
             LogBody::Summary(s) => s.turn,
             LogBody::Proposal(p) => p.turn,
             LogBody::Memory(m) => m.turn,
+            LogBody::Scene(s) => s.turn,
         }
     }
 
@@ -238,6 +279,7 @@ impl LogBody {
             LogBody::Summary(s) => serde_json::to_value(s),
             LogBody::Proposal(p) => serde_json::to_value(p),
             LogBody::Memory(m) => serde_json::to_value(m),
+            LogBody::Scene(s) => serde_json::to_value(s),
         }
         .map_err(|e| format!("事件序列化失败：{e}"))?;
         if let Some(obj) = v.as_object_mut() {
@@ -268,6 +310,7 @@ impl LogBody {
             "summary" => serde_json::from_value(v).map(LogBody::Summary).map_err(bad),
             "proposal" => serde_json::from_value(v).map(LogBody::Proposal).map_err(bad),
             "memory" => serde_json::from_value(v).map(LogBody::Memory).map_err(bad),
+            "scene" => serde_json::from_value(v).map(LogBody::Scene).map_err(bad),
             other => Err(format!("未知事件类型：{other}")),
         }
     }
@@ -312,8 +355,11 @@ impl LogRecord {
             LogBody::Thread(t) => t.origin != "manual",
             LogBody::Codex(c) => c.origin != "manual",
             // 摘要与提案是**模型产物**，不是确定性派生：重放不重新调用模型，
-            // 所以它们永远保留（编辑历史只重算状态/转移/心理，设计 §7.3-5 的承诺范围）
-            LogBody::Summary(_) | LogBody::Proposal(_) | LogBody::Memory(_) => false,
+            // 所以它们永远保留（编辑历史只重算状态/转移/心理，设计 §7.3-5 的承诺范围）。
+            // 场景事件同理：切场/分场/合场是玩家/导演的动作，不从消息派生。
+            LogBody::Summary(_) | LogBody::Proposal(_) | LogBody::Memory(_) | LogBody::Scene(_) => {
+                false
+            }
         }
     }
 
@@ -434,6 +480,15 @@ pub struct Projection {
     pub proposals: BTreeMap<String, serde_json::Value>,
     /// 结构化记忆对象（M2.6 管线写入的情景记忆；键值事实仍在 memory 里）
     pub episodes: Vec<serde_json::Value>,
+    /// 场景表（M3.2 · 设计 §10.3）：场景本体含黑板分区（地点/在场者/局部时钟/flags）。
+    /// 空 = 无场景会话（世界层黑板单场景，M2 行为）。
+    pub scenes: BTreeMap<String, Scene>,
+    /// 当前聚焦的场景（切场的落点）；Some 时必是 scenes 里的 active 场景
+    pub active_scene: Option<String>,
+    /// 摘要分卷：场景 id → 该场景的滚动摘要（scene_id 落值的 summary 事件折叠于此）
+    pub scene_summaries: BTreeMap<String, String>,
+    /// 摘要水位（场景维度）：场景 id → 已总结到哪一轮（批次按场景取）
+    pub summary_upto_of: BTreeMap<String, u64>,
     pub last_seq: Seq,
 }
 
@@ -456,6 +511,78 @@ impl Projection {
         }
         set
     }
+
+    /// 消息归属的场景（读侧归一：None = 缺省场景）
+    pub fn scene_of_message(&self, m: &Message) -> String {
+        scene::normalize(m.scene_id.as_deref()).to_string()
+    }
+
+    /// 某场景的黑板分区（地点/在场者/局部时钟/flags）；场景不存在返回 None
+    pub fn scene_partition(&self, scene_id: Option<&str>) -> Option<&Scene> {
+        let id = scene_id?;
+        self.scenes.get(id)
+    }
+
+    /// 当前聚焦场景 id（多场景会话才有；单场景/老会话 = None，读侧退化为世界层）
+    pub fn active_scene_id(&self) -> Option<&str> {
+        self.active_scene.as_deref()
+    }
+
+    /// 组装用的**有效黑板**（M3.2 · 设计 §10.3）：世界层（时间基准/实体键/世界 flags）
+    /// ∪ 该场景分区（地点/在场者/局部时钟/场景 flags）。场景分区有值就以它为准；
+    /// 场景不存在（老会话/单场景）= 世界层黑板原样（M2 行为不变）。
+    pub fn effective_board(&self, scene_id: Option<&str>) -> Blackboard {
+        let mut board = self.blackboard.clone().unwrap_or_else(Blackboard::default_board);
+        let Some(part) = self.scene_partition(scene_id) else {
+            return board;
+        };
+        board.day = part.day;
+        board.clock = part.clock.clone();
+        board.place = part.place.clone();
+        if !part.actors.is_empty() {
+            board.actors = part.actors.clone();
+        }
+        for (k, v) in &part.flags {
+            board.extra.insert(k.clone(), v.clone());
+        }
+        board
+    }
+
+    /// 组装注入用的滚动摘要：世界层大事记 + 该场景分卷（摘要分卷防跨视角泄漏，
+    /// 设计 §10.4）。场景无分卷时只有世界层；两者皆空返回 None。
+    pub fn summary_for(&self, scene_id: Option<&str>) -> Option<String> {
+        let world = self.summary.trim();
+        let scene_text = scene_id
+            .and_then(|id| self.scene_summaries.get(id))
+            .map(|s| s.trim())
+            .unwrap_or("");
+        let mut parts: Vec<String> = Vec::new();
+        if !world.is_empty() {
+            parts.push(world.to_string());
+        }
+        if !scene_text.is_empty() {
+            parts.push(scene_text.to_string());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    }
+
+    /// 某场景的摘要水位（批次从它之后取）。场景建立时水位即落 0（各场景独立记账）；
+    /// 没有条目的场景（老会话的归一缺省场景）退回全局水位——旧语义按全局轮次取批次。
+    pub fn summary_upto_for(&self, scene_id: &str) -> u64 {
+        self.summary_upto_of
+            .get(scene_id)
+            .copied()
+            .unwrap_or(self.summary_upto)
+    }
+
+    /// 会话是否已有显式场景（多场景会话的判据；单场景/老会话 = false）
+    pub fn has_scenes(&self) -> bool {
+        !self.scenes.is_empty()
+    }
 }
 
 /// 在基线上折叠事件流
@@ -474,6 +601,95 @@ pub fn project_over(records: &[LogRecord], base: &Base) -> Projection {
         fold(&mut p, rec);
     }
     p
+}
+
+/// 把一条场景事件折叠进投影（场景生命周期的不变量在这里维持：
+/// 至多一个活跃聚焦场景；被切走的场景冻结；被合并的场景归档）。
+pub fn fold_scene(p: &mut Projection, s: &SceneEvent) {
+    match s.op.as_str() {
+        "create" | "split" => {
+            if let Some(sc) = &s.scene {
+                let mut sc = sc.clone();
+                if !sc.is_active() {
+                    sc.status = scene::STATUS_ACTIVE.into();
+                }
+                // 场景建立即开一本自己的摘要账（水位从 0 起算，与全局水位脱钩）
+                p.summary_upto_of.entry(sc.id.clone()).or_insert(0);
+                p.scenes.insert(sc.id.clone(), sc);
+            }
+            if s.op == "split" {
+                // 来源场景扣掉移出的在场者并冻结（others[0] = 分场来源）
+                let moved = p
+                    .scenes
+                    .get(&s.scene_id)
+                    .map(|sc| sc.actors.clone())
+                    .unwrap_or_default();
+                if let Some(parent) = s.others.first().and_then(|id| p.scenes.get_mut(id)) {
+                    parent.actors.retain(|a| !moved.contains(a));
+                    parent.status = scene::STATUS_FROZEN.into();
+                }
+            }
+            // 视角带到新场景：首个落地 = 缺省场景接管；分场/显式新建 = 直接去新舞台
+            p.active_scene = Some(s.scene_id.clone());
+        }
+        "switch" => {
+            // 被切走的场景冻结（设计 §10.3：冻结 ≠ 删除，切回来原地继续）
+            if let Some(prev) = p.active_scene.clone() {
+                if prev != s.scene_id {
+                    if let Some(sc) = p.scenes.get_mut(&prev) {
+                        sc.status = scene::STATUS_FROZEN.into();
+                    }
+                }
+            }
+            if let Some(sc) = p.scenes.get_mut(&s.scene_id) {
+                sc.status = scene::STATUS_ACTIVE.into();
+                // 世界层时间基准跟随视角（世界时钟=「现在」；回忆场景靠 versions，M3.7）
+                let (day, clock) = (sc.day, sc.clock.clone());
+                if let Some(world) = p.blackboard.as_mut() {
+                    world.day = day;
+                    world.clock = clock;
+                }
+            }
+            p.active_scene = Some(s.scene_id.clone());
+        }
+        "merge" => {
+            if let Some(sc) = &s.scene {
+                p.scenes.insert(s.scene_id.clone(), sc.clone());
+            }
+            // 被并入的场景归档：留档可查，不再推进
+            for id in &s.others {
+                if let Some(sc) = p.scenes.get_mut(id) {
+                    sc.status = scene::STATUS_MERGED.into();
+                }
+                if p.active_scene.as_deref() == Some(id.as_str()) {
+                    p.active_scene = Some(s.scene_id.clone());
+                }
+            }
+            p.active_scene = Some(s.scene_id.clone());
+        }
+        "freeze" => {
+            // 冻结活跃场景没有意义（没有聚焦的会话无法推进），防御性忽略
+            if p.active_scene.as_deref() != Some(s.scene_id.as_str()) {
+                if let Some(sc) = p.scenes.get_mut(&s.scene_id) {
+                    sc.status = scene::STATUS_FROZEN.into();
+                }
+            }
+        }
+        "resume" => {
+            if let Some(sc) = p.scenes.get_mut(&s.scene_id) {
+                if sc.status == scene::STATUS_FROZEN {
+                    sc.status = scene::STATUS_ACTIVE.into();
+                }
+            }
+        }
+        // 手动编辑分区（地点/在场者/局部时钟/标题）：快照整体替换
+        "update" => {
+            if let Some(sc) = &s.scene {
+                p.scenes.insert(s.scene_id.clone(), sc.clone());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 把一条事件折叠进投影（增量折叠与整体投影走同一份代码，防两处语义漂移）
@@ -500,10 +716,12 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
                 }
             }
             if !e.blackboard.is_empty() {
-                let bb = p
-                    .blackboard
-                    .get_or_insert_with(|| Blackboard::default_board());
-                apply_blackboard_sets(bb, &e.blackboard);
+                // 黑板写入按钩子所在场景路由（M3.2）：地点/在场者/时钟进场景分区，
+                // 实体键与世界 flags 归世界层；无场景 = 世界层（M2 语义）
+                let scene_part = e.scene_id.as_deref().and_then(|id| p.scenes.get_mut(id));
+                let bb = p.blackboard.get_or_insert_with(Blackboard::default_board);
+                apply_blackboard_sets_scoped(bb, scene_part, &e.blackboard);
+                mirror_active_scene(p);
             }
             for kv in &e.memory {
                 p.memory.push(MemRecord {
@@ -516,7 +734,27 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
                 });
             }
         }
-        LogBody::Blackboard(b) => p.blackboard = Some(b.board.clone()),
+        LogBody::Blackboard(b) => {
+            match b.scene_id.as_deref() {
+                None => {
+                    // 世界层快照（init/manual/clock 的旧语义）：活跃场景分区保持同步
+                    p.blackboard = Some(b.board.clone());
+                    if let Some(id) = p.active_scene.clone() {
+                        if let Some(sc) = p.scenes.get_mut(&id) {
+                            sync_scene_from_board(sc, &b.board);
+                        }
+                    }
+                }
+                Some(id) => {
+                    // 场景分区快照（M3.2）：只动该场景；extra 整体 = 场景 flags
+                    if let Some(sc) = p.scenes.get_mut(id) {
+                        sync_scene_from_board(sc, &b.board);
+                        sc.flags = b.board.extra.clone();
+                    }
+                }
+            }
+            mirror_active_scene(p);
+        }
         LogBody::Transition(t) => p.transitions.push(t.clone()),
         LogBody::Thread(t) => {
             if let Some(snapshot) = &t.thread {
@@ -552,11 +790,28 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
         LogBody::Summary(s) => {
             let delta = s.delta.trim();
             if !delta.is_empty() {
-                if !p.summary.is_empty() {
-                    p.summary.push('\n');
+                match s.scene_id.as_deref() {
+                    // 场景分卷（M3.2 · 设计 §10.4：摘要分卷防跨视角泄漏）
+                    Some(id) => {
+                        let volume = p.scene_summaries.entry(id.to_string()).or_default();
+                        if !volume.is_empty() {
+                            volume.push('\n');
+                        }
+                        volume.push_str(delta);
+                    }
+                    // 世界层大事记（None 兼容旧事件流：全部落世界层）
+                    None => {
+                        if !p.summary.is_empty() {
+                            p.summary.push('\n');
+                        }
+                        p.summary.push_str(delta);
+                    }
                 }
-                p.summary.push_str(delta);
             }
+            // 水位按场景记账（None 归一为缺省场景，保底进全局水位供旧读取方使用）
+            let scene_key = scene::normalize(s.scene_id.as_deref()).to_string();
+            let upto = p.summary_upto_of.entry(scene_key).or_insert(0);
+            *upto = (*upto).max(s.to_turn);
             p.summary_upto = p.summary_upto.max(s.to_turn);
         }
         LogBody::Memory(m) => p.episodes.push(m.object.clone()),
@@ -583,6 +838,37 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
                 obj.insert("note".into(), serde_json::json!(note));
             }
         }
+        LogBody::Scene(s) => fold_scene(p, s),
+    }
+}
+
+/// 场景分区 ← 黑板形态的快照（时间/地点/在场者；extra 由调用方决定是否当 flags 整体替换）
+fn sync_scene_from_board(sc: &mut Scene, board: &Blackboard) {
+    sc.day = board.day;
+    sc.clock = board.clock.clone();
+    sc.place = board.place.clone();
+    if !board.actors.is_empty() {
+        sc.actors = board.actors.clone();
+    }
+}
+
+/// 世界层黑板跟随活跃场景（世界时钟 = 「现在」的镜像；读侧有效黑板以分区为准，
+/// 这份镜像服务于派生文件 blackboard.json 与无场景读侧路径的可见性）
+fn mirror_active_scene(p: &mut Projection) {
+    let Some(id) = p.active_scene.clone() else {
+        return;
+    };
+    let Some(sc) = p.scenes.get(&id) else {
+        return;
+    };
+    let Some(world) = p.blackboard.as_mut() else {
+        return;
+    };
+    world.day = sc.day;
+    world.clock = sc.clock.clone();
+    world.place = sc.place.clone();
+    if !sc.actors.is_empty() {
+        world.actors = sc.actors.clone();
     }
 }
 
@@ -627,6 +913,65 @@ pub fn apply_blackboard_sets(bb: &mut Blackboard, sets: &[KvSet]) -> bool {
         }
     }
     format!("{bb:?}") != before
+}
+
+/// 场景感知的黑板写入路由（M3.2 · 设计 §10.3）：
+///
+/// - `day`/`clock` → 世界层时间基准，并同步场景局部时钟（时间是「世界的时间」，
+///   但被冻结的场景不能被别的场景推着走，所以分区里各留一份）；
+/// - `place`/`actors` → 场景分区（地点与在场者是**这个舞台**的属性）；无场景 = 世界层（M2 语义）；
+/// - 其余键（实体作用域键、世界 flags）→ 世界层 extra——设定集是世界的知识，不随场景走。
+///
+/// `scene` = 写入者所在场景的分区（折叠时来自 EffectEvent.scene_id）。
+pub fn apply_blackboard_sets_scoped(
+    world: &mut Blackboard,
+    mut scene: Option<&mut Scene>,
+    sets: &[KvSet],
+) -> bool {
+    let before = format!("{world:?}");
+    for kv in sets {
+        let value = &kv.value;
+        match (kv.key.as_str(), value, scene.as_deref_mut()) {
+            ("day", serde_json::Value::Number(n), sc) => {
+                if let Some(day) = n.as_i64() {
+                    world.day = day;
+                    if let Some(sc) = sc {
+                        sc.day = day;
+                    }
+                }
+            }
+            ("clock", serde_json::Value::String(s), sc) => {
+                world.clock = s.clone();
+                if let Some(sc) = sc {
+                    sc.clock = s.clone();
+                }
+            }
+            ("place", serde_json::Value::String(s), sc) => match sc {
+                Some(sc) => sc.place = s.clone(),
+                None => world.place = s.clone(),
+            },
+            ("actors", serde_json::Value::Array(arr), sc) => {
+                let list: Vec<String> = arr
+                    .iter()
+                    .filter_map(|a| a.as_str().map(str::to_string))
+                    .collect();
+                match sc {
+                    Some(sc) => sc.actors = list,
+                    None => world.actors = list,
+                }
+            }
+            // 实体作用域键与世界 flags：世界的知识，不随场景走
+            (key, v, _) if key.contains('.') => {
+                if v.is_null() {
+                    world.extra.remove(key);
+                } else {
+                    world.extra.insert(key.to_string(), v.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    format!("{world:?}") != before
 }
 
 /// state 的**顶层键补丁**：钩子原地改的是嵌套表，顶层键比对足以完整表达变化
@@ -682,6 +1027,7 @@ mod tests {
             }],
             blackboard: vec![],
             memory: vec![],
+            scene_id: None,
             ts: 1,
         })
     }
@@ -705,6 +1051,7 @@ mod tests {
                     turn: 0,
                     reason: "init".into(),
                     board: board(1, "20:00"),
+                    scene_id: None,
                     ts: 1,
                 }),
             ),
@@ -739,6 +1086,7 @@ mod tests {
                 turn: 2,
                 reason: "clock".into(),
                 board: board(2, "09:10"),
+                scene_id: None,
                 ts: 9,
             }),
             LogBody::Transition(TransitionEvent {
@@ -803,6 +1151,7 @@ mod tests {
                     key: "last_thanked".into(),
                     value: serde_json::json!(1),
                 }],
+                scene_id: None,
                 ts: 2,
             }),
         ));
@@ -849,6 +1198,7 @@ mod tests {
                     state_set: patch,
                     blackboard: vec![],
                     memory: vec![],
+                    scene_id: None,
                     ts: 0,
                 }),
             ),
@@ -906,6 +1256,7 @@ mod tests {
                 turn: 3,
                 reason: "manual".into(),
                 board: board(3, "10:00"),
+                scene_id: None,
                 ts: 1,
             }),
         );
@@ -915,6 +1266,7 @@ mod tests {
                 turn: 3,
                 reason: "clock".into(),
                 board: board(3, "10:10"),
+                scene_id: None,
                 ts: 1,
             }),
         );
@@ -1058,5 +1410,301 @@ mod tests {
         let p = project_over(&records, &Base::default());
         assert_eq!(p.threads["thread.还书"]["state"], "resolved");
         assert_eq!(p.thread_log.len(), 2, "事件本身全部留痕");
+    }
+}
+
+
+#[cfg(test)]
+mod scene_tests {
+    //! M3.2 验收用例（设计 §10.3）：双场景互不污染、分场合场记忆不合并、重放一致。
+
+    use super::*;
+    use crate::scene::{self, Scene};
+
+    fn scene(id: &str, title: &str, place: &str, actors: &[&str], day: i64, clock: &str) -> Scene {
+        Scene {
+            id: id.into(),
+            title: title.into(),
+            place: place.into(),
+            actors: actors.iter().map(|s| s.to_string()).collect(),
+            day,
+            clock: clock.into(),
+            flags: Default::default(),
+            created_turn: 0,
+            origin: "manual".into(),
+            parent: None,
+            status: scene::STATUS_ACTIVE.into(),
+            ts: 1,
+        }
+    }
+
+    fn create(sc: &Scene, turn: u64) -> LogRecord {
+        LogRecord::new(
+            0,
+            LogBody::Scene(SceneEvent {
+                turn,
+                op: "create".into(),
+                scene_id: sc.id.clone(),
+                scene: Some(sc.clone()),
+                others: Vec::new(),
+                origin: "manual".into(),
+                note: None,
+                ts: 1,
+            }),
+        )
+    }
+
+    fn msg_in(turn: u64, role: &str, content: &str, scene_id: Option<&str>) -> LogRecord {
+        LogRecord::message(
+            0,
+            Message {
+                turn,
+                role: role.into(),
+                content: content.into(),
+                ts: 100 + turn,
+                scene_id: scene_id.map(str::to_string),
+                name: None,
+            },
+        )
+    }
+
+    /// 场景内钩子写黑板（effect 带 scene_id）
+    fn effect_in(turn: u64, scene_id: &str, key: &str, value: serde_json::Value) -> LogRecord {
+        LogRecord::new(
+            0,
+            LogBody::Effect(EffectEvent {
+                turn,
+                trigger: "hook.on_message".into(),
+                character: "阿澈".into(),
+                state_set: vec![],
+                blackboard: vec![KvSet {
+                    key: key.into(),
+                    value,
+                }],
+                memory: vec![],
+                scene_id: Some(scene_id.into()),
+                ts: 1,
+            }),
+        )
+    }
+
+    fn two_scene_stream() -> Vec<LogRecord> {
+        let mut records = vec![
+            LogRecord::new(
+                0,
+                LogBody::Blackboard(BlackboardEvent {
+                    turn: 0,
+                    reason: "init".into(),
+                    board: Blackboard {
+                        day: 1,
+                        clock: "20:00".into(),
+                        place: "图书馆".into(),
+                        actors: vec!["阿澈".into(), "小雨".into()],
+                        extra: Default::default(),
+                    },
+                    scene_id: None,
+                    ts: 1,
+                }),
+            ),
+            create(
+                &scene("scene.main", "开场", "图书馆", &["阿澈", "小雨"], 1, "20:00"),
+                0,
+            ),
+            // A 场景推进：阿澈写地点「天台」
+            msg_in(1, "user", "我们去天台吧", Some("scene.main")),
+            effect_in(1, "scene.main", "place", serde_json::json!("天台")),
+        ];
+        // 「与此同时」——B 场景开线（小雨在书店）
+        let b = scene("scene.b", "书店", "旧书店", &["小雨"], 1, "20:10");
+        records.push(create(&b, 1));
+        records.push(msg_in(2, "user", "小雨在书店翻书", Some("scene.b")));
+        records
+    }
+
+    #[test]
+    fn two_scenes_never_leak_into_each_other() {
+        // DoD 第 4 项的场景版：仅 A 场景发生的事，不进 B 场景的任何注入层
+        let p = project_over(&two_scene_stream(), &Base::default());
+        assert_eq!(p.active_scene.as_deref(), Some("scene.b"), "视角跟到新场景");
+
+        // 黑板分区：A 场景的钩子写了 place=天台，B 场景分区仍是书店
+        let a = p.effective_board(Some("scene.main"));
+        let b = p.effective_board(Some("scene.b"));
+        assert_eq!(a.place, "天台");
+        assert_eq!(b.place, "旧书店", "B 场景分区不被 A 场景写入污染");
+        assert_eq!(b.actors, vec!["小雨"], "B 场景在场者独立");
+
+        // 消息流分段：B 场景组装的历史只有 B 场景的消息
+        let b_history = p
+            .messages
+            .iter()
+            .filter(|m| scene::normalize(m.scene_id.as_deref()) == "scene.b")
+            .count();
+        assert_eq!(b_history, 1, "B 场景看不到 A 场景的台词");
+
+        // 摘要分卷：A 卷 B 卷互不可见
+        let mut p2 = p.clone();
+        fold(
+            &mut p2,
+            &LogRecord::new(
+                0,
+                LogBody::Summary(SummaryEvent {
+                    turn: 2,
+                    delta: "天台上的告白".into(),
+                    from_turn: 1,
+                    to_turn: 2,
+                    scene_id: Some("scene.main".into()),
+                    ts: 1,
+                }),
+            ),
+        );
+        let b_summary = p2.summary_for(Some("scene.b")).unwrap_or_default();
+        assert!(
+            !b_summary.contains("天台上的告白"),
+            "B 场景摘要里没有 A 场景的分卷"
+        );
+        let a_summary = p2.summary_for(Some("scene.main")).unwrap_or_default();
+        assert!(a_summary.contains("天台上的告白"), "A 场景读得到自己的分卷");
+    }
+
+    #[test]
+    fn split_then_merge_keeps_memory_per_viewer_and_replay_identical() {
+        let mut records = two_scene_stream();
+        // 分场：小雨从 main 移出另立 scene.c（纯函数算快照，命令层同款）
+        let main = project_over(&records, &Base::default())
+            .scenes
+            .get("scene.main")
+            .cloned()
+            .unwrap();
+        let (_next_main, c) = main
+            .split_from("scene.c", "天台一角", "天台", &["小雨".to_string()], 9)
+            .unwrap();
+        records.push(LogRecord::new(
+            0,
+            LogBody::Scene(SceneEvent {
+                turn: 2,
+                op: "split".into(),
+                scene_id: "scene.c".into(),
+                scene: Some(c),
+                others: vec!["scene.main".into()],
+                origin: "manual".into(),
+                note: None,
+                ts: 9,
+            }),
+        ));
+        // 合场：c 并回 main（先切回 main 再合）
+        records.push(LogRecord::new(
+            0,
+            LogBody::Scene(SceneEvent {
+                turn: 3,
+                op: "switch".into(),
+                scene_id: "scene.main".into(),
+                scene: None,
+                others: Vec::new(),
+                origin: "manual".into(),
+                note: None,
+                ts: 10,
+            }),
+        ));
+        let mut p = project_over(&records, &Base::default());
+        let sources = vec![p.scenes.get("scene.c").cloned().unwrap()];
+        let merged = p
+            .scenes
+            .get("scene.main")
+            .cloned()
+            .unwrap()
+            .merge_into(&sources, 11);
+        records.push(LogRecord::new(
+            0,
+            LogBody::Scene(SceneEvent {
+                turn: 3,
+                op: "merge".into(),
+                scene_id: "scene.main".into(),
+                scene: Some(merged),
+                others: vec!["scene.c".into()],
+                origin: "manual".into(),
+                note: None,
+                ts: 11,
+            }),
+        ));
+
+        let p = project_over(&records, &Base::default());
+        // 分场扣人、合场归档与并集
+        assert_eq!(
+            p.scenes["scene.main"].actors,
+            vec!["阿澈", "小雨"],
+            "合场 = 在场者并集"
+        );
+        assert_eq!(
+            p.scenes["scene.c"].status,
+            scene::STATUS_MERGED,
+            "被并入的场景归档"
+        );
+        assert_eq!(p.active_scene.as_deref(), Some("scene.main"));
+
+        // 记忆不合并：合场不改记忆层（各自记得自己线里的事）
+        let before_mem = project_over(&records[..records.len() - 1], &Base::default()).memory.len();
+        assert_eq!(p.memory.len(), before_mem, "合场零记忆写入");
+
+        // 重放一致（设计 §7.3-5 的场景版）
+        let again = project_over(&records, &Base::default());
+        assert_eq!(p.scenes, again.scenes);
+        assert_eq!(p.active_scene, again.active_scene);
+        assert_eq!(p.messages, again.messages);
+    }
+
+    #[test]
+    fn scene_events_survive_message_level_rebuild_semantics() {
+        // 场景事件不是派生事件：编辑历史（丢弃派生）后场景表原样保留
+        let records = two_scene_stream();
+        let derived_dropped: Vec<LogRecord> = records
+            .iter()
+            .filter(|r| !r.is_derived())
+            .cloned()
+            .collect();
+        let p = project_over(&derived_dropped, &Base::default());
+        assert_eq!(p.scenes.len(), 2, "场景事件全保留");
+        assert_eq!(p.active_scene.as_deref(), Some("scene.b"));
+        // 而 A 场景的钩子写入（派生）被丢弃：分区不再含「天台」
+        assert_eq!(p.effective_board(Some("scene.main")).place, "图书馆");
+    }
+
+    #[test]
+    fn scene_scoped_clock_events_advance_only_their_scene() {
+        let mut records = two_scene_stream();
+        // B 场景的时钟步进：不动 A 场景
+        records.push(LogRecord::new(
+            0,
+            LogBody::Blackboard(BlackboardEvent {
+                turn: 2,
+                reason: "clock".into(),
+                scene_id: Some("scene.b".into()),
+                board: Blackboard {
+                    day: 1,
+                    clock: "20:20".into(),
+                    place: "旧书店".into(),
+                    actors: vec!["小雨".into()],
+                    extra: Default::default(),
+                },
+                ts: 2,
+            }),
+        ));
+        let p = project_over(&records, &Base::default());
+        assert_eq!(p.scenes["scene.b"].clock, "20:20");
+        assert_eq!(
+            p.scenes["scene.main"].clock, "20:00",
+            "A 场景时间停在被切走那一刻"
+        );
+        // 世界层镜像跟随活跃场景（B）
+        assert_eq!(p.blackboard.as_ref().unwrap().clock, "20:20");
+    }
+
+    #[test]
+    fn scene_event_roundtrips_through_json() {
+        let rec = create(&scene("scene.x", "标题", "地点", &["阿澈"], 2, "21:00"), 3);
+        let line = rec.to_line().unwrap();
+        assert!(line.contains("\"kind\":\"scene\""));
+        let back = LogRecord::from_line(line.trim()).unwrap();
+        assert_eq!(back.body, rec.body);
     }
 }

@@ -9,6 +9,8 @@ import type {
   MemRecord,
   Message,
   PromptAssembly,
+  Scene,
+  SceneView,
   SessionMeta,
   StreamEvent,
   TimelineEntry,
@@ -170,11 +172,12 @@ async function resolveThreadCmd(id: string, outcome: string) {
 
 // ---------- M3.0 ②：宫殿记忆溯源跳转（跳回产生这条记忆的原文轮次） ----------
 async function jumpToTurn(turn: number) {
-  const index = messages.value.findIndex((m) => m.turn === turn);
-  if (index < 0) return;
+  // 场景视图里找（分页基于视图）；找不到（可能在别的场景）就不跳
+  const pos = sceneMessagesView.value.findIndex(({ m }) => m.turn === turn);
+  if (pos < 0) return;
   // 跳过去并把抽屉收起来，让聊天流正对那一轮
   panel.value = "";
-  await goPage(Math.floor(index / PAGE_SIZE) + 1);
+  await goPage(Math.floor(pos / PAGE_SIZE) + 1);
 }
 
 // ---------- M3.0 ④：类型化事件流视图（session_timeline） ----------
@@ -269,18 +272,44 @@ const streamEl = ref<HTMLElement | null>(null);
 const composerEl = ref<HTMLTextAreaElement | null>(null);
 
 const lastIndex = computed(() => messages.value.length - 1);
+/** 视图末条消息的全量下标：重roll 只对整条流的末尾有效（后端语义如此），
+ *  所以只有「当前场景正对着流的末尾」时才亮重roll */
+const viewLastFullIndex = computed(
+  () => sceneMessagesView.value[sceneMessagesView.value.length - 1]?.index ?? -1,
+);
 
 // ---------- 分页：多轮对话按页翻，每页 20 条消息 ----------
 const PAGE_SIZE = 20;
 const page = ref(1);
 
-const pageCount = computed(() => Math.max(1, Math.ceil(messages.value.length / PAGE_SIZE)));
+// ---------- M3.2 场景与多线（设计 §10.3）：场景条 + 消息按场景分段 ----------
+const scenes = ref<Scene[]>([]);
+const activeScene = ref("");
+const sceneBusy = ref(false);
+
+/** 当前场景的信息（冻结标识、在场者） */
+const activeSceneInfo = computed(() => scenes.value.find((sc) => sc.id === activeScene.value));
+
+/** 消息的场景视图：只显示聚焦场景的分段（index 保留在**全量**消息流里的下标，
+ *  编辑/删除仍按全量下标发给后端）。过渡插页（system）永远显示。 */
+const sceneMessagesView = computed(() =>
+  messages.value
+    .map((m, index) => ({ m, index }))
+    .filter(
+      ({ m }) =>
+        m.role === "system" ||
+        !scenes.value.length ||
+        (m.scene_id ?? "scene.main") === (activeScene.value || "scene.main"),
+    ),
+);
+
+const pageCount = computed(() =>
+  Math.max(1, Math.ceil(sceneMessagesView.value.length / PAGE_SIZE)),
+);
 const isLastPage = computed(() => page.value >= pageCount.value);
 const pagedMessages = computed(() => {
   const start = (page.value - 1) * PAGE_SIZE;
-  return messages.value
-    .slice(start, start + PAGE_SIZE)
-    .map((m, offset) => ({ m, index: start + offset }));
+  return sceneMessagesView.value.slice(start, start + PAGE_SIZE);
 });
 /** 页码窗口：最多 5 个 */
 const pageNumbers = computed(() => {
@@ -290,6 +319,138 @@ const pageNumbers = computed(() => {
   const end = Math.min(total, start + span - 1);
   return Array.from({ length: Math.max(0, end - start + 1) }, (_, i) => start + i);
 });
+
+async function loadScenes() {
+  try {
+    const view: SceneView = await api.listScenes(props.meta.id);
+    scenes.value = view.scenes;
+    if (view.active && view.active !== activeScene.value) {
+      activeScene.value = view.active;
+    } else if (!view.active) {
+      activeScene.value = view.scenes[0]?.id ?? "";
+    }
+  } catch {
+    /* 场景读取失败不阻塞聊天（旧后端/浏览器 mock 未覆盖时单场景照常用） */
+  }
+}
+
+/** 场景条上的一条的提示文字（时间线 + 状态） */
+function sceneTip(sc: Scene): string {
+  const time = sc.clock ? `第${sc.day}天 ${sc.clock}` : `第${sc.day}天`;
+  const status = sc.status === "frozen" ? "（已冻结，切回原地继续）" : sc.status === "merged" ? "（已并入他场）" : "";
+  return `${time} · ${sc.place || "地点未定"} · 在场 ${sc.actors.length} 人${status}`;
+}
+
+/** 切场：后端冻结原场景并插入过渡插页 */
+async function switchTo(sc: Scene) {
+  if (sc.id === activeScene.value || sceneBusy.value || sc.status === "merged") return;
+  sceneBusy.value = true;
+  error.value = "";
+  try {
+    const view = await api.switchScene(props.meta.id, sc.id);
+    scenes.value = view.scenes;
+    activeScene.value = view.active ?? sc.id;
+    messages.value = await api.readMessages(props.meta.id);
+    void jumpToLastPage();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    sceneBusy.value = false;
+  }
+}
+
+/** 新建场景（prompt 三连：标题/地点/在场者——v0 用系统对话框，M3.10 再换成向导） */
+async function createSceneCmd() {
+  const title = window.prompt("新场景的标题（如：坡下的旧书店）");
+  if (!title?.trim()) return;
+  const place = window.prompt("新场景的地点") ?? "";
+  const castHint = props.meta.characters.join(", ");
+  const actorsRaw = window.prompt(`在场角色（逗号分隔；可选：${castHint}）`, castHint) ?? "";
+  sceneBusy.value = true;
+  error.value = "";
+  try {
+    const view = await api.createScene(
+      props.meta.id,
+      title.trim(),
+      place.trim(),
+      actorsRaw
+        .split(/[,，]/)
+        .map((a) => a.trim())
+        .filter(Boolean),
+    );
+    scenes.value = view.scenes;
+    activeScene.value = view.active ?? "";
+    messages.value = await api.readMessages(props.meta.id);
+    void jumpToLastPage();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    sceneBusy.value = false;
+  }
+}
+
+/** 分场：挑人离场另立场景（视角跟到新场景） */
+async function splitSceneCmd() {
+  const here = activeSceneInfo.value;
+  const hint = here?.actors.join(", ") ?? props.meta.characters.join(", ");
+  const movingRaw = window.prompt(`分场：哪些角色离场？（逗号分隔；此刻在场：${hint}）`);
+  if (!movingRaw?.trim()) return;
+  const moving = movingRaw
+    .split(/[,，]/)
+    .map((a) => a.trim())
+    .filter(Boolean);
+  const title = window.prompt("新场景的标题（如：天台）");
+  if (!title?.trim()) return;
+  const place = window.prompt("新场景的地点") ?? "";
+  sceneBusy.value = true;
+  error.value = "";
+  try {
+    const view = await api.splitScene(props.meta.id, title.trim(), place.trim(), moving);
+    scenes.value = view.scenes;
+    activeScene.value = view.active ?? "";
+    messages.value = await api.readMessages(props.meta.id);
+    void jumpToLastPage();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    sceneBusy.value = false;
+  }
+}
+
+/** 合场：把另一路场景并进当前场景（对齐需确认——在场者并集、时间取较晚） */
+async function mergeSceneCmd() {
+  const candidates = scenes.value.filter(
+    (sc) => sc.id !== activeScene.value && sc.status !== "merged",
+  );
+  if (!candidates.length) {
+    error.value = "没有可以并进来的场景";
+    return;
+  }
+  const listed = candidates.map((sc, i) => `${i + 1}. ${sc.title}（${sc.place}）`).join("\n");
+  const pick = window.prompt(
+    `合场：把哪一路并进「${activeSceneInfo.value?.title ?? "当前场景"}」？\n${listed}\n\n输入序号（合场后各角色记忆不合并，只并舞台）：`,
+  );
+  if (!pick?.trim()) return;
+  const chosen = candidates[Number(pick.trim()) - 1];
+  if (!chosen) return;
+  const ok = window.confirm(
+    `确认合场？\n\n「${chosen.title}」的在场者将并入当前场景，故事时间取较晚的一路（${chosen.day}天 ${chosen.clock || "?"}）。被并入的场景归档留档。`,
+  );
+  if (!ok) return;
+  sceneBusy.value = true;
+  error.value = "";
+  try {
+    const view = await api.mergeScenes(props.meta.id, [chosen.id]);
+    scenes.value = view.scenes;
+    activeScene.value = view.active ?? activeScene.value;
+    messages.value = await api.readMessages(props.meta.id);
+    void jumpToLastPage();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    sceneBusy.value = false;
+  }
+}
 
 /** 翻页：回到最后一页时贴底，往回翻时从头看 */
 async function goPage(target: number) {
@@ -331,9 +492,15 @@ function fmtTime(ts: number): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-/** 可重新生成本轮的情形：末尾角色回复（重roll）、末尾用户消息（上次生成失败后重试） */
+/** 可重新生成本轮的情形：末尾角色回复（重roll）、末尾用户消息（上次生成失败后重试）；
+ *  且当前场景视图必须正对着流的末尾（重roll 的目标是整条流的最后一轮） */
 function canReroll(i: number, m: Message): boolean {
-  return !generating.value && i === lastIndex.value && (m.role === "char" || m.role === "user");
+  return (
+    !generating.value &&
+    i === lastIndex.value &&
+    viewLastFullIndex.value === lastIndex.value &&
+    (m.role === "char" || m.role === "user")
+  );
 }
 
 function togglePanel(p: "board" | "inspector") {
@@ -371,6 +538,9 @@ async function loadAll() {
       actors: bb.actors.join(", "),
     });
     messages.value = [...msgs];
+    scenes.value = [];
+    activeScene.value = "";
+    await loadScenes();
     page.value = pageCount.value; // 打开会话时停在最新一页
     void refreshInspector();
     void refreshCard();
@@ -443,8 +613,11 @@ async function send() {
   resetComposerHeight();
   generating.value = true;
   streamText.value = "";
-  // 乐观上屏；终态后以磁盘为准重读
-  messages.value = [...messages.value, { turn: -1, role: "user", content, ts: 0 }];
+  // 乐观上屏；终态后以磁盘为准重读（带场景归属，切着场景时不出戏）
+  messages.value = [
+    ...messages.value,
+    { turn: -1, role: "user", content, ts: 0, scene_id: activeScene.value || undefined },
+  ];
   void jumpToLastPage();
   let final: StreamEvent;
   try {
@@ -698,16 +871,73 @@ watch(cardGeneration, () => {
       </div>
     </header>
 
+    <!-- 场景条（M3.2 · 设计 §10.3）：多场景会话的「与此同时」切换 -->
+    <div v-if="scenes.length > 0" class="card card-border flex-none bg-base-100">
+      <div class="flex items-center gap-1 overflow-x-auto p-2">
+        <button
+          v-for="sc in scenes"
+          :key="sc.id"
+          class="btn btn-sm h-auto min-h-0 flex-col items-start gap-0 px-3 py-1.5 text-left"
+          :class="[
+            sc.id === activeScene ? 'btn-primary' : 'btn-ghost',
+            sc.status === 'merged' ? 'btn-disabled opacity-50' : '',
+          ]"
+          :disabled="sc.status === 'merged' || sceneBusy"
+          :data-tip="sceneTip(sc)"
+          @click="switchTo(sc)"
+        >
+          <span class="flex items-center gap-1 text-xs font-semibold">
+            {{ sc.title || sc.place || sc.id }}
+            <span v-if="sc.status === 'frozen'" class="badge badge-xs badge-ghost">冻结</span>
+            <span v-else-if="sc.status === 'merged'" class="badge badge-xs badge-ghost">已并入</span>
+          </span>
+          <span class="text-[10px] font-normal opacity-70">
+            {{ sc.clock ? `第${sc.day}天 ${sc.clock}` : `第${sc.day}天` }} · {{ sc.place || "地点未定" }}
+          </span>
+        </button>
+        <div class="ml-auto flex flex-none items-center gap-1 pl-2">
+          <button
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+            data-tip="新场景：另起一个舞台（视角随即切过去）"
+            :disabled="sceneBusy"
+            @click="createSceneCmd"
+          >
+            <Icon name="plus" :size="15" />
+          </button>
+          <button
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+            data-tip="分场：挑人离场另立场景（「与此同时」）"
+            :disabled="sceneBusy"
+            @click="splitSceneCmd"
+          >
+            <Icon name="split" :size="15" />
+          </button>
+          <button
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+            data-tip="合场：把另一路场景并进当前场景（需确认）"
+            :disabled="sceneBusy"
+            @click="mergeSceneCmd"
+          >
+            <Icon name="merge" :size="15" />
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div class="relative flex min-h-0 flex-1 gap-4">
       <!-- 聊天流 + 输入区 -->
       <section class="card card-border min-w-0 flex-1 overflow-hidden bg-base-100">
         <ul ref="streamEl" class="m-0 flex min-h-0 flex-1 list-none flex-col gap-5 overflow-y-auto p-5">
-          <li
-            v-for="{ m, index: i } in pagedMessages"
-            :key="i"
-            class="chat group"
-            :class="m.role === 'user' ? 'chat-end' : 'chat-start'"
-          >
+          <template v-for="{ m, index: i } in pagedMessages" :key="i">
+            <!-- 过渡插页（切场/分场/合场的叙事接缝）：居中一条，不占气泡 -->
+            <li v-if="m.role === 'system'" class="mx-auto my-1 flex max-w-full list-none items-center gap-3">
+              <span class="h-px flex-1 bg-base-content/15"></span>
+              <span class="flex-none font-serif text-sm italic tracking-wide text-base-content/50">
+                {{ m.content }}
+              </span>
+              <span class="h-px flex-1 bg-base-content/15"></span>
+            </li>
+            <li v-else class="chat group" :class="m.role === 'user' ? 'chat-end' : 'chat-start'">
             <div class="chat-image avatar avatar-placeholder">
               <div class="w-9 rounded-full" :class="avatarClass(m)">
                 <span class="text-xs">{{ initial(whoFor(m)) }}</span>
@@ -759,7 +989,8 @@ watch(cardGeneration, () => {
                 </span>
               </div>
             </template>
-          </li>
+            </li>
+          </template>
 
           <!-- 流式中的角色回复（只在最后一页显示） -->
           <li v-if="generating && isLastPage" class="chat chat-start">
@@ -780,7 +1011,10 @@ watch(cardGeneration, () => {
             </div>
           </li>
 
-          <li v-if="messages.length === 0 && !generating" class="mt-10 self-center text-sm text-base-content/45">
+          <li
+            v-if="sceneMessagesView.length === 0 && !generating"
+            class="mt-10 self-center text-sm text-base-content/45"
+          >
             还没有消息。说点什么，把这场戏开起来。
           </li>
         </ul>

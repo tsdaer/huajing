@@ -71,6 +71,7 @@ pub const CODEX_RELATION: &str = "relation";
 /// 格式示范，模型要按本批消息重写（骨架里的字面值不该被照抄进产物）。
 pub const OUTCOME_SCHEMA_HINT: &str = r#"{
   "summary_delta": "第三人称编年史体，2–6 句；没有进展给空串",
+  "chronicle": "世界层大事记，只记公开发生、别的场景也该知道的大事，1–2 句；没有给空串",
   "episodes": [
     {
       "content": "一句话：谁在哪里做了什么、结果如何",
@@ -129,6 +130,8 @@ pub struct SummaryContext<'a> {
     pub persona_name: Option<&'a str>,
     /// 会话起因 premise（§4.1 新会话向导三问；也是 §8.3 开线来源之一）。
     pub premise: Option<&'a str>,
+    /// 本批所属场景的标题（M3.2 摘要分卷；None = 未分场景/世界层批次）。
+    pub scene_label: Option<&'a str>,
     /// 故事时钟（如 「第3天 23:40」；宿主从黑板取）。
     pub story_clock: &'a str,
     /// 已有 L1 滚动摘要（本批之前的梗概；首轮为空串）。
@@ -170,6 +173,8 @@ impl BatchMessage {
 pub struct SummaryOutcome {
     /// L1 滚动摘要增量（编年史体、第三人称；空串 = 本批无进展）。
     pub summary_delta: String,
+    /// 世界层大事记增量（M3.2 · 设计 §10.4）：只记公开事件，跨场景可见；空串 = 没有。
+    pub chronicle: String,
     /// 情景记忆草稿（入宫殿，§5.2）。
     pub episodes: Vec<EpisodeDraft>,
     /// L3 事实键值草稿（§5.1）。
@@ -186,6 +191,7 @@ impl SummaryOutcome {
     /// 六类产物是否全空（宿主据此跳过落盘与事件；空产物算成功，不算失败）。
     pub fn is_empty(&self) -> bool {
         self.summary_delta.trim().is_empty()
+            && self.chronicle.trim().is_empty()
             && self.episodes.is_empty()
             && self.facts.is_empty()
             && self.threads.is_empty()
@@ -317,13 +323,18 @@ const ROLE_BRIEF: &str =
 宁可少写，不要编造——下面这批消息里没有的东西，一个字也不要补。";
 
 /// 六类产物的逐条要求（§5.3 那张图的展开；build_prompt 的核心段落）。
-const PRODUCT_SPEC: &str = r#"【必须逐条产出的六类产物】（设计 §5.3；哪一类都没有就给空，但字段不要省）
+const PRODUCT_SPEC: &str = r#"【必须逐条产出的产物】（设计 §5.3 + §10.4 摘要分卷；哪一类都没有就给空，但字段不要省）
 
-1. summary_delta —— L1 滚动摘要增量（设计 §5.1）
+1. summary_delta —— L1 滚动摘要增量（设计 §5.1，**本场景分卷**）
    把本批消息推进的剧情并入长期摘要：编年史体、第三人称，只写「发生了什么、结果如何」，
    2–6 句。不抄台词、不写文采、不揣测内心；起因与结果比过程重要。本批没有值得记的进展就给空串 ""。
+   这一卷只有本场景的角色会读到，可以放心写本场景私下发生的事。
 
-2. episodes —— 情景记忆（设计 §5.2，入记忆宫殿）
+2. chronicle —— 世界层大事记（设计 §10.4，跨场景共享）
+   只记**公开发生**、别的场景也该知道的大事（某人离开了小镇、店铺倒闭、世界级事件），
+   1–2 句；私下对话、只有本场景角色知道的细节绝对不写。没有就给空串 ""。
+
+3. episodes —— 情景记忆（设计 §5.2，入记忆宫殿）
    一条 = 角色亲身经历的一件值得记住的事。只记值得记住的事，宁少勿滥：日常寒暄、重复的
    状态描写不要记；承诺、冲突、秘密、转折、亲密、失去才值得记。最多 6 条，都不值得就给 []。
    每条字段：
@@ -338,12 +349,12 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的六类产物】（设计 �
    - thread：属于哪条剧情线（填线 id，如 thread.周五还书），不属于就省略；
    - turns：这件事发生的轮次（本批消息的 turn，升序）。
 
-3. facts —— L3 事实键值（设计 §5.1）
+4. facts —— L3 事实键值（设计 §5.1）
    跨会话仍然要记得的稳定事实：玩家叫什么、生日、约定、关键事件、稳定偏好。
    key 用简短中文或点分路径（如 玩家名字 / 约定.还书），value 是 JSON 标量或短数组。
    一次性的、会变的、拿不准的不要写；没有就给 []。
 
-4. threads —— 剧情线提案（设计 §8.3「管线提案」，必须一并起草提及时机）
+5. threads —— 剧情线提案（设计 §8.3「管线提案」，必须一并起草提及时机）
    只有当剧情里出现了新的承诺 / 冲突 / 悬念（有起因、将来要了结的事）才提，最多 2 条。
    上文已列出的活跃线不要重复开；没有就给 []。每条字段：
    - title / cause（起因，一句话讲清为什么欠着）/ actors / importance（0–1 重要度）；
@@ -364,14 +375,14 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的六类产物】（设计 �
    - framing：提起时的表演指引一句话（她打算怎么开这个口、被问到会怎样），例如
      「她在意但不好意思催；若对方主动提起，会松一口气」。没有特别指引给 ""。
 
-5. psyche —— 心理评价提案（设计 §9.2：情绪是对「需要是否被满足」的态度体验）
+6. psyche —— 心理评价提案（设计 §9.2：情绪是对「需要是否被满足」的态度体验）
    对照上文的「需要（needs）」清单评价本批消息——某个需要被满足或受挫时：
    - 情绪：{"kind": "feel", "name": "<情绪名>", "intensity": <0–1>, "source": "<哪个需要被满足/受挫>"}；
    - 意图增减：{"kind": "intend", "name": "<意图名>", "intensity": <-1–1>, "source": "<原因>"}
      （正数增强、负数削弱；例如 -0.3 表示「想解释」的冲动被削掉三成）。
    没有明显评价就给 []；不要为了凑数造情绪，也不要写角色的台词倾向（那是生成时的职责）。
 
-6. codex —— 设定提案（设计 §6.8，进设定收件箱；未经确认不进注入，§6.9）
+7. codex —— 设定提案（设计 §6.8，进设定收件箱；未经确认不进注入，§6.9）
    本批消息里即兴发明且值得留下的世界事实（例如「她养了一只叫墨墨的猫」）。kind 四选一：
    - "new_entity"  全新实体（必须人工确认）：{"kind":"new_entity","target":"char.墨墨",
        "value":{"type":"char","name":"墨墨","facts":{"look.impression":"一只黑猫"}},
@@ -389,7 +400,7 @@ const OUTPUT_SPEC: &str = "【输出格式】\
 
 /// 空批次的说明（§5.3：批次为空时不该编内容出来）。
 const EMPTY_BATCH_NOTE: &str =
-    "（本批没有消息。summary_delta 给空串，episodes / facts / threads / psyche / codex 全给 []。）";
+    "（本批没有消息。summary_delta 与 chronicle 给空串，episodes / facts / threads / psyche / codex 全给 []。）";
 
 /// 拼一次总结调用的提示词（宿主 ①：批次与上下文进，提示词出）。
 ///
@@ -411,6 +422,9 @@ pub fn build_prompt(ctx: &SummaryContext<'_>, batch: &[BatchMessage]) -> String 
     }
     if let Some(p) = ctx.premise {
         push_line(&mut out, "起因（premise）", p);
+    }
+    if let Some(sc) = ctx.scene_label {
+        push_line(&mut out, "本批所属场景（分卷）", sc);
     }
     push_line(&mut out, "故事时钟", ctx.story_clock);
     let summary = ctx.rolling_summary.trim();
@@ -548,6 +562,7 @@ pub fn parse_outcome(raw: &str) -> Result<SummaryOutcome, String> {
 
     Ok(SummaryOutcome {
         summary_delta: text_of(map.get("summary_delta")),
+        chronicle: text_of(map.get("chronicle")),
         episodes: objects_of(map.get("episodes"))
             .iter()
             .map(|m| episode_of(m))
@@ -834,6 +849,7 @@ pub fn sanitize(outcome: SummaryOutcome) -> SummaryOutcome {
 
     SummaryOutcome {
         summary_delta: outcome.summary_delta.trim().to_string(),
+        chronicle: outcome.chronicle.trim().to_string(),
         episodes,
         facts,
         threads,
@@ -1074,6 +1090,7 @@ mod tests {
             card_name: card,
             persona_name: persona,
             premise,
+            scene_label: None,
             story_clock: clock,
             rolling_summary: summary,
             active_threads,
@@ -1518,6 +1535,7 @@ mod tests {
     fn sanitize_clamps_numbers() {
         let out = sanitize(SummaryOutcome {
             summary_delta: "  她哭了。  ".into(),
+            chronicle: String::new(),
             episodes: vec![
                 draft_with("a", 1.7),
                 draft_with("b", -3.0),
@@ -1565,6 +1583,7 @@ mod tests {
     fn sanitize_drops_empty_identity_fields() {
         let out = sanitize(SummaryOutcome {
             summary_delta: "   ".into(),
+            chronicle: String::new(),
             episodes: vec![draft_with("   ", 0.5), draft_with("有效记忆", 0.5)],
             facts: vec![
                 FactDraft {
@@ -1709,6 +1728,7 @@ mod tests {
         e.thread = Some("".into());
         let out = sanitize(SummaryOutcome {
             summary_delta: "  梗概  ".into(),
+            chronicle: String::new(),
             episodes: vec![e],
             facts: vec![FactDraft {
                 key: "  玩家名字 ".into(),
@@ -1933,6 +1953,7 @@ mod tests {
         assert!(SummaryOutcome::default().is_empty());
         let only_summary = SummaryOutcome {
             summary_delta: "  有进展  ".to_string(),
+            chronicle: String::new(),
             ..SummaryOutcome::default()
         };
         assert!(!sanitize(only_summary).is_empty());
