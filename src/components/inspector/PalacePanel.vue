@@ -5,6 +5,7 @@ import type { InspectorPalace } from "../../types";
 import MemoryRow from "./MemoryRow.vue";
 
 defineProps<{ palace: InspectorPalace }>();
+const emit = defineEmits<{ jump: [turn: number] }>();
 
 const view = ref<"rooms" | "timeline" | "graph">("rooms");
 const VIEWS = [
@@ -57,7 +58,7 @@ const VIEWS = [
           <span class="badge badge-xs badge-soft font-mono">{{ room.count }} 条</span>
         </div>
         <ul class="m-0 flex list-none flex-col gap-1 p-0">
-          <MemoryRow v-for="m in room.top" :key="m.id" :m="m" dense />
+          <MemoryRow v-for="m in room.top" :key="m.id" :m="m" dense @jump="emit('jump', $event)" />
         </ul>
       </div>
       <p v-if="!palace.rooms.length" class="m-0 text-xs text-base-content/50">
@@ -73,7 +74,7 @@ const VIEWS = [
           <span class="badge badge-xs badge-soft font-mono">{{ bucket.count }} 条</span>
         </div>
         <ul class="m-0 flex list-none flex-col gap-1 p-0">
-          <MemoryRow v-for="m in bucket.top" :key="m.id" :m="m" dense />
+          <MemoryRow v-for="m in bucket.top" :key="m.id" :m="m" dense @jump="emit('jump', $event)" />
         </ul>
       </div>
       <p v-if="!palace.timeline.length" class="m-0 text-xs text-base-content/50">时间线上还没有记忆。</p>
@@ -103,7 +104,7 @@ const VIEWS = [
     <section class="flex flex-col gap-1.5">
       <p class="m-0 text-xs text-base-content/50">最近记忆（{{ palace.recent.length }} 条，新在前）</p>
       <ul v-if="palace.recent.length" class="m-0 flex list-none flex-col gap-1.5 p-0">
-        <MemoryRow v-for="m in palace.recent" :key="m.id" :m="m" />
+        <MemoryRow v-for="m in palace.recent" :key="m.id" :m="m" @jump="emit('jump', $event)" />
       </ul>
       <p v-else class="m-0 text-xs text-base-content/50">还没有记忆对象。</p>
     </section>

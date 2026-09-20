@@ -92,8 +92,9 @@ pub enum StreamEvent {
         report: Option<HookReport>,
     },
     Error { message: String },
-    /// 卡片经 `api.ui.emit` 推来的界面事件（紧跟产生它的那一步发生）
-    HookEvent { kind: String, value: String },
+    /// 卡片经 `api.ui.emit` 推来的界面事件（紧跟产生它的那一步发生）；
+    /// turn = 产生它的钩子轮次（M3.0 修界面事件「第 -1 轮」：前端不再从乐观消息推轮次）
+    HookEvent { kind: String, value: String, turn: u64 },
 }
 
 /// 一轮 `on_message` 钩子的执行报告（前端据此显示卡内状态与事件）

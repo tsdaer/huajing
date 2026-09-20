@@ -11,6 +11,7 @@ import type {
   PromptAssembly,
   SessionMeta,
   StreamEvent,
+  TimelineEntry,
 } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
@@ -64,6 +65,11 @@ const M2_TABS: InspTab[] = ["statetree", "threads", "psyche", "palace", "codex",
 
 const inspTab = ref<InspTab>("layers");
 const inspTabLabel = computed(() => INSP_TABS.find((t) => t.id === inspTab.value)?.label ?? "");
+
+// 切到事件流页签时按需拉一次类型化事件流（M3.0 ④）
+watch(inspTab, (tab) => {
+  if (tab === "events") ensureTimeline();
+});
 
 /** 记忆检查器全量投影（状态树 / 剧情线 / 心理 / 宫殿 / 设定集 / 摘要与收件箱） */
 const inspector = ref<InspectorData | null>(null);
@@ -127,6 +133,70 @@ async function summarizeNow() {
   } finally {
     summarizing.value = false;
   }
+}
+
+// ---------- M3.0 ①：剧情线手动开/收线（设计 §8.3，后端命令的 UI 入口） ----------
+const threadBusy = ref(false);
+
+async function openThread(draft: { title: string; cause: string; actors: string[]; importance: number }) {
+  if (threadBusy.value) return;
+  threadBusy.value = true;
+  error.value = "";
+  try {
+    await api.openThread(props.meta.id, draft.title, draft.cause, draft.actors, draft.importance);
+    await loadInspector();
+    void refreshInspector(); // 线影响 B1/C1 组装
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    threadBusy.value = false;
+  }
+}
+
+async function resolveThreadCmd(id: string, outcome: string) {
+  if (threadBusy.value) return;
+  threadBusy.value = true;
+  error.value = "";
+  try {
+    await api.resolveThread(props.meta.id, id, outcome);
+    await loadInspector();
+    void refreshInspector(); // 收线三件事都会改变组装（B1「了结未远」/ C1 清空/转移）
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    threadBusy.value = false;
+  }
+}
+
+// ---------- M3.0 ②：宫殿记忆溯源跳转（跳回产生这条记忆的原文轮次） ----------
+async function jumpToTurn(turn: number) {
+  const index = messages.value.findIndex((m) => m.turn === turn);
+  if (index < 0) return;
+  // 跳过去并把抽屉收起来，让聊天流正对那一轮
+  panel.value = "";
+  await goPage(Math.floor(index / PAGE_SIZE) + 1);
+}
+
+// ---------- M3.0 ④：类型化事件流视图（session_timeline） ----------
+const timeline = ref<TimelineEntry[] | null>(null);
+const timelineLoading = ref(false);
+const timelineError = ref("");
+
+async function loadTimeline() {
+  timelineLoading.value = true;
+  timelineError.value = "";
+  try {
+    timeline.value = await api.sessionTimeline(props.meta.id);
+  } catch (e) {
+    timelineError.value = String(e);
+  } finally {
+    timelineLoading.value = false;
+  }
+}
+
+/** 事件流页签展开时拉一次（聊天推进后想看新的，点「刷新」） */
+function ensureTimeline() {
+  if (timeline.value === null && !timelineLoading.value) void loadTimeline();
 }
 
 // ---------- M1.6：卡内状态 / 记忆 / 界面事件 ----------
@@ -273,10 +343,12 @@ async function loadAll() {
   editingIndex.value = -1;
   draft.value = "";
   page.value = 1;
-  // 换会话：检查器数据作废（下次打开抽屉再拉）
+  // 换会话：检查器数据作废（下次打开抽屉再拉）；事件流视图同理
   inspector.value = null;
   inspError.value = "";
   summaryResult.value = "";
+  timeline.value = null;
+  timelineError.value = "";
   const id = props.meta.id;
   try {
     const [bb, msgs] = await Promise.all([api.getBlackboard(id), api.readMessages(id)]);
@@ -392,15 +464,24 @@ function onDelta(e: StreamEvent) {
     streamText.value += e.text;
     void scrollToBottom();
   } else if (e.event === "hook_event") {
-    pushHookEvent(e.kind, e.value);
+    // turn 由后端带上（产生该事件的钩子轮次）；没有就回退到本地推算
+    pushHookEvent(e.kind, e.value, e.turn ?? -1);
   }
 }
 
-function pushHookEvent(kind: string, value: string) {
-  hookEvents.value = [
-    { kind, value, turn: messages.value.length ? messages.value[messages.value.length - 1].turn : 0 },
-    ...hookEvents.value,
-  ].slice(0, 50);
+/** 界面事件进列表；轮次缺省时从消息流推算（乐观消息 turn=-1 不算数，M3.0 ③） */
+function pushHookEvent(kind: string, value: string, turn = -1) {
+  const hint = turn >= 0 ? turn : currentTurnHint();
+  hookEvents.value = [{ kind, value, turn: hint }, ...hookEvents.value].slice(0, 50);
+}
+
+/** 推算「此刻在第几轮」：跳过乐观上屏的 turn=-1，取最后一条真实消息的轮次 */
+function currentTurnHint(): number {
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const t = messages.value[i].turn;
+    if (t >= 0) return t;
+  }
+  return 0;
 }
 
 /** 钩子报告落地：卡内状态、记忆增量、日志 */
@@ -408,9 +489,7 @@ function applyReport(report: HookReport) {
   lastReport.value = report;
   if (report.card_state) cardState.value = report.card_state;
   hookLogs.value = report.logs ?? [];
-  if (report.ui_events?.length) {
-    for (const e of report.ui_events) pushHookEvent(e.kind, e.value);
-  }
+  for (const e of report.ui_events) pushHookEvent(e.kind, e.value, report.turn);
 }
 
 /** 读卡内状态与记忆流（面板数据源） */
@@ -452,7 +531,10 @@ async function finishGeneration(final: StreamEvent) {
   void refreshInspector();
   void refreshCard();
   // 刚聊完一轮：状态树/剧情线/心理/宫殿多半都变了，抽屉开着就顺手重拉（设计 §8/§9 的「面板可查」）
-  if (panel.value === "inspector") void loadInspector();
+  if (panel.value === "inspector") {
+    void loadInspector();
+    if (inspTab.value === "events") void loadTimeline(); // 事件流页签：新事件即时可见
+  }
   void scrollToBottom();
   composerEl.value?.focus();
 }
@@ -943,9 +1025,15 @@ watch(cardGeneration, () => {
                 :tree="inspector.stateTree"
                 :transitions="inspector.transitions"
               />
-              <ThreadsPanel v-else-if="inspTab === 'threads'" :threads="inspector.threads" />
+              <ThreadsPanel
+                v-else-if="inspTab === 'threads'"
+                :threads="inspector.threads"
+                :busy="threadBusy"
+                @open="openThread"
+                @resolve="resolveThreadCmd"
+              />
               <PsychePanel v-else-if="inspTab === 'psyche'" :psyche="inspector.psyche" />
-              <PalacePanel v-else-if="inspTab === 'palace'" :palace="inspector.palace" />
+              <PalacePanel v-else-if="inspTab === 'palace'" :palace="inspector.palace" @jump="jumpToTurn" />
               <CodexPanel
                 v-else-if="inspTab === 'codex'"
                 :codex="inspector.codex"
@@ -1019,24 +1107,63 @@ watch(cardGeneration, () => {
             <p v-else class="m-0 text-xs text-base-content/50">还没有记忆写入。</p>
           </template>
 
-          <!-- 事件流：api.ui.emit 的界面事件 + 卡内错误 -->
+          <!-- 事件流：类型化事件流（session_timeline）+ 界面事件（api.ui.emit）+ 卡内错误 -->
           <template v-else>
             <div class="flex items-center justify-between gap-2">
-              <p class="m-0 text-xs text-base-content/50">卡片推来的界面事件（api.ui.emit）</p>
-              <button class="btn btn-ghost btn-xs flex-none" @click="hookEvents = []">清空</button>
+              <p class="m-0 text-xs text-base-content/50">
+                类型化事件流（messages.jsonl · 最新在前）
+              </p>
+              <button class="btn btn-ghost btn-xs flex-none" :disabled="timelineLoading" @click="loadTimeline">
+                <span v-if="timelineLoading" class="loading loading-spinner loading-xs"></span>
+                <Icon v-else name="refresh" :size="13" />刷新
+              </button>
             </div>
-            <ul v-if="hookEvents.length" class="m-0 flex list-none flex-col gap-1.5 p-0">
+            <div
+              v-if="timelineError"
+              role="alert"
+              class="alert alert-error alert-soft py-2 text-xs break-words"
+            >
+              {{ timelineError }}
+            </div>
+            <p v-else-if="!timeline" class="m-0 text-xs text-base-content/50">读取中…</p>
+            <ul v-else-if="timeline.length" class="m-0 flex list-none flex-col gap-1 p-0">
               <li
-                v-for="(ev, i) in hookEvents"
-                :key="`${ev.turn}-${ev.kind}-${ev.value}-${i}`"
-                class="rounded-box flex items-center gap-2 bg-base-200 px-3 py-1.5 text-xs"
+                v-for="e in timeline"
+                :key="e.seq"
+                class="rounded-box flex items-center gap-2 bg-base-200 px-2.5 py-1.5 text-xs"
               >
-                <span class="badge badge-xs badge-soft badge-primary">{{ kindLabel(ev.kind) }}</span>
-                <span class="truncate">{{ ev.value }}</span>
-                <span class="ml-auto flex-none text-[11px] text-base-content/40">第 {{ ev.turn }} 轮</span>
+                <span class="badge badge-xs badge-soft flex-none font-mono">{{ e.kind }}</span>
+                <span class="min-w-0 flex-1 break-words">{{ e.brief }}</span>
+                <span class="ml-auto flex-none font-mono text-[10px] text-base-content/35">
+                  #{{ e.seq }} · 第 {{ e.turn }} 轮
+                </span>
               </li>
             </ul>
-            <p v-else class="m-0 text-xs text-base-content/50">还没有界面事件。</p>
+            <p v-else class="m-0 text-xs text-base-content/50">事件流还是空的。</p>
+
+            <div class="collapse collapse-arrow rounded-box bg-base-200">
+              <input type="checkbox" />
+              <div class="collapse-title min-h-0 px-3 py-2 text-xs">
+                界面事件（api.ui.emit · {{ hookEvents.length }}）
+              </div>
+              <div class="collapse-content px-3">
+                <div class="mb-1 flex justify-end">
+                  <button class="btn btn-ghost btn-xs" @click="hookEvents = []">清空</button>
+                </div>
+                <ul v-if="hookEvents.length" class="m-0 flex list-none flex-col gap-1.5 p-0">
+                  <li
+                    v-for="(ev, i) in hookEvents"
+                    :key="`${ev.turn}-${ev.kind}-${ev.value}-${i}`"
+                    class="rounded-box flex items-center gap-2 bg-base-100 px-2.5 py-1.5 text-xs"
+                  >
+                    <span class="badge badge-xs badge-soft badge-primary">{{ kindLabel(ev.kind) }}</span>
+                    <span class="truncate">{{ ev.value }}</span>
+                    <span class="ml-auto flex-none text-[11px] text-base-content/40">第 {{ ev.turn }} 轮</span>
+                  </li>
+                </ul>
+                <p v-else class="m-0 text-xs text-base-content/50">还没有界面事件。</p>
+              </div>
+            </div>
 
             <template v-if="hookLogs.length">
               <p class="m-0 mt-1 text-xs text-base-content/50">卡内错误（不打断对话）</p>

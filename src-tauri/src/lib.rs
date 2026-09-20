@@ -62,6 +62,7 @@ pub fn run() {
             commands::summarize_now,
             commands::open_thread,
             commands::resolve_thread,
+            commands::session_timeline,
             commands::get_card_state,
             commands::list_card_memory,
             watch::watch_cards,

@@ -1671,6 +1671,7 @@ fn run_message_hook(
             let _ = channel.send(StreamEvent::HookEvent {
                 kind: event.kind.clone(),
                 value: event.value.clone(),
+                turn,
             });
         }
     }
@@ -1943,6 +1944,7 @@ fn forward_ui_events(channel: &Channel<StreamEvent>, report: &llm::HookReport) {
         let _ = channel.send(StreamEvent::HookEvent {
             kind: event.kind.clone(),
             value: event.value.clone(),
+            turn: report.turn,
         });
     }
 }
@@ -2011,6 +2013,7 @@ pub async fn send_message(
         let _ = on_event.send(StreamEvent::HookEvent {
             kind: event.kind.clone(),
             value: event.value.clone(),
+            turn,
         });
     }
 
@@ -2130,6 +2133,7 @@ pub async fn regenerate(
         let _ = on_event.send(StreamEvent::HookEvent {
             kind: event.kind.clone(),
             value: event.value.clone(),
+            turn,
         });
     }
     // 上一轮的 on_message 效果已随截断消失，这里补跑：**恰好一次**，不是重复计分
@@ -2437,6 +2441,125 @@ fn resolve_thread_at(
         }
     }
     Ok(snapshot)
+}
+
+// ---------- 事件流视图（M3.0 ④：检查器「事件流」页签的数据源）----------
+
+/// 事件的一行摘要（seq/kind/turn 之外的人读内容）
+fn timeline_brief(record: &event::LogRecord) -> String {
+    let clip = |s: &str, n: usize| -> String {
+        let t: String = s
+            .chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .collect();
+        if t.chars().count() > n {
+            let head: String = t.chars().take(n).collect();
+            format!("{head}…")
+        } else {
+            t
+        }
+    };
+    match &record.body {
+        LogBody::Message(m) => {
+            let who = match m.role.as_str() {
+                "user" => "我",
+                "char" => "角色",
+                _ => m.role.as_str(),
+            };
+            format!("{who}：{}", clip(&m.content, 60))
+        }
+        LogBody::Effect(e) => {
+            let mut parts: Vec<String> = Vec::new();
+            if !e.state_set.is_empty() {
+                parts.push(format!("state×{}", e.state_set.len()));
+            }
+            if !e.blackboard.is_empty() {
+                parts.push(format!("黑板×{}", e.blackboard.len()));
+            }
+            if !e.memory.is_empty() {
+                parts.push(format!("记忆×{}", e.memory.len()));
+            }
+            if parts.is_empty() {
+                format!("{}（{}）无副作用", e.trigger, e.character)
+            } else {
+                format!("{}（{}）{}", e.trigger, e.character, parts.join(" "))
+            }
+        }
+        LogBody::Blackboard(b) => format!(
+            "{} → 第{}天 {} {}",
+            b.reason, b.board.day, b.board.clock, b.board.place
+        ),
+        LogBody::Transition(t) => format!(
+            "{} → {}（{}）",
+            t.from.join("/"),
+            t.to.join("/"),
+            clip(&t.reason, 40)
+        ),
+        LogBody::Thread(t) => {
+            let title = t
+                .thread
+                .as_ref()
+                .and_then(|v| v.get("title"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let label = if title.is_empty() { t.thread_id.clone() } else { title.to_string() };
+            match t.note.as_deref() {
+                Some(note) if !note.is_empty() => format!("{} {}（{}）", t.op, clip(&label, 24), clip(note, 30)),
+                _ => format!("{} {}（{}）", t.op, clip(&label, 24), t.origin),
+            }
+        }
+        LogBody::Codex(c) => match c.note.as_deref() {
+            Some(note) if !note.is_empty() => format!("{} {}（{}）", c.op, c.target, clip(note, 30)),
+            _ => format!("{} {}（{}）", c.op, c.target, c.origin),
+        },
+        LogBody::Summary(s) => format!("批次 {}–{}：{}", s.from_turn, s.to_turn, clip(&s.delta, 50)),
+        LogBody::Proposal(p) => format!("{} {}（{}）", p.op, p.kind, p.id),
+        LogBody::Memory(m) => {
+            let content = m
+                .object
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("{}：{}", m.origin, clip(content, 50))
+        }
+    }
+}
+
+/// 类型化事件流视图（诊断/检查器）：最新在前，默认最近 200 条。
+/// 每条 = { seq, kind, turn, brief }；brief 是人读摘要，重放语义以事件原文为准。
+#[tauri::command]
+pub fn session_timeline(
+    session_id: String,
+    limit: Option<usize>,
+    log: State<'_, store::EventLog>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    timeline_entries(&log, &root, &meta, limit)
+}
+
+/// 事件流视图的内核（与 Tauri 无关，便于单测）
+fn timeline_entries(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let records = log.read(root, &meta.id).map_err(|e| e.to_string())?;
+    let limit = limit.unwrap_or(200);
+    Ok(records
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|r| {
+            serde_json::json!({
+                "seq": r.seq,
+                "kind": r.body.kind(),
+                "turn": r.turn(),
+                "brief": timeline_brief(r),
+            })
+        })
+        .collect())
 }
 
 // ---------- 记忆检查器数据（M2.8 面板的数据源）----------
@@ -4415,5 +4538,71 @@ return {
             "线了结应驱动状态转移：{:?}",
             proj.transitions
         );
+    }
+
+    /// M3.0 ④：session_timeline 把类型化事件流摊成人读视图（最新在前、带摘要）
+    #[test]
+    fn session_timeline_lists_events_newest_first_with_briefs() {
+        let card = r#"
+name = '小雨'
+scenario = '图书馆'
+personality = '安静'
+first_mes = '晚上好。'
+state_tree = {
+  root = '日常',
+  states = {
+    ['日常'] = {
+      directive = '轻松日常。',
+      transitions = {
+        { to = '释然', priority = 5, when = 'event:thread.周五还书:resolved' },
+      },
+    },
+    ['释然'] = { parent = '日常', directive = '事情说开了。' },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+        open_thread_at(
+            &log,
+            &root,
+            &meta,
+            "周五还书",
+            "玩家忘带借书卡。",
+            &["小雨".into()],
+            Some(0.8),
+        )
+        .unwrap();
+
+        let entries = timeline_entries(&log, &root, &meta, None).unwrap();
+        assert!(!entries.is_empty(), "事件流视图不该为空");
+        // 最新在前：线程开线事件是最后落的，应该在首位
+        assert_eq!(entries[0]["kind"], "thread");
+        assert!(
+            entries[0]["brief"]
+                .as_str()
+                .unwrap_or("")
+                .contains("周五还书"),
+            "线的摘要应带标题：{}",
+            entries[0]["brief"]
+        );
+        // seq 单调：视图顺序的 seq 严格递减
+        let seqs: Vec<u64> = entries.iter().filter_map(|e| e["seq"].as_u64()).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[0] > w[1]),
+            "最新在前意味着 seq 递减：{seqs:?}"
+        );
+        // 消息事件带人读摘要；limit 生效
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["kind"] == "message" && e["brief"].as_str().unwrap_or("").contains("我：")),
+            "消息事件的摘要应署名：{:?}",
+            entries.iter().find(|e| e["kind"] == "message").map(|e| e["brief"].clone())
+        );
+        let limited = timeline_entries(&log, &root, &meta, Some(1)).unwrap();
+        assert_eq!(limited.len(), 1, "limit 应截取最近 N 条");
     }
 }

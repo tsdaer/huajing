@@ -7,6 +7,7 @@ import type {
   CardDetail,
   CardSummary,
   HookReport,
+  InspectorThreads,
   MemRecord,
   Message,
   Persona,
@@ -96,6 +97,47 @@ const memoryRecords: MemRecord[] = [
     ts: 1758200160,
   },
 ];
+
+/** mock 的剧情线投影（M3.0 ① 手动开/收线与之共享同一份状态） */
+const opened = { turn: 2, story_day: 3, story_clock: "21:30" };
+const mockThreads: InspectorThreads = {
+  active: [
+    {
+      id: "thread.周五还书",
+      title: "周五还书的约定",
+      cause: "玩家忘带借书卡，小雨破例让他先把书拿走。",
+      actors: ["小雨", "玩家"],
+      importance: 0.7,
+      opened,
+      state: "active",
+      scope: "session",
+      linked_intent: null,
+      progress: [{ turn: 2, note: "立约", memory: null }],
+      resurface: {
+        grade: "natural",
+        windows: [{ mention: ["还书", "借书卡"] }],
+        deadline: { day: 5, escalate: "eager" },
+        cooldown: 5,
+        framing: "她在意但不好意思催。",
+        last_mentioned_turn: null,
+      },
+      resolution: null,
+    },
+  ],
+  resolved: [],
+  abandoned: [],
+  pending: ["周五还书的约定（active）"],
+  inWindow: [
+    {
+      id: "thread.周五还书",
+      title: "周五还书的约定",
+      grade: "natural",
+      framing: "她在意但不好意思催。",
+      reason: "提及:还书",
+    },
+  ],
+  eventCount: 1,
+};
 
 const cardDetail: CardDetail = {
   dir_name: "小雨",
@@ -195,7 +237,8 @@ function streamReply(
       timerMap.delete(timerKey);
       if (full) msgs.push({ turn, role: "char", content: full, ts: Math.floor(Date.now() / 1000) });
       const report = full ? finishHook() : null;
-      if (report) onEvent?.onmessage?.({ event: "hook_event", ...report.ui_events[0] });
+      if (report)
+        onEvent?.onmessage?.({ event: "hook_event", ...report.ui_events[0], turn: report.turn });
       resolve({ event: "done", full, cancelled, report });
     };
     const timer = setInterval(() => {
@@ -205,7 +248,7 @@ function streamReply(
         clearInterval(timer);
         timerMap.delete(timerKey);
         const report = finishHook();
-        onEvent?.onmessage?.({ event: "hook_event", ...report.ui_events[0] });
+        onEvent?.onmessage?.({ event: "hook_event", ...report.ui_events[0], turn: report.turn });
         resolve({ event: "done", full: reply, cancelled: false, report });
         return;
       }
@@ -381,40 +424,7 @@ export function setupMock() {
               ts: Math.floor(Date.now() / 1000),
             },
           ],
-          threads: {
-            active: [
-              {
-                id: "thread.周五还书",
-                title: "周五还书的约定",
-                cause: "玩家忘带借书卡，小雨破例让他先把书拿走。",
-                actors: ["小雨", "玩家"],
-                importance: 0.7,
-                state: "active",
-                progress: [{ turn: 2, note: "立约", memory: null }],
-                resurface: {
-                  grade: "natural",
-                  windows: [{ mention: ["还书", "借书卡"] }],
-                  deadline: { day: 5, escalate: "eager" },
-                  cooldown: 5,
-                  framing: "她在意但不好意思催。",
-                  last_mentioned_turn: null,
-                },
-              },
-            ],
-            resolved: [],
-            abandoned: [],
-            pending: ["周五还书的约定（active）"],
-            inWindow: [
-              {
-                id: "thread.周五还书",
-                title: "周五还书的约定",
-                grade: "natural",
-                framing: "她在意但不好意思催。",
-                reason: "提及:还书",
-              },
-            ],
-            eventCount: 1,
-          },
+          threads: mockThreads,
           psyche: {
             summary: "【小雨·内心】喜悦0.6 ▸ 惦记着说再见(0.4)",
             affects: [
@@ -493,6 +503,61 @@ export function setupMock() {
         return { id: (args as { id?: string }).id ?? "mock", status: (args as { accept?: boolean }).accept ? "accept" : "reject" };
       case "summarize_now":
         return "（mock）已总结第 1–2 轮，落 3 条事件";
+      // M3.0 ①：手动开/收线（mock 只改内存里的 threads 投影，真命令会落事件流）
+      case "open_thread": {
+        const q = args as { title?: string; cause?: string; actors?: string[]; importance?: number };
+        const id = `thread.${q.title ?? "新线"}`;
+        mockThreads.active.push({
+          id,
+          title: q.title ?? "新线",
+          cause: q.cause ?? "",
+          actors: q.actors ?? [],
+          importance: q.importance ?? 0.6,
+          opened: { turn: messages[messages.length - 1]?.turn ?? 0, story_day: blackboard.day, story_clock: blackboard.clock },
+          state: "active",
+          progress: [],
+          resurface: {
+            grade: "natural",
+            windows: [],
+            deadline: null,
+            cooldown: 3,
+            framing: "",
+            last_mentioned_turn: null,
+          },
+          resolution: null,
+          scope: "session",
+          linked_intent: null,
+        });
+        mockThreads.pending.push(`${q.title ?? "新线"}（active）`);
+        return { id, state: "active" };
+      }
+      case "resolve_thread": {
+        const q = args as { id?: string; outcome?: string };
+        const i = mockThreads.active.findIndex((t) => t.id === q.id);
+        if (i >= 0) {
+          const [t] = mockThreads.active.splice(i, 1);
+          mockThreads.resolved.push({
+            ...t,
+            state: "resolved",
+            resolution: {
+              turn: messages[messages.length - 1]?.turn ?? 0,
+              story_day: blackboard.day,
+              story_clock: blackboard.clock,
+              outcome: q.outcome ?? "",
+              memory: null,
+            },
+          });
+        }
+        return { id: q.id ?? "mock", state: "resolved" };
+      }
+      // M3.0 ④：类型化事件流视图（mock 给一份与真实形态一致的示意）
+      case "session_timeline":
+        return [
+          { seq: 4, kind: "blackboard", turn: 1, brief: "clock → 第3天 21:40 图书馆自习区" },
+          { seq: 3, kind: "effect", turn: 1, brief: "on_message:char（小雨）state×1" },
+          { seq: 2, kind: "message", turn: 1, brief: "角色：「我在等雨停。」…" },
+          { seq: 1, kind: "message", turn: 1, brief: "我：嗯，截稿日快到了。你还没走？" },
+        ];
       default:
         throw new Error(`mock 未覆盖命令：${cmd}`);
     }

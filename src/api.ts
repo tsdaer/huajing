@@ -22,6 +22,7 @@ import type {
   SessionMeta,
   Settings,
   StreamEvent,
+  TimelineEntry,
 } from "./types";
 
 export type NewSessionOptions = {
@@ -106,6 +107,21 @@ export const api = {
     invoke<InspectorProposal>("decide_proposal", { sessionId, id, accept, note }),
   /** 手动触发一次总结（可能较慢；正常路径是消息滑出窗口后自动触发） */
   summarizeNow: (sessionId: string) => invoke<string>("summarize_now", { sessionId }),
+
+  /** 手动开线（设计 §8.3）：玩家给这段关系记一笔欠账，origin=manual 不随重放丢弃 */
+  openThread: (
+    sessionId: string,
+    title: string,
+    cause: string,
+    actors: string[],
+    importance?: number,
+  ) => invoke<unknown>("open_thread", { sessionId, title, cause, actors, importance }),
+  /** 手动收线（设计 §8.3）：结果入宫殿 + 线事件落流 + 驱动一次状态树转移 */
+  resolveThread: (sessionId: string, id: string, outcome: string) =>
+    invoke<unknown>("resolve_thread", { sessionId, id, outcome }),
+  /** 类型化事件流视图（最新在前，默认 200 条） */
+  sessionTimeline: (sessionId: string, limit?: number) =>
+    invoke<TimelineEntry[]>("session_timeline", { sessionId, limit }),
 
   /** 角色私有 state 现状（卡内状态面板） */
   getCardState: (sessionId: string) => invoke<Record<string, unknown>>("get_card_state", { sessionId }),

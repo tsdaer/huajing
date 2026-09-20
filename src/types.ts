@@ -200,8 +200,16 @@ export type StreamEvent =
   | { event: "delta"; text: string }
   | { event: "done"; full: string; cancelled: boolean; report?: HookReport | null }
   | { event: "error"; message: string }
-  /** 卡片经 api.ui.emit 推来的界面事件 */
-  | { event: "hook_event"; kind: string; value: string };
+  /** 卡片经 api.ui.emit 推来的界面事件；turn = 产生它的钩子轮次 */
+  | { event: "hook_event"; kind: string; value: string; turn: number };
+
+/** 类型化事件流视图的一条（session_timeline · M3.0 ④） */
+export interface TimelineEntry {
+  seq: number;
+  kind: string;
+  turn: number;
+  brief: string;
+}
 
 /** 卡内长期记忆写入流中的一条（store.rs · MemRecord） */
 export interface MemRecord {
