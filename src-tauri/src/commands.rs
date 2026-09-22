@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::card;
 use crate::codex;
+use crate::director;
 use crate::event::{self, LogBody, LogRecord};
 use crate::palace;
 use crate::psyche;
@@ -1924,6 +1925,8 @@ fn spawn_summary(root: &std::path::Path, session_id: &str, flags: &SummaryFlags)
 
 /// 流式生成的后半程（send_message 与 regenerate 共用）：
 /// 中断标记 → 流式补全 → 回复落盘 → 时钟步进 → on_message → 记录组装（记忆检查器）。
+/// `finalize`（M3.4 群聊）：是否在这一步做轮末推进——一轮的最后一位发言人
+/// 才做（心理/状态树/总结每轮一次）；中间发言人只落回复。
 #[allow(clippy::too_many_arguments)]
 async fn stream_reply(
     app: &AppHandle,
@@ -1947,12 +1950,16 @@ async fn stream_reply(
     user_report: llm::HookReport,
     // 本轮对话所在的场景（M3.2 · 设计 §10.3）：回复与轮末推进都归属这个舞台
     scene: Option<&str>,
+    // 轮末推进（见上）
+    finalize: bool,
 ) -> Result<StreamEvent, String> {
     let session_id = meta.id.as_str();
     let flag = match acquire_flag(flags, session_id) {
         Ok(f) => f,
         Err(e) => return Ok(e),
     };
+    // 流式气泡带署名（M3.4）：前端据此区分一轮里的多位发言人
+    let speaker_name = cast.display_name(speaker);
 
     // 流式补全（取消检查在每个响应块之间）。代理跟随设置页：空则自动探测。
     let proxy = store::load_settings(root)
@@ -1963,6 +1970,7 @@ async fn stream_reply(
     let stream = llm::chat_stream(provider, &chat, |delta| {
         let _ = on_event.send(StreamEvent::Delta {
             text: delta.to_string(),
+            name: Some(speaker_name.clone()),
         });
     }, &flag, proxy.as_deref())
     .await;
@@ -1982,20 +1990,35 @@ async fn stream_reply(
             let mut report = Some(user_report);
             if !outcome.text.is_empty() {
                 // 回复落定后的收尾与单测共用同一份代码：回复事件 → 时钟步进 → on_message
-                match commit_reply(
-                    root,
-                    meta,
-                    cast,
-                    speaker,
-                    turn,
-                    &outcome.text,
-                    Some(&ui_sink(app)),
-                    log,
-                    runtime,
-                    tree_cache,
-                    summary_flags,
-                    scene,
-                ) {
+                let committed = if finalize {
+                    commit_reply(
+                        root,
+                        meta,
+                        cast,
+                        speaker,
+                        turn,
+                        &outcome.text,
+                        Some(&ui_sink(app)),
+                        log,
+                        runtime,
+                        tree_cache,
+                        summary_flags,
+                        scene,
+                    )
+                } else {
+                    commit_reply_core(
+                        root,
+                        meta,
+                        cast,
+                        speaker,
+                        turn,
+                        &outcome.text,
+                        Some(&ui_sink(app)),
+                        log,
+                        scene,
+                    )
+                };
+                match committed {
                     Ok(next) => {
                         forward_ui_events(on_event, &next);
                         report = Some(next);
@@ -2018,25 +2041,37 @@ async fn stream_reply(
 /// 重roll / 重试的历史裁剪（纯函数，便于单测）：
 ///
 /// - 末尾是角色回复 → 去掉它（重roll），以最后一条用户消息重新生成；
-/// - 末尾是用户消息 → 上一轮生成失败（例如「请求失败」），直接**重试**这一轮；
+/// - 末尾是一条用户消息 → 上一轮生成失败（例如「请求失败」），直接**重试**这一轮；
+/// - 末尾是**同一轮的多条角色回复**（M3.4 群聊一轮多人）→ 重roll 末尾那条，
+///   同轮更早的回复保留为上下文（「重roll 不换人」：重生成的是被点掉的那位的回复）；
 /// - 其它（空、只有开场白）→ 报错。
 ///
-/// 返回 `(写回磁盘的消息, 组装用的历史, 轮次, 用户输入)`。
+/// 返回 `(写回磁盘的消息, 组装用的历史截尾条数, 轮次, 用户输入)`：
+/// `content` = Some（末尾是用户消息）时历史截掉它、输入随请求走；
+/// None（重roll 群聊中后位发言人）时历史全量保留——本轮用户消息与先发言者的
+/// 回复都在历史里，与该发言人当初生成时的上下文同构。
 #[allow(clippy::type_complexity)]
-fn plan_regenerate(
-    messages: &[Message],
-) -> Result<(Vec<Message>, Vec<Message>, u64, String), String> {
+fn plan_regenerate(messages: &[Message]) -> Result<(Vec<Message>, usize, u64, Option<String>), String> {
     let mut kept = messages.to_vec();
     if kept.last().map(|m| m.role.as_str()) == Some("char") {
         kept.pop();
     }
-    let Some(user_msg) = kept.last().filter(|m| m.role == "user") else {
-        return Err("末尾没有可重新生成的用户消息".into());
-    };
-    let turn = user_msg.turn;
-    let content = user_msg.content.clone();
-    let prior = kept[..kept.len() - 1].to_vec();
-    Ok((kept, prior, turn, content))
+    // 末尾（去掉被重roll 的回复后）必须是用户消息，或全是**同一轮**的角色回复
+    match kept.last().map(|m| (m.role.as_str(), m.turn)) {
+        Some(("user", turn)) => {
+            let content = kept.last().unwrap().content.clone();
+            Ok((kept, 1, turn, Some(content)))
+        }
+        Some(("char", _)) => {
+            let turn = kept.last().unwrap().turn;
+            // 同轮 char 之后不允许再冒出别的轮次（流必须以本轮收尾）
+            if kept.iter().rev().take_while(|m| m.role == "char").any(|m| m.turn != turn) {
+                return Err("末尾不是本轮的回复，无法重新生成".into());
+            }
+            Ok((kept, 0, turn, None))
+        }
+        _ => Err("末尾没有可重新生成的用户消息".into()),
+    }
 }
 
 /// 跑一轮 `on_message`（用户消息与回复都已落盘后调用，设计 §3）——
@@ -2252,10 +2287,11 @@ fn tick_psyche(
 /// 回复落定后的收尾（stream_reply 与单测共用同一份代码，避免两处等价逻辑）：
 /// 回复事件（带发言人署名与场景归属）→ 时钟步进事件（发言人所在场景的局部时钟）→
 /// on_message 事件（本场景在场成员）→ 心理运行时推进（在场成员）→ 状态树轮末求值（在场成员）。
-///
-/// 事件化后时钟步进也是事件：重放同一轮必然得到同一时刻（设计 §7.3-5）。
+/// 回复落盘（消息级，M3.4 从 commit_reply 拆出）：回复事件 → 时钟步进 → on_message。
+/// 只做「这一条回复」的事；轮末推进（心理/状态树/总结）在 [finalize_turn]，
+/// 群聊一轮多人发言时它只跑一次。`scene` = 本轮所在场景（M3.2）。
 #[allow(clippy::too_many_arguments)]
-fn commit_reply(
+fn commit_reply_core(
     root: &std::path::Path,
     meta: &store::SessionMeta,
     cast: &Cast,
@@ -2264,9 +2300,6 @@ fn commit_reply(
     text: &str,
     sink: Option<&card::UiSink>,
     log: &store::EventLog,
-    runtime: Option<&SessionRuntime>,
-    tree_cache: Option<&TreeCache>,
-    summary_flags: Option<&SummaryFlags>,
     scene: Option<&str>,
 ) -> Result<llm::HookReport, String> {
     let reply = Message {
@@ -2285,7 +2318,7 @@ fn commit_reply(
     // 单场景/老会话照旧是世界层事件（scene_id = None）。
     let proj = project_session(log, root, meta)?;
     let scene_id = scoped_scene(&proj, scene);
-    let mut board = proj.effective_board(scene.as_deref());
+    let mut board = proj.effective_board(scene);
     let (day, clock) = prompt::advance_clock(board.day, &board.clock);
     board.day = day;
     board.clock = clock;
@@ -2316,10 +2349,28 @@ fn commit_reply(
     }
     let mut report = report.expect("发言人必在场（调用方已校验）");
     report.logs.extend(other_logs);
+    Ok(report)
+}
 
+/// 轮末推进（每轮**一次**，与回复条数无关）：心理 tick → 状态树轮末求值 → 异步总结。
+/// 群聊一轮多人发言（M3.4）：只在最后一位发言人之后调用——
+/// 「默认转移推迟到轮末」的轮是用户的一轮，不是某条回复。
+#[allow(clippy::too_many_arguments)]
+fn finalize_turn(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    cast: &Cast,
+    turn: u64,
+    log: &store::EventLog,
+    runtime: Option<&SessionRuntime>,
+    tree_cache: Option<&TreeCache>,
+    summary_flags: Option<&SummaryFlags>,
+    scene: Option<&str>,
+    report: &mut llm::HookReport,
+) -> Result<(), String> {
     // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——在场成员各自推进，结果同样是事件
     if let Ok(proj) = project_session(log, root, meta) {
-        for m in present_members(cast, &proj, scene_id.as_deref()) {
+        for m in present_members(cast, &proj, scene) {
             let (body, emotion) = tick_psyche(&proj, &m.dir, &m.loaded, turn);
             if let Some(body) = body {
                 if let Err(e) = commit(log, root, meta, body) {
@@ -2340,7 +2391,7 @@ fn commit_reply(
     // M3.2：判据环境与揭示见证者取本场景分区。
     let active_entities = runtime.map(|r| r.previously_active(&meta.id));
     if let Ok(proj) = project_session(log, root, meta) {
-        for m in present_members(cast, &proj, scene_id.as_deref()) {
+        for m in present_members(cast, &proj, scene) {
             let Some(tree) = load_tree(&m.loaded, tree_cache) else {
                 continue;
             };
@@ -2353,7 +2404,7 @@ fn commit_reply(
                 "on_turn_end",
                 active_entities.as_ref(),
                 meta.seed,
-                scene_id.as_deref(),
+                scene,
             );
             // 转移的界面事件（on_enter 的 ui.emit）与本轮钩子事件一起回给前端
             report.ui_events.extend(emits);
@@ -2369,6 +2420,40 @@ fn commit_reply(
     if let Some(flags) = summary_flags {
         spawn_summary(root, &meta.id, flags);
     }
+    Ok(())
+}
+
+/// 一条角色回复的完整收尾 = 回复级落盘 + 轮末推进（单发言人路径；语义与拆分前一致）。
+///
+/// 事件化后时钟步进也是事件：重放同一轮必然得到同一时刻（设计 §7.3-5）。
+#[allow(clippy::too_many_arguments)]
+fn commit_reply(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    cast: &Cast,
+    speaker: &str,
+    turn: u64,
+    text: &str,
+    sink: Option<&card::UiSink>,
+    log: &store::EventLog,
+    runtime: Option<&SessionRuntime>,
+    tree_cache: Option<&TreeCache>,
+    summary_flags: Option<&SummaryFlags>,
+    scene: Option<&str>,
+) -> Result<llm::HookReport, String> {
+    let mut report = commit_reply_core(root, meta, cast, speaker, turn, text, sink, log, scene)?;
+    finalize_turn(
+        root,
+        meta,
+        cast,
+        turn,
+        log,
+        runtime,
+        tree_cache,
+        summary_flags,
+        scene,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -2383,13 +2468,138 @@ fn forward_ui_events(channel: &Channel<StreamEvent>, report: &llm::HookReport) {
     }
 }
 
+/// 每轮发言数的缺省值（M3.4：每轮发言数可配，默认 1–2；导演调度本就天然限流，
+/// 对冲隔离模式的请求成本）。会话未配置（None）时取它。
+pub const DEFAULT_MAX_SPEAKERS: usize = 2;
+
+/// 导演调度（M3.4 · 设计 §10.5，与 Tauri 无关，便于单测）：从投影里取一切信号
+/// （在场者、最近消息、黑板在场名单、活跃线、意图投票、最近的 char 发言人），
+/// 交给 [`director::plan_speakers`] 打分，返回本轮发言人计划。
+fn director_plan(
+    meta: &store::SessionMeta,
+    cast: &Cast,
+    proj: &event::Projection,
+    scene: Option<&str>,
+    content: &str,
+) -> Result<Vec<director::Pick>, String> {
+    let present_members = present_members(cast, proj, scene);
+    let candidates: Vec<director::Candidate> = present_members
+        .iter()
+        .map(|m| director::Candidate {
+            dir: m.dir.clone(),
+            name: cast.display_name(&m.dir),
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err("当前场景没有可发言的角色".into());
+    }
+    let present: Vec<String> = candidates.iter().map(|c| c.dir.clone()).collect();
+
+    // 最近消息窗口与 char 发言人序列（本场景；窗口大小归 director 的权重表管，
+    // 这里只切片不搬整段历史）
+    let history = scene_messages(&proj.messages, scene);
+    let recent: Vec<String> = history
+        .iter()
+        .rev()
+        .take(director::weights::RECENT_WINDOW)
+        .rev()
+        .map(|m| m.content.clone())
+        .collect();
+    let name_to_dir = |name: &str| -> Option<String> {
+        cast.members
+            .iter()
+            .find(|m| cast.display_name(&m.dir) == name)
+            .map(|m| m.dir.clone())
+            .or_else(|| cast.get(name).map(|m| m.dir.clone()))
+    };
+    let recent_speakers: Vec<String> = history
+        .iter()
+        .rev()
+        .filter(|m| m.role == "char")
+        .take(director::weights::COOLDOWN_SPAN)
+        .filter_map(|m| m.name.as_deref().and_then(name_to_dir))
+        .collect();
+
+    let board = proj.effective_board(scene);
+    // 活跃线切片（mention 窗口词 = resurface 的话题窗口）
+    let threads: Vec<director::ThreadRef> = proj
+        .threads
+        .values()
+        .filter_map(|v| threads::Thread::from_value(v).ok())
+        .filter(|t| t.state == threads::STATE_ACTIVE)
+        .map(|t| director::ThreadRef {
+            title: t.title.clone(),
+            actors: t.actors.clone(),
+            importance: t.importance,
+            mention_words: t
+                .resurface
+                .windows
+                .iter()
+                .filter_map(|w| match w {
+                    threads::ResurfaceWindow::Mention(words) => Some(words.clone()),
+                    threads::ResurfaceWindow::All(parts) => {
+                        let mut all = Vec::new();
+                        for p in parts {
+                            if let threads::ResurfaceWindow::Mention(words) = p {
+                                all.extend(words.clone());
+                            }
+                        }
+                        if all.is_empty() { None } else { Some(all) }
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect(),
+        })
+        .collect();
+
+    // want_to_speak 投票（M3.4 取意图强度；M3.5 的 schedule_say 队列接进来后同槽加权）
+    let votes: Vec<(String, f32)> = present_members
+        .iter()
+        .map(|m| {
+            let psyche = psyche::Psyche::from_state(&current_state(proj, &m.dir, &m.loaded));
+            let strength = psyche
+                .intents
+                .iter()
+                .map(|i| i.strength)
+                .fold(0.0f32, f32::max);
+            (m.dir.clone(), strength)
+        })
+        .collect();
+
+    let query = director::SpeechQuery {
+        candidates: &candidates,
+        present: &present,
+        content,
+        recent: &recent,
+        board_actors: &board.actors,
+        threads: &threads,
+        votes: &votes,
+        recent_speakers: &recent_speakers,
+        max_speakers: meta_max_speakers(meta, cast),
+    };
+    Ok(director::plan_speakers(&query))
+}
+
+/// 每轮发言数的会话配置（夹到 1..=阵容数；导演调度天然限流，上限就是全阵容）。
+/// 会话未配置（None）时取 [DEFAULT_MAX_SPEAKERS]。
+fn meta_max_speakers(meta: &store::SessionMeta, cast: &Cast) -> usize {
+    let configured = meta.max_speakers.unwrap_or(DEFAULT_MAX_SPEAKERS as u32) as usize;
+    configured.clamp(1, cast.members.len().max(1))
+}
+
 /// 发送一条用户消息并流式生成回复。
 /// 流事件经 `on_event` 通道推给前端（delta / done / error），
 /// 返回值即终态事件。用户消息先落盘；回复（含中断时的部分文本）生成后落盘。
-/// `speaker`（M3.1 群聊）：本轮由谁回应——缺省主角色；多角色时组装取她的隔离视角。
+///
+/// 发言权（M3.4 · 设计 §10.5）：
+/// - 显式 `speaker` = **点名直通**（只他一人接话，语义与 M3.1 一致）；
+/// - `None` 且阵容多人 = **导演调度**——发言权打分选出 1–N 位发言人按序接话
+///   （后发言者听到先发言者刚说的话），调度落 `director` 事件（回放可重现）；
+/// - `None` 且单角色 = 主角色（1v1 退化，不走导演，行为与 M2 一致）。
 ///
 /// 事件顺序（与重放顺序一致，见 rebuild_from）：
-/// on_context 事件 → 用户消息事件 → on_message 事件 → 回复事件 → 时钟步进事件 → on_message 事件。
+/// director 事件 → on_context 事件 → 用户消息事件 → on_message 事件 → 回复事件 → 时钟步进事件。
 #[tauri::command]
 pub async fn send_message(
     app: AppHandle,
@@ -2407,50 +2617,117 @@ pub async fn send_message(
 ) -> Result<StreamEvent, String> {
     let root = root();
 
-    // 会话与角色阵容（M3.1 隔离模式：speaker 指定本轮谁发言，缺省主角色）
+    // 会话与角色阵容（M3.1 隔离模式：每轮发言 = 发言人独立的上下文组装与请求）
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
     let cast = Cast::load(&root, &meta)?;
-    let member = cast.resolve(speaker.as_deref())?;
-    let speaker = member.dir.clone();
 
     // 接入点（chat 档；先校验再落盘用户消息，配置错误不产生半截会话）
     let provider = pick_chat_provider(&root)?;
 
+    let proj = project_session(&log, &root, &meta)?;
+    let scene = scene_ctx(&proj);
+
+    // 发言人解析（见函数头注释）
+    let explicit = match speaker.as_deref() {
+        Some(s) if !s.trim().is_empty() => Some(cast.resolve(Some(s))?.dir.clone()),
+        _ => None,
+    };
+    let scheduled = explicit.is_none() && cast.is_multi();
+    let picks: Vec<director::Pick> = if scheduled {
+        director_plan(&meta, &cast, &proj, scene.as_deref(), &content)?
+    } else {
+        let dir = explicit.clone().unwrap_or_else(|| cast.first().dir.clone());
+        vec![director::Pick {
+            dir: dir.clone(),
+            name: cast.display_name(&dir),
+            score: 0.0,
+            reasons: Vec::new(),
+        }]
+    };
+    let first_hooks = picks
+        .first()
+        .and_then(|p| cast.get(&p.dir))
+        .map(|m| m.loaded.hook_names.clone())
+        .unwrap_or_default();
+
     crate::diag::record(
         "chat",
         format!(
-            "send_message 会话={} 发言人={} 阵容={:?}（{}，钩子={:?}）",
+            "send_message 会话={} 发言人={:?} 阵容={:?} 调度={} 钩子={:?}（{}）",
             session_id,
-            speaker,
+            picks.iter().map(|p| p.dir.as_str()).collect::<Vec<_>>(),
             meta.characters,
+            if scheduled { "导演" } else { "点名/主角色" },
+            first_hooks,
             root.display(),
-            member.loaded.hook_names
         ),
     );
 
-    // 双槽位组装（设计 §4.1）：历史来自事件流投影，高轮次只解析新增行。
-    // 隔离模式（设计 §10.2）：组装取发言人视角，其他角色的 B4/B5/内心不进这次请求；
-    // 场景化（M3.2 · 设计 §10.3）：组装只看聚焦场景的舞台——别的场景是「与此同时」的盲区
-    let proj = project_session(&log, &root, &meta)?;
-    let scene = scene_ctx(&proj);
-    // 发言人必须在本场景（被切走的场景冻结，不在场的人不能开口）
+    // 发言人必须在本场景（导演计划只在在场者里挑；点名要显式检查——
+    // 被切走的场景冻结，不在场的人点不动）
     if let Some(id) = &scene {
-        let present = proj.scenes.get(id).map(|sc| sc.has_actor(&speaker));
-        if present == Some(false) {
-            return Err(format!(
-                "「{}」不在当前场景——切到他所在的场景再说话",
-                cast.display_name(&speaker)
-            ));
+        for p in &picks {
+            let present = proj.scenes.get(id).map(|sc| sc.has_actor(&p.dir));
+            if present == Some(false) {
+                return Err(format!(
+                    "「{}」不在当前场景——切到他所在的场景再说话",
+                    cast.display_name(&p.dir)
+                ));
+            }
         }
     }
+
     let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0) + 1;
-    // on_context 在此运行并事件化落盘：卡片可能顺手改了 state/黑板/界面事件
+
+    // 调度落流（只有导演真正拍板的轮才记——点名直通本身就是消息署名可见的动作），
+    // 同时给前端一条调度指示：第一个字出现前，「谁在说话、为何轮到她」就有答案
+    if scheduled {
+        log.append(
+            &root,
+            &session_id,
+            LogBody::Director(event::DirectorEvent {
+                turn,
+                op: "schedule".into(),
+                picks: picks
+                    .iter()
+                    .map(|p| event::DirectorPick {
+                        dir: p.dir.clone(),
+                        name: p.name.clone(),
+                        score: p.score,
+                        reasons: p.reasons.clone(),
+                    })
+                    .collect(),
+                direct: None,
+                note: None,
+                ts: store::unix_now(),
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = on_event.send(StreamEvent::Director {
+            names: picks.iter().map(|p| p.name.clone()).collect(),
+            brief: picks
+                .iter()
+                .map(|p| {
+                    if p.reasons.is_empty() {
+                        p.name.clone()
+                    } else {
+                        format!("{}（{}）", p.name, p.reasons.join(" · "))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("、"),
+        });
+    }
+
+    let first = &picks[0];
+    // on_context 在此运行并事件化落盘：卡片可能顺手改了 state/黑板/界面事件。
+    // （第一位发言人的组装——此时用户消息尚未落盘，随 content 单独进上下文）
     let run = assemble_prompt_core(
         &ui_sink(&app),
         &root,
         &meta,
         &cast,
-        &speaker,
+        &first.dir,
         &proj.messages,
         &proj,
         Some(&content),
@@ -2483,38 +2760,85 @@ pub async fn send_message(
 
     // 设计 §3：`on_message` 在**每条**新消息落地后调用——用户消息同样要跑，
     // 否则卡看不到本轮输入，且它的反应（比如好感度 +1）来不及影响这一轮的生成。
+    // （每轮一次，报告归属第一位发言人；其他成员的日志并入报告）
     let report = run_message_hooks(
         &app,
         &root,
         &meta,
         &cast,
-        &speaker,
+        &first.dir,
         turn,
         Some(&on_event),
         &log,
         scene.as_deref(),
     );
 
-    stream_reply(
-        &app,
-        &root,
-        &meta,
-        &cast,
-        &speaker,
-        turn,
-        &provider,
-        run.assembly,
-        &on_event,
-        &flags,
-        &log,
-        &assemblies,
-        Some(&runtime),
-        Some(&tree_cache),
-        Some(&summary_flags),
-        report,
-        scene.as_deref(),
-    )
-    .await
+    // 逐位发言（顺序，不并行——后发言者的组装要含先发言者刚落盘的回复，
+    // 「后发言者自然听到先发言者刚说的话」，设计 §10.2）
+    let mut assembly = Some(run.assembly);
+    let mut user_report = Some(report);
+    let mut last: Result<StreamEvent, String> = Err("没有可发言的角色".into());
+    for (i, pick) in picks.iter().enumerate() {
+        let is_last = i + 1 == picks.len();
+        let asm = match assembly.take() {
+            Some(a) => a,
+            None => {
+                // 重投影：上一位的回复（与更早的消息）已进历史，这位发言人按自己的视角组装
+                let proj = project_session(&log, &root, &meta)?;
+                assemble_prompt_core(
+                    &ui_sink(&app),
+                    &root,
+                    &meta,
+                    &cast,
+                    &pick.dir,
+                    &proj.messages,
+                    &proj,
+                    None,
+                    turn,
+                    Some(&log),
+                    Some(&codex_cache),
+                    Some(&runtime),
+                    Some(&tree_cache),
+                    scene.as_deref(),
+                )?
+                .assembly
+            }
+        };
+        let report = user_report.take().unwrap_or_else(|| llm::HookReport {
+            turn,
+            ..Default::default()
+        });
+        let res = stream_reply(
+            &app,
+            &root,
+            &meta,
+            &cast,
+            &pick.dir,
+            turn,
+            &provider,
+            asm,
+            &on_event,
+            &flags,
+            &log,
+            &assemblies,
+            Some(&runtime),
+            Some(&tree_cache),
+            Some(&summary_flags),
+            report,
+            scene.as_deref(),
+            is_last,
+        )
+        .await;
+        let stop = matches!(
+            &res,
+            Ok(StreamEvent::Error { .. }) | Ok(StreamEvent::Done { cancelled: true, .. })
+        );
+        last = res;
+        if stop {
+            break; // 出错或被中断：保留已说出的部分，不再往下排
+        }
+    }
+    last
 }
 
 /// 重roll 的截断（regenerate 与单测共用）：丢掉 turn 起的**派生事件**，
@@ -2571,7 +2895,7 @@ pub async fn regenerate(
         .and_then(|m| m.name.clone());
     let member = cast.resolve(rerolled_speaker.as_deref())?;
     let speaker = member.dir.clone();
-    let (rewritten, _prior, turn, content) = match plan_regenerate(&all) {
+    let (rewritten, trim, turn, content) = match plan_regenerate(&all) {
         Ok(plan) => plan,
         Err(message) => return Ok(StreamEvent::Error { message }),
     };
@@ -2579,7 +2903,7 @@ pub async fn regenerate(
     // 截断本轮：丢掉 turn 起的**派生事件**（上一次的 on_context / on_message / 时钟步进），
     // 并按 plan 移除末尾回复。它们随后由正常流程重新产生——**「重roll 不重复计分」
     // 由此从启发式判据变成结构性保证**：旧效果已经不在流里了。
-    // 手动事件（手改黑板、手动开收线）不是派生结果，照旧保留。
+    // 手动事件（手改黑板、手动开收线）与导演调度事件不是派生结果，照旧保留。
     let kept = truncate_turn(&records, turn, rewritten.len() < all.len());
     log.rewrite(&root, &session_id, &kept)
         .map_err(|e| e.to_string())?;
@@ -2593,7 +2917,9 @@ pub async fn regenerate(
         .rev()
         .find(|m| m.role == "user" && m.turn == turn)
         .and_then(|m| scoped_scene(&proj, m.scene_id.as_deref()));
-    let history = &proj.messages[..proj.messages.len().saturating_sub(1)]; // 组装历史不含本轮用户消息
+    // content = Some：历史截掉本轮用户消息（重roll 首位发言人 / 重试失败轮）；
+    // content = None：本轮用户消息与先发言者的回复都留在历史里（重roll 群聊的后位发言人）
+    let history = &proj.messages[..proj.messages.len().saturating_sub(trim)]; // 组装历史
     let run = assemble_prompt_core(
         &ui_sink(&app),
         &root,
@@ -2602,7 +2928,7 @@ pub async fn regenerate(
         &speaker,
         history,
         &proj,
-        Some(&content),
+        content.as_deref(),
         turn,
         Some(&log),
         Some(&codex_cache),
@@ -2647,6 +2973,7 @@ pub async fn regenerate(
         Some(&summary_flags),
         report,
         scene.as_deref(),
+        true,
     )
     .await
 }
@@ -3092,6 +3419,17 @@ pub fn update_scene(
     )
 }
 
+/// 配置每轮发言数上限（M3.4 群聊 · 设计 §10.5；导演调度的天然限流旋钮）。
+/// 0 = 恢复缺省（2）。夹取与生效都在发送路径做（[meta_max_speakers]）。
+#[tauri::command]
+pub fn set_max_speakers(session_id: String, max_speakers: u32) -> Result<u32, String> {
+    let root = root();
+    let mut meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    meta.max_speakers = if max_speakers == 0 { None } else { Some(max_speakers) };
+    store::save_session(&root, &meta).map_err(|e| e.to_string())?;
+    Ok(meta.max_speakers.unwrap_or(DEFAULT_MAX_SPEAKERS as u32))
+}
+
 // ---------- 记忆检查器 v0（设计 §4.2：组装结果逐层可见）----------
 
 /// 预览组装：按当前状态干跑一轮（不含用户消息），不发送。
@@ -3421,6 +3759,26 @@ fn timeline_brief(record: &event::LogRecord) -> String {
                 _ => format!("{} {}（{}）", s.op, clip(&title, 24), s.origin),
             }
         }
+        LogBody::Director(d) => match d.op.as_str() {
+            "schedule" => {
+                let who: Vec<String> = d
+                    .picks
+                    .iter()
+                    .map(|p| {
+                        if p.reasons.is_empty() {
+                            p.name.clone()
+                        } else {
+                            format!("{}（{}）", p.name, p.reasons.join(" · "))
+                        }
+                    })
+                    .collect();
+                match &d.direct {
+                    Some(name) => format!("点名 → {name}"),
+                    None => format!("调度 → {}", who.join("、")),
+                }
+            }
+            other => format!("{other}（{} 人）", d.picks.len()),
+        },
     }
 }
 
@@ -4780,7 +5138,7 @@ return {
         // 截断（regenerate 命令与这里调的是同一个函数）
         let records = log.read(&root, &meta.id).unwrap();
         let all = event::messages(&records);
-        let (rewritten, _prior, turn, content) = plan_regenerate(&all).unwrap();
+        let (rewritten, _trim, turn, content) = plan_regenerate(&all).unwrap();
         let kept = truncate_turn(&records, turn, rewritten.len() < all.len());
         log.rewrite(&root, &meta.id, &kept).unwrap();
         sync_now(&log, &root, &meta).unwrap();
@@ -4803,7 +5161,7 @@ return {
             &speaker,
             history,
             &proj,
-            Some(&content),
+            content.as_deref(),
             turn,
             Some(&log),
             None,
@@ -4950,19 +5308,28 @@ return {
             scene_id: None,
         };
 
-        // 完整一轮：重roll 去掉末尾回复，组装历史不含本轮用户消息
+        // 完整一轮：重roll 去掉末尾回复，组装历史不含本轮用户消息（trim=1，content 随请求走）
         let full = vec![ch(0, "开场"), user(1, "你好"), ch(1, "……嗯")];
-        let (rewritten, prior, turn, content) = plan_regenerate(&full).unwrap();
+        let (rewritten, trim, turn, content) = plan_regenerate(&full).unwrap();
         assert_eq!(rewritten.len(), 2, "末尾回复被移除");
-        assert_eq!(prior.len(), 1, "组装历史不含本轮用户消息");
-        assert_eq!((turn, content.as_str()), (1, "你好"));
+        assert_eq!((trim, turn), (1, 1), "组装历史截掉本轮用户消息");
+        assert_eq!(content.as_deref(), Some("你好"));
 
         // 请求失败：末尾只剩用户消息 → 直接重试这一轮
         let failed = vec![ch(0, "开场"), user(1, "你好")];
-        let (rewritten, prior, turn, content) = plan_regenerate(&failed).unwrap();
+        let (rewritten, trim, turn, content) = plan_regenerate(&failed).unwrap();
         assert_eq!(rewritten.len(), 2, "没有回复可删，原样保留");
-        assert_eq!(prior.len(), 1);
-        assert_eq!((turn, content.as_str()), (1, "你好"));
+        assert_eq!(trim, 1);
+        assert_eq!(content.as_deref(), Some("你好"));
+
+        // M3.4 群聊一轮多回复：重roll 末位发言人——同轮更早的回复留在历史里
+        // （trim=0、content=None：组装历史含本轮用户消息与先发言者的回复）
+        let group = vec![user(1, "你们好"), ch(1, "嗨"), ch(1, "……你好呀")];
+        let (rewritten, trim, turn, content) = plan_regenerate(&group).unwrap();
+        assert_eq!(rewritten.len(), 2, "只移除末位发言人的回复");
+        assert_eq!((trim, turn), (0, 1), "历史全量保留");
+        assert_eq!(content, None);
+        assert_eq!(rewritten.last().unwrap().role, "char");
 
         // 只有开场白 / 空会话：给明确错误，而不是生成出奇怪的一轮
         assert!(plan_regenerate(&[ch(0, "开场")]).is_err());
@@ -6490,6 +6857,87 @@ return {
             !b3c.contains("已故母亲"),
             "串台：秘密只对知情者展开：{b3c}"
         );
+    }
+
+    // M3.4 验收（commands 层）：发言权调度——点名提及优先、冷却轮换、
+    // 调度事件落流可查且消息级重建不丢（设计 §10.5）。
+    #[test]
+    fn director_schedules_speakers_logs_and_survives_rebuild() {
+        let plain = |name: &str, mes: &str| {
+            format!(
+                r#"return {{ spec='charcard/1.0', name='{name}', scenario='图书馆', personality='温柔', first_mes='{mes}' }}"#
+            )
+        };
+        let (_dir, meta, root) = setup_cast3(
+            &plain("小雨", "（开场）"),
+            &plain("阿澈", "（阿澈入席）"),
+            &plain("小玲", "（小玲入席）"),
+        );
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+
+        // ① 点名提及：指名小雨 → 小雨排第一（导演打分的强信号）；缺省每轮至多 2 人
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let picks = director_plan(&meta, &cast, &proj, None, "小雨，你觉得呢？").unwrap();
+        assert_eq!(picks[0].dir, "小雨");
+        assert!(picks[0].reasons.iter().any(|r| r.contains("点名")));
+        assert_eq!(picks.len(), 2, "每轮缺省至多 2 人接话：{picks:?}");
+        assert!(picks[0].dir != picks[1].dir, "不打架：不重复点名");
+
+        // ② 冷却轮换：小雨刚说完话、这轮没人被点名 → 她不开头（不冷场也不独占）
+        simulate_turn_as(&root, &meta, &cast, "小雨", &log, 1, "（大家随意聊）");
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let picks = director_plan(&meta, &cast, &proj, None, "（继续）").unwrap();
+        assert_ne!(
+            picks[0].dir, "小雨",
+            "刚说过话的排后面（防独占）：{:?}",
+            picks.iter().map(|p| p.dir.clone()).collect::<Vec<_>>()
+        );
+
+        // ③ 调度事件落流：时间线有人读摘要；消息级重建（丢派生事件）不丢调度史
+        let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0) + 1;
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Director(event::DirectorEvent {
+                turn,
+                op: "schedule".into(),
+                picks: picks
+                    .iter()
+                    .map(|p| event::DirectorPick {
+                        dir: p.dir.clone(),
+                        name: p.name.clone(),
+                        score: p.score,
+                        reasons: p.reasons.clone(),
+                    })
+                    .collect(),
+                direct: None,
+                note: None,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        let entries = timeline_entries(&log, &root, &meta, Some(50)).unwrap();
+        let brief = entries
+            .iter()
+            .find(|e| e["kind"] == "director")
+            .map(|e| e["brief"].as_str().unwrap_or_default().to_string());
+        let brief = brief.unwrap_or_default();
+        assert!(brief.contains("调度"), "时间线应有调度摘要：{brief}");
+        assert!(brief.contains("阿澈") || brief.contains("小玲"), "摘要应带发言人：{brief}");
+
+        let records = log.read(&root, &meta.id).unwrap();
+        let kept = truncate_turn(&records, turn, false);
+        assert!(
+            kept.iter()
+                .any(|r| matches!(&r.body, LogBody::Director(_))),
+            "调度史不随重建丢弃"
+        );
+        // fold 对 director 是 no-op：重建前后投影一致（可回放承诺，设计 §7.3-5）
+        let before = event::project_over(&records, &event::Base::default());
+        let after = event::project_over(&kept, &event::Base::default());
+        assert_eq!(before.states, after.states);
+        assert_eq!(before.blackboard, after.blackboard);
     }
 
     // M3.2 验收（commands 层）：消息级重建时，钩子的黑板写入按消息所在场景重演；

@@ -78,6 +78,8 @@ export interface SessionMeta {
   world?: string | null;
   seed: number;
   premise?: string | null;
+  /** 每轮发言数上限（M3.4 群聊；缺省 = 2，0 视为恢复缺省） */
+  max_speakers?: number | null;
 }
 
 /** messages.jsonl 中的一行 */
@@ -228,11 +230,14 @@ export interface HookReport {
 
 /** send_message / regenerate 推送的流事件 */
 export type StreamEvent =
-  | { event: "delta"; text: string }
+  /** 一段增量文本；name = 生成它的角色署名（M3.4 群聊一轮多人发言） */
+  | { event: "delta"; text: string; name?: string }
   | { event: "done"; full: string; cancelled: boolean; report?: HookReport | null }
   | { event: "error"; message: string }
   /** 卡片经 api.ui.emit 推来的界面事件；turn = 产生它的钩子轮次 */
-  | { event: "hook_event"; kind: string; value: string; turn: number };
+  | { event: "hook_event"; kind: string; value: string; turn: number }
+  /** 导演调度指示（M3.4 · §10.5）：这一轮谁接话、为何轮到她 */
+  | { event: "director"; names: string[]; brief: string };
 
 /** 类型化事件流视图的一条（session_timeline · M3.0 ④） */
 export interface TimelineEntry {

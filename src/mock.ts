@@ -441,6 +441,8 @@ export function setupMock() {
       case "list_card_memory":
         return memoryRecords;
       // ---------- 场景与多线（M3.2 · 设计 §10.3） ----------
+      case "set_max_speakers":
+        return (args as { maxSpeakers: number }).maxSpeakers;
       case "list_scenes":
         return sceneView();
       case "create_scene": {

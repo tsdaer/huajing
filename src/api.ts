@@ -73,8 +73,9 @@ export const api = {
   deleteMessage: (sessionId: string, index: number) =>
     invoke<Message[]>("delete_message", { sessionId, index }),
 
-  /** 发送消息并流式接收（delta/done/error 经 onEvent 推送；返回值为终态事件）；
-   *  speaker（群聊）：本轮由谁回应，缺省主角色——多角色时组装取她的隔离视角 */
+  /** 发送消息并流式接收（delta/done/director/error 经 onEvent 推送；返回值为终态事件）。
+   *  speaker（群聊 · M3.4）：显式点名 = 只他一人接话；缺省 = 导演调度（多角色）
+   *  或主角色（1v1）。多角色时每位发言人按自己的隔离视角组装 */
   sendMessage: (sessionId: string, content: string, onEvent: (e: StreamEvent) => void, speaker?: string) => {
     const channel = new Channel<StreamEvent>();
     channel.onmessage = onEvent;
@@ -153,6 +154,10 @@ export const api = {
     sceneId: string,
     patch: { title?: string; place?: string; actors?: string[]; day?: number; clock?: string },
   ) => invoke<SceneView>("update_scene", { sessionId, sceneId, ...patch }),
+
+  /** 配置每轮发言数上限（M3.4 群聊 · 导演调度的限流旋钮；0 = 恢复缺省 2） */
+  setMaxSpeakers: (sessionId: string, maxSpeakers: number) =>
+    invoke<number>("set_max_speakers", { sessionId, maxSpeakers }),
 
   /** 角色私有 state 现状（卡内状态面板） */
   getCardState: (sessionId: string) => invoke<Record<string, unknown>>("get_card_state", { sessionId }),

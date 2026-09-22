@@ -46,7 +46,7 @@ const bbForm = reactive({ day: 1, clock: "", place: "", actors: "" });
 const savingBb = ref(false);
 
 // ---------- 记忆检查器：页签与数据（M1.6 的四个可观测面 + M2.8 的六个面板） ----------
-/** 检查器页签：M1 的四个可观测面 + M2.8 的六个记忆检查器面板 */
+/** 检查器页签：M1 的四个可观测面 + M2.8 的六个记忆检查器面板 + M3.4 的导演面板 */
 const INSP_TABS = [
   { id: "layers", label: "注入层" },
   { id: "statetree", label: "状态路径" },
@@ -55,6 +55,7 @@ const INSP_TABS = [
   { id: "palace", label: "宫殿" },
   { id: "codex", label: "设定集" },
   { id: "outbox", label: "摘要·收件箱" },
+  { id: "director", label: "导演" },
   { id: "state", label: "卡内状态" },
   { id: "memory", label: "卡内记忆" },
   { id: "events", label: "事件流" },
@@ -68,10 +69,15 @@ const M2_TABS: InspTab[] = ["statetree", "threads", "psyche", "palace", "codex",
 const inspTab = ref<InspTab>("layers");
 const inspTabLabel = computed(() => INSP_TABS.find((t) => t.id === inspTab.value)?.label ?? "");
 
-// 切到事件流页签时按需拉一次类型化事件流（M3.0 ④）
+// 切到事件流/导演页签时按需拉一次类型化事件流（M3.0 ④ / M3.4）
 watch(inspTab, (tab) => {
-  if (tab === "events") ensureTimeline();
+  if (tab === "events" || tab === "director") ensureTimeline();
 });
+
+/** 导演面板的数据源：事件流里的调度史（发言权打分的依据逐条可查，DoD 1） */
+const directorHistory = computed(() =>
+  (timeline.value ?? []).filter((e) => e.kind === "director"),
+);
 
 /** 记忆检查器全量投影（状态树 / 剧情线 / 心理 / 宫殿 / 设定集 / 摘要与收件箱） */
 const inspector = ref<InspectorData | null>(null);
@@ -253,20 +259,48 @@ function fmtValue(v: unknown): string {
 
 const draft = ref("");
 const generating = ref(false);
-const streamText = ref("");
+/** 流式中的各位发言人（M3.4 群聊）：一位一个气泡，按发言顺序排列 */
+const streams = ref<{ name: string; text: string }[]>([]);
+/** 导演调度指示（这轮谁接话、为何轮到她；本轮结束后清掉） */
+const scheduleNote = ref("");
 const editingIndex = ref(-1);
 const editDraft = ref("");
 
-// ---------- M3.1 群聊：发言人选择（多角色时对谁说话；1v1 恒主角色） ----------
+// ---------- M3.4 群聊：发言权（导演调度 / 点名 · 设计 §10.5） ----------
 const speakers = computed(() => props.meta.characters);
+/** "" = 导演调度（多角色缺省：发言权打分选出 1–N 位按序接话）；否则为点名角色的目录名 */
 const speaker = ref("");
 watch(
   speakers,
   (list) => {
-    if (!list.includes(speaker.value)) speaker.value = list[0] ?? "";
+    // 1v1 无导演；点名对象不在阵容里时回到导演调度
+    if (!speaker.value && list.length > 1) return;
+    if (!list.includes(speaker.value)) speaker.value = "";
   },
   { immediate: true },
 );
+/** 每轮发言数上限（导演调度的限流旋钮；0 = 恢复缺省 2） */
+const maxSpeakers = ref(props.meta.max_speakers ?? 2);
+watch(
+  () => props.meta.max_speakers,
+  (n) => {
+    maxSpeakers.value = n ?? 2;
+  },
+);
+async function setMaxSpeakers(n: number) {
+  maxSpeakers.value = n;
+  try {
+    await api.setMaxSpeakers(props.meta.id, n);
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+/** 输入框占位（随发言权模式变化） */
+const placeholder = computed(() => {
+  if (speakers.value.length <= 1) return "说点什么…";
+  return speaker.value ? `点名${speaker.value}：对她说点什么…` : "说点什么，导演安排谁接话…";
+});
 
 const streamEl = ref<HTMLElement | null>(null);
 const composerEl = ref<HTMLTextAreaElement | null>(null);
@@ -485,6 +519,13 @@ function avatarClass(m: Message): string {
   return m.role === "user" ? "bg-primary text-primary-content" : "bg-neutral text-neutral-content";
 }
 
+/** 角色气泡的稳定颜色（M3.4 群聊：按署名取色，同一角色恒同色——多人同台一眼可分） */
+function avatarStyle(name: string): string {
+  let h = 0;
+  for (const ch of name) h = (h * 31 + (ch.codePointAt(0) ?? 0)) % 360;
+  return `background: hsl(${h} 45% 42%); color: white`;
+}
+
 /** 消息时间戳（秒）→ HH:MM；乐观上屏的消息没有时间戳，返回空串 */
 function fmtTime(ts: number): string {
   if (!ts) return "";
@@ -517,7 +558,8 @@ async function scrollToBottom() {
 async function loadAll() {
   error.value = "";
   generating.value = false;
-  streamText.value = "";
+  streams.value = [];
+  scheduleNote.value = "";
   editingIndex.value = -1;
   draft.value = "";
   page.value = 1;
@@ -612,7 +654,8 @@ async function send() {
   draft.value = "";
   resetComposerHeight();
   generating.value = true;
-  streamText.value = "";
+  streams.value = [];
+  scheduleNote.value = "";
   // 乐观上屏；终态后以磁盘为准重读（带场景归属，切着场景时不出戏）
   messages.value = [
     ...messages.value,
@@ -621,6 +664,7 @@ async function send() {
   void jumpToLastPage();
   let final: StreamEvent;
   try {
+    // speaker 为空 = 导演调度（多角色自动选人）；点名则直通该角色
     final = await api.sendMessage(props.meta.id, content, onDelta, speaker.value || undefined);
   } catch (e) {
     final = { event: "error", message: String(e) };
@@ -632,7 +676,8 @@ async function reroll() {
   if (generating.value) return;
   error.value = "";
   generating.value = true;
-  streamText.value = "";
+  streams.value = [];
+  scheduleNote.value = "";
   void jumpToLastPage();
   let final: StreamEvent;
   try {
@@ -645,11 +690,18 @@ async function reroll() {
 
 function onDelta(e: StreamEvent) {
   if (e.event === "delta") {
-    streamText.value += e.text;
+    // 换人了就开新气泡（M3.4 群聊：先发言者的话落定后，下一位接着流式）
+    const last = streams.value[streams.value.length - 1];
+    const name = e.name ?? last?.name ?? cardName.value;
+    if (last && last.name === name) last.text += e.text;
+    else streams.value.push({ name, text: e.text });
     void scrollToBottom();
   } else if (e.event === "hook_event") {
     // turn 由后端带上（产生该事件的钩子轮次）；没有就回退到本地推算
     pushHookEvent(e.kind, e.value, e.turn ?? -1);
+  } else if (e.event === "director") {
+    // 调度指示：第一个字出现前，「谁在说话、为何轮到她」就有答案
+    scheduleNote.value = `导演：${e.brief} 接话`;
   }
 }
 
@@ -711,13 +763,14 @@ async function finishGeneration(final: StreamEvent) {
     error.value = String(e);
   }
   generating.value = false;
-  streamText.value = "";
+  streams.value = [];
+  scheduleNote.value = "";
   void refreshInspector();
   void refreshCard();
   // 刚聊完一轮：状态树/剧情线/心理/宫殿多半都变了，抽屉开着就顺手重拉（设计 §8/§9 的「面板可查」）
   if (panel.value === "inspector") {
     void loadInspector();
-    if (inspTab.value === "events") void loadTimeline(); // 事件流页签：新事件即时可见
+    if (inspTab.value === "events" || inspTab.value === "director") void loadTimeline(); // 事件流/导演页签：新事件即时可见
   }
   void scrollToBottom();
   composerEl.value?.focus();
@@ -939,7 +992,11 @@ watch(cardGeneration, () => {
             </li>
             <li v-else class="chat group" :class="m.role === 'user' ? 'chat-end' : 'chat-start'">
             <div class="chat-image avatar avatar-placeholder">
-              <div class="w-9 rounded-full" :class="avatarClass(m)">
+              <div
+                class="w-9 rounded-full"
+                :class="avatarClass(m)"
+                :style="m.role === 'char' ? avatarStyle(whoFor(m)) : undefined"
+              >
                 <span class="text-xs">{{ initial(whoFor(m)) }}</span>
               </div>
             </div>
@@ -992,24 +1049,42 @@ watch(cardGeneration, () => {
             </li>
           </template>
 
-          <!-- 流式中的角色回复（只在最后一页显示） -->
-          <li v-if="generating && isLastPage" class="chat chat-start">
-            <div class="chat-image avatar avatar-placeholder">
-              <div class="w-9 rounded-full bg-neutral text-neutral-content">
-                <span class="text-xs">{{ initial(cardName) }}</span>
+          <!-- 流式区（只在最后一页显示）：导演调度指示 + 各位发言人的流式气泡 -->
+          <template v-if="generating && isLastPage">
+            <li v-if="scheduleNote" class="mx-auto my-1 flex max-w-full list-none items-center gap-3">
+              <span class="h-px flex-1 bg-base-content/15"></span>
+              <span class="flex-none text-xs tracking-wide text-base-content/50">{{ scheduleNote }}</span>
+              <span class="h-px flex-1 bg-base-content/15"></span>
+            </li>
+            <li v-for="(s, si) in streams" :key="`stream-${si}-${s.name}`" class="chat chat-start">
+              <div class="chat-image avatar avatar-placeholder">
+                <div class="w-9 rounded-full" :style="avatarStyle(s.name)">
+                  <span class="text-xs">{{ initial(s.name) }}</span>
+                </div>
               </div>
-            </div>
-            <div class="chat-header mb-0.5 text-xs font-medium text-base-content/60">{{ cardName }}</div>
-            <div
-              class="chat-bubble max-w-[min(76%,72ch)] border border-primary/40 bg-base-300 leading-relaxed break-words whitespace-pre-wrap text-base-content"
-            >
-              {{ streamText }}<span class="ml-0.5 inline-block h-[1em] w-0.5 animate-pulse bg-primary align-[-0.15em]" aria-hidden="true"></span>
-            </div>
-            <div class="chat-footer mt-1 flex items-center gap-2 text-[11px] text-base-content/45">
-              <span class="loading loading-dots loading-xs text-primary"></span>
-              正在写…
-            </div>
-          </li>
+              <div class="chat-header mb-0.5 text-xs font-medium text-base-content/60">{{ s.name }}</div>
+              <div
+                class="chat-bubble max-w-[min(76%,72ch)] border border-primary/40 bg-base-300 leading-relaxed break-words whitespace-pre-wrap text-base-content"
+              >
+                {{ s.text }}<span class="ml-0.5 inline-block h-[1em] w-0.5 animate-pulse bg-primary align-[-0.15em]" aria-hidden="true"></span>
+              </div>
+              <div class="chat-footer mt-1 flex items-center gap-2 text-[11px] text-base-content/45">
+                <span class="loading loading-dots loading-xs text-primary"></span>
+                正在写…
+              </div>
+            </li>
+            <!-- 第一位还没开口：先给一条生成中提示，气泡等第一个增量到了再出现 -->
+            <li v-if="streams.length === 0" class="chat chat-start">
+              <div class="chat-image avatar avatar-placeholder">
+                <div class="w-9 rounded-full bg-neutral text-neutral-content">
+                  <span class="text-xs">{{ initial(speaker || cardName) }}</span>
+                </div>
+              </div>
+              <div class="chat-bubble border border-primary/40 bg-base-300">
+                <span class="loading loading-dots loading-sm text-primary"></span>
+              </div>
+            </li>
+          </template>
 
           <li
             v-if="sceneMessagesView.length === 0 && !generating"
@@ -1047,22 +1122,45 @@ watch(cardGeneration, () => {
           </div>
         </div>
 
-        <!-- 输入区：daisyUI textarea + 圆形发送键；多角色时带发言人选择（M3.1 隔离模式） -->
+        <!-- 输入区：daisyUI textarea + 圆形发送键；多角色时带发言权选择（M3.4 · 设计 §10.5） -->
         <form class="flex-none border-t border-base-300 p-3" @submit.prevent="send">
           <div v-if="speakers.length > 1" class="mb-2 flex flex-wrap items-center gap-1.5">
-            <span class="text-[11px] text-base-content/45">对谁说</span>
+            <span class="text-[11px] text-base-content/45">发言权</span>
             <div role="tablist" class="tabs tabs-box tabs-xs">
+              <button
+                role="tab"
+                class="tab tooltip tooltip-bottom"
+                :class="{ 'tab-active': !speaker }"
+                data-tip="导演按相关性打分选人接话（最近提及 · 场景 · 剧情线 · 想说话）"
+                @click="speaker = ''"
+              >
+                导演调度
+              </button>
               <button
                 v-for="dir in speakers"
                 :key="dir"
                 role="tab"
-                class="tab"
+                class="tab tooltip tooltip-bottom"
                 :class="{ 'tab-active': speaker === dir }"
+                :data-tip="`点名${dir}：只让她接话，不经调度`"
                 @click="speaker = dir"
               >
-                {{ dir }}
+                点名 {{ dir }}
               </button>
             </div>
+            <label v-if="!speaker" class="ml-auto flex items-center gap-1 text-[11px] text-base-content/45">
+              每轮至多
+              <select
+                class="select select-bordered select-xs"
+                :value="maxSpeakers"
+                aria-label="每轮发言数上限"
+                @change="setMaxSpeakers(Number(($event.target as HTMLSelectElement).value))"
+              >
+                <option :value="1">1 人</option>
+                <option :value="2">2 人</option>
+                <option :value="3">3 人</option>
+              </select>
+            </label>
           </div>
           <div class="flex items-end gap-2">
             <textarea
@@ -1070,7 +1168,7 @@ watch(cardGeneration, () => {
               class="textarea max-h-40 w-full flex-1 resize-none leading-relaxed"
               v-model="draft"
               rows="1"
-              :placeholder="speakers.length > 1 ? `对${speaker || '谁'}说点什么…` : '说点什么…'"
+              :placeholder="placeholder"
               aria-label="消息输入框"
               @keydown="onComposerKeydown"
               @input="autoGrow"
@@ -1319,6 +1417,42 @@ watch(cardGeneration, () => {
                 @decide="decideProposal"
               />
             </template>
+          </template>
+
+          <!-- 导演面板（M3.4 · 设计 §10.5）：发言权调度史，逐条可查「为何轮到她」 -->
+          <template v-else-if="inspTab === 'director'">
+            <div class="flex items-center justify-between gap-2">
+              <p class="m-0 text-xs text-base-content/50">发言权调度史（导演事件 · 最新在前）</p>
+              <button class="btn btn-ghost btn-xs flex-none" :disabled="timelineLoading" @click="loadTimeline">
+                <span v-if="timelineLoading" class="loading loading-spinner loading-xs"></span>
+                <Icon v-else name="refresh" :size="13" />刷新
+              </button>
+            </div>
+            <p class="m-0 text-[11px] text-base-content/40">
+              打分信号：最近提及 · 场景黑板 · 剧情线关联 · 想说话投票 − 冷却。点名直通不经打分。
+            </p>
+            <div v-if="timelineError" role="alert" class="alert alert-error alert-soft py-2 text-xs break-words">
+              {{ timelineError }}
+            </div>
+            <p v-else-if="!timeline" class="m-0 flex items-center gap-2 text-xs text-base-content/50">
+              <span v-if="timelineLoading" class="loading loading-spinner loading-xs"></span>
+              {{ timelineLoading ? "正在读调度史…" : "还没有数据，点「刷新」重拉。" }}
+            </p>
+            <ul v-else-if="directorHistory.length" class="m-0 flex list-none flex-col gap-1.5 p-0">
+              <li
+                v-for="e in directorHistory"
+                :key="e.seq"
+                class="rounded-box bg-base-200 px-2.5 py-1.5 text-xs"
+              >
+                <span class="break-words">{{ e.brief }}</span>
+                <span class="ml-1 inline-block font-mono text-[10px] text-base-content/35">
+                  第 {{ e.turn }} 轮
+                </span>
+              </li>
+            </ul>
+            <p v-else class="m-0 text-xs text-base-content/50">
+              还没有调度记录——多角色会话用「导演调度」发一轮就有了。
+            </p>
           </template>
 
           <!-- 卡内状态：角色私有 state（state.json，hook 每轮维护） -->

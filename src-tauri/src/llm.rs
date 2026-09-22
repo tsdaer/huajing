@@ -84,7 +84,13 @@ pub struct UiEmit {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Delta { text: String },
+    /// 一段增量文本；`name` = 生成它的角色署名（M3.4 群聊一轮多人发言：
+    /// 前端据此切换流式气泡——每个发言人一个气泡，按发言顺序排列）
+    Delta {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     Done {
         full: String,
         cancelled: bool,
@@ -95,6 +101,14 @@ pub enum StreamEvent {
     /// 卡片经 `api.ui.emit` 推来的界面事件（紧跟产生它的那一步发生）；
     /// turn = 产生它的钩子轮次（M3.0 修界面事件「第 -1 轮」：前端不再从乐观消息推轮次）
     HookEvent { kind: String, value: String, turn: u64 },
+    /// 导演的调度指示（M3.4 · 设计 §10.5）：这一轮谁接话、为何轮到她。
+    /// 生成开始前发出——「谁在说话」在第一个字出现前就有答案
+    Director {
+        /// 发言人署名（按发言顺序）
+        names: Vec<String>,
+        /// 人读的调度依据（逐人：「小雨：被点名提及 · 剧情线「X」正被谈到」）
+        brief: String,
+    },
 }
 
 /// 一轮 `on_message` 钩子的执行报告（前端据此显示卡内状态与事件）

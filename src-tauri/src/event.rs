@@ -208,6 +208,40 @@ fn default_origin() -> String {
     "manual".into()
 }
 
+/// 导演调度里的一名发言人（M3.4 · 设计 §10.5）：谁说话 + 为何轮到她。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectorPick {
+    /// 角色目录名（会话内唯一键）
+    pub dir: String,
+    /// 展示名（卡名；与消息署名一致）
+    pub name: String,
+    /// 打分（调度依据的一部分；点名直通时无意义）
+    pub score: f32,
+    /// 逐条理由（「被点名提及」「剧情线「X」正被谈到」…）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+/// 导演调度事件（M3.4 · 设计 §10.5）：发言权调度落流，回放可重现整场调度史。
+///
+/// 与场景事件同理：调度是**元层的动作**，不是消息的派生结果——消息级重建
+/// 永远保留它们（否则编辑一句台词就会把调度史抹掉）。调度只决定谁说话，
+/// 不产生任何投影副作用（fold 对它是 no-op）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectorEvent {
+    pub turn: u64,
+    /// schedule（发言权调度）；后续：cut（切场）/ advance（时间推进）/ open·close（开收线）
+    pub op: String,
+    /// 选中的发言人（按发言顺序）
+    pub picks: Vec<DirectorPick>,
+    /// 用户点名的发言人（直通，不经打分）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub ts: u64,
+}
+
 /// 事件体（messages.jsonl 一行去掉 seq 与 kind 之后的部分）
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogBody {
@@ -221,6 +255,7 @@ pub enum LogBody {
     Proposal(ProposalEvent),
     Memory(MemoryEvent),
     Scene(SceneEvent),
+    Director(DirectorEvent),
 }
 
 impl From<Message> for LogBody {
@@ -248,6 +283,7 @@ impl LogBody {
             LogBody::Proposal(_) => "proposal",
             LogBody::Memory(_) => "memory",
             LogBody::Scene(_) => "scene",
+            LogBody::Director(_) => "director",
         }
     }
 
@@ -264,6 +300,7 @@ impl LogBody {
             LogBody::Proposal(p) => p.turn,
             LogBody::Memory(m) => m.turn,
             LogBody::Scene(s) => s.turn,
+            LogBody::Director(d) => d.turn,
         }
     }
 
@@ -280,6 +317,7 @@ impl LogBody {
             LogBody::Proposal(p) => serde_json::to_value(p),
             LogBody::Memory(m) => serde_json::to_value(m),
             LogBody::Scene(s) => serde_json::to_value(s),
+            LogBody::Director(d) => serde_json::to_value(d),
         }
         .map_err(|e| format!("事件序列化失败：{e}"))?;
         if let Some(obj) = v.as_object_mut() {
@@ -311,6 +349,7 @@ impl LogBody {
             "proposal" => serde_json::from_value(v).map(LogBody::Proposal).map_err(bad),
             "memory" => serde_json::from_value(v).map(LogBody::Memory).map_err(bad),
             "scene" => serde_json::from_value(v).map(LogBody::Scene).map_err(bad),
+            "director" => serde_json::from_value(v).map(LogBody::Director).map_err(bad),
             other => Err(format!("未知事件类型：{other}")),
         }
     }
@@ -360,9 +399,12 @@ impl LogRecord {
             // 摘要与提案是**模型产物**，不是确定性派生：重放不重新调用模型，
             // 所以它们永远保留（编辑历史只重算状态/转移/心理，设计 §7.3-5 的承诺范围）。
             // 场景事件同理：切场/分场/合场是玩家/导演的动作，不从消息派生。
-            LogBody::Summary(_) | LogBody::Proposal(_) | LogBody::Memory(_) | LogBody::Scene(_) => {
-                false
-            }
+            // 导演调度同理（M3.4）：调度史是元层的动作记录，重建不得抹掉。
+            LogBody::Summary(_)
+            | LogBody::Proposal(_)
+            | LogBody::Memory(_)
+            | LogBody::Scene(_)
+            | LogBody::Director(_) => false,
         }
     }
 
@@ -842,6 +884,8 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
             }
         }
         LogBody::Scene(s) => fold_scene(p, s),
+        // 导演调度只决定谁说话，不产生任何会话状态（设计 §10.5「输出只有调度动作」）
+        LogBody::Director(_) => {}
     }
 }
 
@@ -1324,6 +1368,32 @@ mod tests {
         assert!(codex("tree").is_derived());
         assert!(!codex("pipeline").is_derived());
         assert!(!codex("manual").is_derived());
+    }
+
+    #[test]
+    fn director_event_roundtrips_and_is_never_derived() {
+        // 调度史是元层动作（M3.4 · §10.5）：永远保留、回放不产生副作用
+        let ev = DirectorEvent {
+            turn: 7,
+            op: "schedule".into(),
+            picks: vec![DirectorPick {
+                dir: "xiaoyu".into(),
+                name: "小雨".into(),
+                score: 4.5,
+                reasons: vec!["被点名提及".into(), "剧情线「周五还书」正被谈到".into()],
+            }],
+            direct: None,
+            note: None,
+            ts: 12,
+        };
+        assert!(!LogRecord::new(0, LogBody::Director(ev.clone())).is_derived());
+
+        let rec = LogRecord::new(3, LogBody::Director(ev));
+        let line = rec.to_line().unwrap();
+        assert!(line.contains(r#""kind":"director""#), "{line}");
+        assert!(line.contains(r#""reasons":["被点名提及""#), "{line}");
+        let back = LogRecord::from_line(&line).unwrap();
+        assert!(matches!(back.body, LogBody::Director(ref d) if d.turn == 7 && d.picks.len() == 1));
     }
 
     #[test]

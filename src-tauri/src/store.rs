@@ -276,6 +276,10 @@ pub struct SessionMeta {
     /// 起因（premise），新建向导 v0 可填
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub premise: Option<String>,
+    /// 每轮发言数上限（M3.4 群聊 · 设计 §10.5；None = 缺省 2。导演调度天然限流，
+    /// 对冲隔离模式的请求成本）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_speakers: Option<u32>,
 }
 
 /// 事件流里的一条消息（M2.0 起 messages.jsonl 是类型化事件流，
@@ -466,6 +470,7 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         world: None,
         seed: seed_now(),
         premise: req.premise.clone(),
+        max_speakers: None,
     };
     let dir = session_dir(root, &meta.id);
     std::fs::create_dir_all(&dir)?;
@@ -808,6 +813,17 @@ pub fn load_session(root: &Path, id: &str) -> StoreResult<SessionMeta> {
         return Err(StoreError::NotFound(format!("会话「{}」", id)));
     }
     Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
+}
+
+/// 回写单个会话元数据（session.json 全量覆盖；调用方先 load 后改）
+pub fn save_session(root: &Path, meta: &SessionMeta) -> StoreResult<()> {
+    let dir = session_dir(root, &meta.id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join("session.json"),
+        serde_json::to_string_pretty(meta)? + "\n",
+    )?;
+    Ok(())
 }
 
 fn seed_now() -> u64 {

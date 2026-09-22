@@ -5,6 +5,7 @@ mod card;     // 角色卡与 Lua 沙箱（设计 §3）
 mod codex;    // 设定集：实体图谱、激活与分级注入（M2.2 · 设计 §6）
 mod commands; // Tauri 命令层
 mod diag;     // 运行时诊断环形缓冲
+mod director; // 导演调度：发言权打分与发言计划（M3.4 · 设计 §10.5）
 mod event;    // 事件日志：类型化事件流与投影（M2.0 · 设计 §7.3）
 mod llm;      // OpenAI 兼容 SSE 客户端（设计 §11）
 mod palace;   // 记忆宫殿：记忆对象、召回与视图（M2.1 · 设计 §5）
@@ -72,6 +73,7 @@ pub fn run() {
             commands::split_scene,
             commands::merge_scenes,
             commands::update_scene,
+            commands::set_max_speakers,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,
