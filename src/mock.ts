@@ -315,7 +315,7 @@ export function setupMock() {
       case "app_info":
         return {
           name: "化境 Huajing",
-          slogan: "扮谁，便入谁之境。",
+          slogan: "化万千相，随心入境。",
           version: "0.1.0-mock",
           buildTs: Math.floor(Date.now() / 1000),
           dataRoot: "DataHub（浏览器 mock）",

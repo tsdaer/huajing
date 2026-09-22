@@ -25,7 +25,7 @@ use crate::store::{self, Message, NewSessionRequest, Settings};
 pub fn app_info() -> serde_json::Value {
     serde_json::json!({
         "name": "化境 Huajing",
-        "slogan": "扮谁，便入谁之境。",
+        "slogan": "化万千相，随心入境。",
         "version": env!("CARGO_PKG_VERSION"),
         // 编译期注入（build.rs）：界面显示它，就能一眼看出跑的是哪一版
         "buildTs": env!("HUAJING_BUILD_TS").parse::<u64>().unwrap_or(0),
