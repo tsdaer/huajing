@@ -81,8 +81,36 @@ function hasTrail(ticks: unknown[]): boolean {
           </span>
           <span v-else>未外化为剧情线</span>
         </p>
+        <p
+          v-if="it.triggered"
+          class="m-0 rounded-box bg-accent/10 px-2 py-1.5 text-[11px] leading-relaxed text-base-content/70"
+          :title="`强度 ${fixed2(it.triggered.strength)} ≥ 阈值 ${fixed2(it.triggered.threshold)}`"
+        >
+          <span class="badge badge-xs badge-accent badge-soft mr-1.5">主动行为</span>
+          第 {{ it.triggered.turn }} 轮触发（强度 {{ fixed2(it.triggered.strength) }} ≥ 阈值
+          {{ fixed2(it.triggered.threshold) }}）→ {{ it.triggered.action }}
+        </p>
       </div>
       <p v-if="!psyche.intents.length" class="m-0 text-xs text-base-content/50">没有在意的意图。</p>
+    </section>
+
+    <section v-if="psyche.scheduled.length" class="flex flex-col gap-2">
+      <p class="m-0 text-xs text-base-content/50">憋着没说的心里话（{{ psyche.scheduled.length }}）</p>
+      <div class="rounded-box flex flex-col gap-1.5 border border-dashed border-base-300 bg-base-200/60 p-3">
+        <p
+          v-for="s in psyche.scheduled"
+          :key="s.text"
+          class="m-0 text-xs leading-relaxed break-words text-base-content/80"
+        >
+          <span class="badge badge-xs badge-ghost mr-1.5 font-mono">
+            {{ s.turn > 0 ? `第${s.turn}轮憋下` : "不知何时" }}
+          </span>
+          {{ s.text }}
+        </p>
+        <p class="m-0 text-[11px] text-base-content/45">
+          下一轮她会优先拿到发言权，把这话说出口（B5 同步注入「心里话」）。
+        </p>
+      </div>
     </section>
 
     <section class="flex flex-col gap-2">

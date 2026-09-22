@@ -596,6 +596,7 @@ fn run_load_hook_core(
             state: state.clone(),
             blackboard: blackboard_env(&proj.effective_board(scene.as_deref())),
             memory: memory_env(&proj.memory),
+            turn: 0,
         },
         meta.seed,
         sink,
@@ -775,6 +776,7 @@ fn rebuild_from(
                     state: state.clone(),
                     blackboard: blackboard_env(&board),
                     memory: memory_env(&proj.memory),
+                    turn: 0,
                 },
                 meta.seed,
                 &NOOP_SINK,
@@ -855,6 +857,7 @@ fn rebuild_from(
                     &proj.messages.clone(),
                     &NOOP_SINK,
                     msg_scene.as_deref(),
+                    msg.turn,
                 );
                 if let Some(body) = hook_effect(
                     &run,
@@ -894,6 +897,31 @@ fn rebuild_from(
             );
             out.push(rec.clone());
             event::fold(&mut proj, &rec);
+        }
+        // ③b 主动心声消费（M3.5）：与 commit_reply_core 同序——时钟步进之后、
+        //    on_message 之前；章取步进后的故事时刻（生成路径同口径）。队列到期才消费，
+        //    否则是 no-op（不产生事件），重放由此保持一致
+        if msg.role == "char" {
+            if let Some(speaker) = cast
+                .resolve(msg.name.as_deref())
+                .ok()
+                .map(|m| m.dir.clone())
+            {
+                let stepped = proj.effective_board(msg_scene.as_deref());
+                for body in consume_proactive_say(
+                    &proj,
+                    cast,
+                    &speaker,
+                    msg.turn,
+                    msg_scene.as_deref(),
+                    stepped.day,
+                    &stepped.clock,
+                ) {
+                    let rec = LogRecord::new(0, body);
+                    out.push(rec.clone());
+                    event::fold(&mut proj, &rec);
+                }
+            }
         }
         // ④ on_message（每条新消息落地后，设计 §3）——本场景在场的成员各跑一次。
         //    过渡插页（system）不触发钩子：它是场景的叙事接缝，不是任何人说的话
@@ -1530,6 +1558,7 @@ fn blackboard_env(bb: &store::Blackboard) -> BTreeMap<String, serde_json::Value>
 /// 跑 `on_context`（B5 注入时机，设计 §4.1）：返回 (运行结果, 运行前的 state)。
 /// 降级卡与未定义该 hook 的卡返回默认（ran=false），不新建 Lua 实例。
 /// `scene`（M3.2）：钩子看到的是该场景的有效黑板（世界层 ∪ 场景分区）。
+/// `turn`：本轮轮次（M3.5 心里话盖章用）。
 #[allow(clippy::too_many_arguments)]
 fn run_context_hook(
     loaded: &card::LoadedCard,
@@ -1539,6 +1568,7 @@ fn run_context_hook(
     history: &[Message],
     sink: &card::UiSink,
     scene: Option<&str>,
+    turn: u64,
 ) -> (card::HookRun, serde_json::Value) {
     let state = current_state(proj, character, loaded);
     if loaded.degraded || !loaded.hook_names.iter().any(|h| h == "on_context") {
@@ -1554,6 +1584,7 @@ fn run_context_hook(
             state: state.clone(),
             blackboard: blackboard_env(&proj.effective_board(scene)),
             memory: memory_env(&proj.memory), // 长期记忆读侧：记忆宫殿的键值（同 key 后写覆盖）
+            turn,
         },
         seed,
         sink,
@@ -1582,6 +1613,7 @@ fn run_message_hook_at(
             state: state.clone(),
             blackboard: blackboard_env(&proj.effective_board(scene)),
             memory: memory_env(&proj.memory),
+            turn: msg.turn,
         },
         seed,
         sink,
@@ -1640,7 +1672,7 @@ fn assemble_prompt_core(
     let mut speaker_run: Option<(card::HookRun, serde_json::Value)> = None;
     for m in present_members(cast, proj, scene) {
         let (run, before) = run_context_hook(
-            &m.loaded, proj, &m.dir, meta.seed, history, sink, scene,
+            &m.loaded, proj, &m.dir, meta.seed, history, sink, scene, turn,
         );
         if run.ran() {
             // 黑板写入是公开事件（设计 §10.1：角色之间共享说出口的与做出来的）——
@@ -1810,7 +1842,19 @@ fn assemble_prompt_core(
         .collect();
 
     // ---- B5 内心：心理运行时摘要（设计 §9.2：主观世界一行，空则省略）----
-    let psyche_line = psyche::Psyche::from_state(&card_state).summary_line_for(&loaded.card.name);
+    // M3.5：憋着没说出口的心里话同槽注入——「下一轮主动发消息」的说话侧
+    //（发言权优先在导演投票，这里负责让她把那句话自然说出来）
+    let psy = psyche::Psyche::from_state(&card_state);
+    let mut psyche_line = psy.summary_line_for(&loaded.card.name);
+    if let Some(text) = psy.first_scheduled() {
+        let urge = format!("【心里话】你憋着一句话想说：「{text}」——这轮找机会把它自然说出口，不要生硬念稿。");
+        if psyche_line.is_empty() {
+            psyche_line = urge;
+        } else {
+            psyche_line.push('\n');
+            psyche_line.push_str(&urge);
+        }
+    }
     let psyche_line = if psyche_line.trim().is_empty() {
         None
     } else {
@@ -2171,7 +2215,7 @@ fn run_message_hook_core(
     let (run, before) = run_message_hook_at(
         loaded,
         &proj,
-        &character,
+        character,
         &current,
         meta.seed,
         sink.unwrap_or(&NOOP_SINK),
@@ -2186,7 +2230,16 @@ fn run_message_hook_core(
         ),
     );
 
-    let report = apply_message_hook(log, root, meta, turn, &run, &before, msg_scene.as_deref());
+    let report = apply_message_hook(
+        log,
+        root,
+        meta,
+        character,
+        turn,
+        &run,
+        &before,
+        msg_scene.as_deref(),
+    );
     crate::diag::record(
         "hook",
         format!(
@@ -2222,6 +2275,7 @@ fn apply_message_hook(
     log: &store::EventLog,
     root: &std::path::Path,
     meta: &store::SessionMeta,
+    character: &str,
     turn: u64,
     run: &card::HookRun,
     before: &serde_json::Value,
@@ -2236,8 +2290,9 @@ fn apply_message_hook(
         card_state: run.state.clone().unwrap_or_else(|| before.clone()),
     };
 
-    let character = first_character(meta).unwrap_or_default();
-    if let Some(body) = hook_effect(run, before, &character, turn, "hook.on_message", false, scene)
+    // 效果归给**真正跑钩子的角色**（M3.1 隔离的题中之义）——此前误归主角色，
+    // 群聊里她人的钩子写入会记错人（M3.5 群聊心里话用例当场暴露）
+    if let Some(body) = hook_effect(run, before, character, turn, "hook.on_message", false, scene)
     {
         if let Err(e) = commit(log, root, meta, body) {
             report.logs.push(e);
@@ -2250,6 +2305,11 @@ fn apply_message_hook(
 ///
 /// 返回自动表情（宿主据此 ui.emit，"情绪跨轮连续"由此保证——衰减可查，不凭模型记忆）。
 /// 结果作为 effect 事件落盘，因此**消息级重放会重新长出同一份心理状态**。
+///
+/// M3.5 主动行为触发（设计 §9.2「strength ≥ 阈值且状态窗口开启 → 触发主动行为」）：
+/// 「状态窗口」= 她在本场景在场（finalize_turn / 重放都只对 present_members 调用，
+/// 进到本函数即窗口开启）。队列空且存在没触发过的高强度意图 → 宿主替她把心里话
+/// 入队（下一轮发言权优先 + B5 注入），并在意图上记下触发记录（可溯源到面板）。
 fn tick_psyche(
     proj: &event::Projection,
     character: &str,
@@ -2264,6 +2324,14 @@ fn tick_psyche(
     }
     let mut p = psyche::Psyche::from_state(&state);
     p.tick(turn, 1.0);
+    if !p.has_scheduled() {
+        if let Some(intent) = p.proactive_candidate() {
+            let action = format!("主动想说：「{intent}」");
+            p.mark_triggered(&intent, turn, &action);
+            p.schedule(&intent, turn);
+            // 触发记录与心里话随本轮 psyche tick 的 state 补丁一起落盘
+        }
+    }
     let mut next = state.clone();
     p.write_into(&mut next);
     let patch = event::state_patch(&state, &next);
@@ -2284,10 +2352,108 @@ fn tick_psyche(
     (body, p.auto_emotion())
 }
 
+/// 主动心声消费（M3.5 · 设计 §9.2「意图说出口 → 意志外化为剧情线」）：
+/// 她这轮真的开口了（回复落盘）→ 心里话队列清空；若存在没外化的意图，
+/// 取最强的一条（强度降序、同分名字升序）开线并绑定 `linked_thread`
+/// （线已存在且活跃则直接绑上去，不重复开）。事件顺序：线事件 → psyche 补丁。
+///
+/// 由 commit_reply_core 与 rebuild_from 共用（消费是派生效果，重放要重演同一条路径）；
+/// 返回需要落盘的事件体，空 = 没有到期的心里话。`story_day`/`story_clock` = 本轮
+/// 时钟步进**之后**的故事时刻（开线的章盖在上面；两处调用方各自算好传入，保证一致）。
+fn consume_proactive_say(
+    proj: &event::Projection,
+    cast: &Cast,
+    speaker: &str,
+    turn: u64,
+    scene: Option<&str>,
+    story_day: i64,
+    story_clock: &str,
+) -> Vec<LogBody> {
+    let Some(m) = cast.get(speaker) else {
+        return Vec::new();
+    };
+    let state = current_state(proj, speaker, &m.loaded);
+    let mut p = psyche::Psyche::from_state(&state);
+    // 只消费到期的心里话（turn < 本轮）：她自己这轮刚憋下的话，下一轮才主动说
+    let said = p.consume_ready(turn);
+    if said.is_empty() {
+        return Vec::new();
+    }
+    let mut bodies: Vec<LogBody> = Vec::new();
+
+    // 外化：最强未绑线的意图 → 开线绑定（origin=psyche：说出口是历史事实，
+    // 消息级重建不丢；线已存在且活跃则直接绑上去，不重复开）
+    let candidate = p
+        .intents
+        .iter()
+        .filter(|i| i.linked_thread.is_none())
+        .max_by(|a, b| {
+            a.strength
+                .partial_cmp(&b.strength)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.name.cmp(&a.name))
+        })
+        .cloned();
+    if let Some(intent) = candidate {
+        let id = threads::id_from_title(&intent.name);
+        let existing_active = proj
+            .threads
+            .get(&id)
+            .and_then(|v| threads::Thread::from_value(v).ok())
+            .map(|t| t.is_active())
+            .unwrap_or(false);
+        if existing_active {
+            p.bind_thread(&intent.name, &id);
+        } else {
+            let thread = threads::Thread::open(
+                &id,
+                &intent.name,
+                &said.join("；"),
+                &[cast.display_name(speaker)],
+                intent.strength,
+                threads::ThreadStamp {
+                    turn,
+                    story_day,
+                    story_clock: story_clock.to_string(),
+                },
+            );
+            let snapshot = thread.to_value();
+            if p.bind_thread(&intent.name, &id) {
+                bodies.push(LogBody::Thread(event::ThreadEvent {
+                    turn,
+                    op: threads::OP_OPEN.into(),
+                    thread_id: id,
+                    thread: Some(snapshot),
+                    origin: threads::ORIGIN_PSYCHE.into(),
+                    note: Some("心里话说出口，意志外化为剧情线".into()),
+                    ts: store::unix_now(),
+                }));
+            }
+        }
+    }
+
+    // psyche 状态补丁（队列清空 + 可能的 linked_thread 绑定）
+    let mut next = state.clone();
+    p.write_into(&mut next);
+    let patch = event::state_patch(&state, &next);
+    if !patch.is_empty() {
+        bodies.push(LogBody::Effect(event::EffectEvent {
+            turn,
+            trigger: "psyche.consume".into(),
+            character: speaker.to_string(),
+            state_set: patch,
+            blackboard: Vec::new(),
+            memory: Vec::new(),
+            scene_id: scene.map(str::to_string),
+            ts: store::unix_now(),
+        }));
+    }
+    bodies
+}
+
 /// 回复落定后的收尾（stream_reply 与单测共用同一份代码，避免两处等价逻辑）：
 /// 回复事件（带发言人署名与场景归属）→ 时钟步进事件（发言人所在场景的局部时钟）→
-/// on_message 事件（本场景在场成员）→ 心理运行时推进（在场成员）→ 状态树轮末求值（在场成员）。
-/// 回复落盘（消息级，M3.4 从 commit_reply 拆出）：回复事件 → 时钟步进 → on_message。
+/// 主动心声消费（M3.5，[consume_proactive_say]）→ on_message 事件（本场景在场成员）。
 /// 只做「这一条回复」的事；轮末推进（心理/状态树/总结）在 [finalize_turn]，
 /// 群聊一轮多人发言时它只跑一次。`scene` = 本轮所在场景（M3.2）。
 #[allow(clippy::too_many_arguments)]
@@ -2323,6 +2489,7 @@ fn commit_reply_core(
     board.day = day;
     board.clock = clock;
     let board = scene_board_value(&proj, scene_id.as_deref(), board);
+    let (stepped_day, stepped_clock) = (board.day, board.clock.clone());
     log.append(
         root,
         &meta.id,
@@ -2335,6 +2502,20 @@ fn commit_reply_core(
         }),
     )
     .map_err(|e| e.to_string())?;
+
+    // 主动心声消费（M3.5）：她这轮真的开口了 → 心里话清空 + 意图外化开线。
+    // 章盖在步进后的时钟上（与 rebuild 的重放路径同口径）
+    for body in consume_proactive_say(
+        &proj,
+        cast,
+        speaker,
+        turn,
+        scene,
+        stepped_day,
+        &stepped_clock,
+    ) {
+        commit(log, root, meta, body)?;
+    }
 
     // 回复落盘后跑 on_message（设计 §3：每条新消息落地后，在场成员各跑一次）
     let mut report: Option<llm::HookReport> = None;
@@ -2553,16 +2734,20 @@ fn director_plan(
         })
         .collect();
 
-    // want_to_speak 投票（M3.4 取意图强度；M3.5 的 schedule_say 队列接进来后同槽加权）
+    // want_to_speak 投票：意图强度为基础；心里话队列非空记满票（M3.5 · 设计 §9.2
+    // 「下一轮主动发消息」的调度侧——憋着话要说比一般意向更急，导演优先给她发言权）
     let votes: Vec<(String, f32)> = present_members
         .iter()
         .map(|m| {
             let psyche = psyche::Psyche::from_state(&current_state(proj, &m.dir, &m.loaded));
-            let strength = psyche
+            let mut strength = psyche
                 .intents
                 .iter()
                 .map(|i| i.strength)
                 .fold(0.0f32, f32::max);
+            if psyche.has_scheduled() {
+                strength = strength.max(1.0);
+            }
             (m.dir.clone(), strength)
         })
         .collect();
@@ -3660,7 +3845,73 @@ fn resolve_thread_at(
             commit(log, root, meta, body)?;
         }
     }
+
+    // ④ 意图回流评价（M3.5 · 设计 §9.2「线被拒绝/了结 → 回流评价：受挫情绪 +
+    //    相关意图削弱」）：绑定了这条线的意图削弱，心理面板可查
+    reflow_thread_feedback(&proj2, &cast, root, meta, log, id, &thread.title, turn)?;
     Ok(snapshot)
+}
+
+/// 回流评价的常数（M3.5 · 设计 §9.2）：线了结/被拒给意图主人的心理反馈。
+/// 情绪名与强度固定（确定性、可回放）；削弱量按负增量应用。
+const REFLOW_EMOTION: &str = "受挫";
+const REFLOW_AFFECT_INTENSITY: f32 = 0.5;
+const REFLOW_INTENT_DELTA: f32 = 0.35;
+
+/// 意图回流评价（M3.5 · 设计 §9.2）：线被收结时，绑定了这条线的意图削弱
+/// （`REFLOW_INTENT_DELTA` 的负增量，削到 0 即移除），并给意图主人记一条受挫情绪
+/// （来源标注哪条线了结）。效果事件落盘（trigger=psyche.reflow），重放一致；
+/// 没有任何意图绑定这条线时不产生事件。
+#[allow(clippy::too_many_arguments)]
+fn reflow_thread_feedback(
+    proj: &event::Projection,
+    cast: &Cast,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    log: &store::EventLog,
+    thread_id: &str,
+    title: &str,
+    turn: u64,
+) -> Result<(), String> {
+    let source = format!("剧情线「{title}」了结");
+    for m in &cast.members {
+        let state = current_state(proj, &m.dir, &m.loaded);
+        let mut p = psyche::Psyche::from_state(&state);
+        let linked: Vec<String> = p
+            .intents
+            .iter()
+            .filter(|i| i.linked_thread.as_deref() == Some(thread_id))
+            .map(|i| i.name.clone())
+            .collect();
+        if linked.is_empty() {
+            continue;
+        }
+        for name in &linked {
+            p.feel(REFLOW_EMOTION, REFLOW_AFFECT_INTENSITY, &source, turn);
+            p.intend(name, -REFLOW_INTENT_DELTA, turn);
+        }
+        let mut next = state.clone();
+        p.write_into(&mut next);
+        let patch = event::state_patch(&state, &next);
+        if !patch.is_empty() {
+            commit(
+                log,
+                root,
+                meta,
+                LogBody::Effect(event::EffectEvent {
+                    turn,
+                    trigger: "psyche.reflow".into(),
+                    character: m.dir.clone(),
+                    state_set: patch,
+                    blackboard: Vec::new(),
+                    memory: Vec::new(),
+                    scene_id: None,
+                    ts: store::unix_now(),
+                }),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 // ---------- 事件流视图（M3.0 ④：检查器「事件流」页签的数据源）----------
@@ -3904,13 +4155,14 @@ fn inspector_payload(
         })
         .collect();
 
-    // 心理：内心摘要 + 情绪槽 + 意图 + 衰减轨迹
+    // 心理：内心摘要 + 情绪槽 + 意图（含触发记录）+ 心里话队列 + 衰减轨迹
     let state = current_state(proj, &character, loaded);
     let p = psyche::Psyche::from_state(&state);
     let psyche_view = serde_json::json!({
         "summary": p.summary_line_for(&loaded.card.name),
         "affects": p.affects,
         "intents": p.intents,
+        "scheduled": p.scheduled,
         "trail": p.decay_trail(),
         "auto_emotion": p.auto_emotion(),
     });
@@ -6938,6 +7190,226 @@ return {
         let after = event::project_over(&kept, &event::Base::default());
         assert_eq!(before.states, after.states);
         assert_eq!(before.blackboard, after.blackboard);
+    }
+
+    // M3.5 验收（设计 §9.2 / §15 DoD 3）：主动消息与意图动态——
+    // 触发可溯源、外化开线、回流评价，全链路事件化可回放。
+
+    /// 意图动态闭环（1v1）：阈值下不触发 → 剧情把意图推过阈值 → 轮末触发心里话
+    /// （带触发记录）→ 下一轮 B5 注入「心里话」→ 她开口后队列消费、意图外化开线绑定。
+    #[test]
+    fn intent_loop_triggers_speaks_and_externalizes() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { psyche = { affects = {}, intents = { { name = '惦记着坦白', strength = 0.3 } } } },
+  hooks = {
+    on_message = function(msg, state, api)
+      if msg.role == 'user' and msg.content:find('工作牌') then
+        state.psyche.intents[1].strength = 0.8
+      end
+    end,
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+
+        let psyche_of = |root: &std::path::Path, meta: &store::SessionMeta| -> serde_json::Value {
+            stored_state(root, meta)["psyche"].clone()
+        };
+
+        // ① 意图低于阈值（0.3 < 0.52 生效阈值）：轮末不触发，队列空
+        simulate_turn(&root, &meta, &loaded, &log, 1, "（随便聊聊）");
+        let psy = psyche_of(&root, &meta);
+        assert!(psy["scheduled"].as_array().unwrap().is_empty(), "阈值下不触发：{psy}");
+        assert!(psy["intents"][0]["triggered"].is_null());
+
+        // ② 剧情把意图推过阈值 → 轮末触发：心里话入队 + 触发记录（哪轮/何阈值/多强/触发什么）
+        simulate_turn(&root, &meta, &loaded, &log, 2, "工作牌的事，你还好吗？");
+        let psy = psyche_of(&root, &meta);
+        assert_eq!(
+            psy["scheduled"][0]["text"], "惦记着坦白",
+            "宿主把高强度意图转成心里话：{psy}"
+        );
+        assert_eq!(psy["scheduled"][0]["turn"], 2, "盖上憋下的轮次");
+        let trig = &psy["intents"][0]["triggered"];
+        assert_eq!(trig["turn"], 2);
+        approx_f64(trig["threshold"].as_f64().unwrap(), 0.52, "默认气质生效阈值");
+        approx_f64(trig["strength"].as_f64().unwrap(), 0.76, "0.8 过一轮衰减");
+        assert!(trig["action"].as_str().unwrap().contains("惦记着坦白"));
+
+        // ③ 下一轮：B5 注入「心里话」（主动消息的说话侧）
+        let (a3, _) = simulate_turn(&root, &meta, &loaded, &log, 3, "嗯？");
+        let b5 = a3
+            .layers
+            .iter()
+            .find(|l| l.id == "B5" && l.name == "内心")
+            .expect("B5「内心」层");
+        assert!(b5.content.contains("心里话"), "B5 应带心里话：{}", b5.content);
+        assert!(b5.content.contains("惦记着坦白"));
+
+        // ④ 她开口（回复落盘）→ 队列消费 + 意图外化开线（origin=psyche，重建不丢）
+        let psy = psyche_of(&root, &meta);
+        assert!(psy["scheduled"].as_array().unwrap().is_empty(), "说出口即清空：{psy}");
+        assert_eq!(
+            psy["intents"][0]["linked_thread"], "thread.惦记着坦白",
+            "意志外化为剧情线：{psy}"
+        );
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let opened = proj
+            .thread_log
+            .iter()
+            .find(|t| t.op == threads::OP_OPEN && t.thread_id == "thread.惦记着坦白")
+            .expect("外化开线事件在流");
+        assert_eq!(opened.origin, threads::ORIGIN_PSYCHE);
+        let t = threads::Thread::from_value(&opened.thread.clone().unwrap()).unwrap();
+        assert!(t.is_active());
+        assert_eq!(t.actors, vec!["小雨".to_string()], "线 actor 是开口的她");
+
+        // ⑤ 触发过的意图不再重复触发（一条意图只催一次，不轰炸）
+        assert_eq!(psy["intents"][0]["triggered"]["turn"], 2, "触发记录保持在第一次");
+        assert!(psy["scheduled"].as_array().unwrap().is_empty());
+
+        // ⑥ 消息级重建（丢派生事件）后重放：触发/消费/开线沿同一路径重演，投影一致
+        let records = log.read(&root, &meta.id).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &Cast::load(&root, &meta).unwrap(), &records, 3)
+            .unwrap();
+        let before = event::project_over(&records, &event::Base::default());
+        let after = event::project_over(&rebuilt, &event::Base::default());
+        assert_eq!(before.states, after.states, "重放长出同一份心理状态");
+        assert_eq!(before.threads, after.threads, "外化开线在重放后不丢不重");
+    }
+
+    /// 群聊（M3.4 导演）：心里话队列记满票——憋着话要说的人在下一轮优先拿到发言权，
+    /// 且她的组装带「心里话」；说出口后队列清空。
+    #[test]
+    fn scheduled_say_earns_the_floor_in_group_chat() {
+        let plain = |name: &str, mes: &str| {
+            format!(
+                r#"return {{ spec='charcard/1.0', name='{name}', scenario='图书馆', personality='温柔', first_mes='{mes}' }}"#
+            )
+        };
+        let ache = r#"
+return {
+  spec = 'charcard/1.0', name = '阿澈', scenario = '图书馆', personality = '安静', first_mes = '（阿澈入席）',
+  hooks = {
+    on_message = function(msg, state, api)
+      if msg.content:find('秘密') then
+        api.schedule_say('我想问问你工作牌的事。')
+      end
+    end,
+  },
+}
+"#;
+        let (_dir, meta, root) = setup_cast2(&plain("小雨", "（开场）"), ache);
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+
+        // 第 1 轮阿澈接话，「秘密」触发他憋下一句心里话（on_message 在消费点之后跑，
+        // 话留到下一轮——「让该角色在下一轮主动发消息」）
+        simulate_turn_as(&root, &meta, &cast, "阿澈", &log, 1, "说个秘密吧");
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let ache_psy = proj.states.get("阿澈").cloned().unwrap_or_default()["psyche"].clone();
+        assert_eq!(
+            ache_psy["scheduled"][0]["text"], "我想问问你工作牌的事。",
+            "心里话入队：{ache_psy}"
+        );
+
+        // ② 下一轮导演调度：阿澈记满票（2.0），压过没有任何信号的小雨
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let picks = director_plan(&meta, &cast, &proj, None, "（大家继续）").unwrap();
+        assert_eq!(picks[0].dir, "阿澈", "憋着话的人优先拿发言权：{picks:?}");
+        assert!(picks[0].reasons.iter().any(|r| r.contains("想说话")));
+
+        // ③ 他的组装带「心里话」注入；回复落盘后队列消费（无意图 → 不开线）
+        let a2 = simulate_turn_as(&root, &meta, &cast, "阿澈", &log, 2, "（继续）");
+        let b5 = a2
+            .layers
+            .iter()
+            .find(|l| l.id == "B5" && l.name == "内心")
+            .expect("B5「内心」层");
+        assert!(b5.content.contains("心里话"), "B5 应带心里话：{}", b5.content);
+        assert!(b5.content.contains("工作牌"));
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let ache_psy = proj.states.get("阿澈").cloned().unwrap_or_default()["psyche"].clone();
+        assert!(ache_psy["scheduled"].as_array().unwrap().is_empty(), "说出口即清空：{ache_psy}");
+        assert!(proj.thread_log.is_empty(), "没有可外化的意图就不开线");
+    }
+
+    /// 回流评价（M3.5 · 设计 §9.2「线被拒绝/了结 → 受挫情绪 + 相关意图削弱」）：
+    /// 收线时绑定了这条线的意图削弱、意图主人记一条受挫情绪；没绑线的角色不受影响。
+    #[test]
+    fn resolving_linked_thread_refluxes_frustration() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { psyche = { affects = {}, intents = {
+    { name = '想解释', strength = 0.8, linked_thread = 'thread.周五还书' },
+    { name = '不相干的念头', strength = 0.6 },
+  } } },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let log = store::EventLog::new();
+
+        // 手动开一条线（id 与意图绑定的对上）
+        open_thread_at(
+            &log,
+            &root,
+            &meta,
+            "周五还书",
+            "借书卡的约定",
+            &["小雨".to_string()],
+            Some(0.6),
+        )
+        .unwrap();
+
+        // 收线 → 回流
+        let tree_cache = TreeCache::default();
+        let runtime = SessionRuntime::default();
+        let snapshot =
+            resolve_thread_at(&log, &root, &meta, "thread.周五还书", "玩家如约还了书", &tree_cache, &runtime)
+                .unwrap();
+        assert_eq!(snapshot["state"], threads::STATE_RESOLVED);
+
+        let psy = stored_state(&root, &meta)["psyche"].clone();
+        let affects = psy["affects"].as_array().unwrap();
+        assert!(
+            affects.iter().any(|a| a["name"] == "受挫"),
+            "记一条受挫情绪：{psy}"
+        );
+        let hurt = affects.iter().find(|a| a["name"] == "受挫").unwrap();
+        assert!(hurt["source"].as_str().unwrap().contains("周五还书"), "情绪可溯源到线：{hurt}");
+        let intents = psy["intents"].as_array().unwrap();
+        let explain = intents.iter().find(|i| i["name"] == "想解释").unwrap();
+        approx_f64(explain["strength"].as_f64().unwrap(), 0.45, "0.8 − 0.35 = 0.45");
+        let untouched = intents.iter().find(|i| i["name"] == "不相干的念头").unwrap();
+        approx_f64(untouched["strength"].as_f64().unwrap(), 0.6, "没绑线的意图不动");
+
+        // 收线驱动效果事件落流（psyche.reflow），可回放
+        let proj = project_session(&log, &root, &meta).unwrap();
+        // 回流事件的 trigger 记在 effect 里——投影不另设通道，检查器时间线可查
+        let reflowed = log
+            .read(&root, &meta.id)
+            .unwrap()
+            .iter()
+            .filter_map(|r| match &r.body {
+                LogBody::Effect(e) if e.trigger == "psyche.reflow" => Some(e),
+                _ => None,
+            })
+            .count();
+        assert!(reflowed >= 1, "应有 psyche.reflow 事件");
+        let _ = proj;
+    }
+
+    /// 浮点断言（测试夹具；json 路径取出的 f64 与期望值比对）
+    fn approx_f64(actual: f64, expected: f64, note: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-3,
+            "{note}：期望 {expected}，实际 {actual}"
+        );
     }
 
     // M3.2 验收（commands 层）：消息级重建时，钩子的黑板写入按消息所在场景重演；

@@ -415,12 +415,32 @@ export interface PsycheAffect {
   history: AffectTick[];
 }
 
+/** 主动行为的触发记录（M3.5 · psyche.rs · TriggerRecord）：可溯源到意图 */
+export interface PsycheTrigger {
+  turn: number;
+  /** 触发时的生效阈值（threshold − 冲动性加成 − 余量） */
+  threshold: number;
+  /** 触发时的意图强度 */
+  strength: number;
+  /** 触发了什么 */
+  action: string;
+}
+
 /** 一条意图（意志的内隐形态；说出口后外化为剧情线） */
 export interface PsycheIntent {
   name: string;
   strength: number;
   linked_thread?: string | null;
   since_turn: number;
+  /** 主动行为触发记录（M3.5）：None = 还没触发过 */
+  triggered?: PsycheTrigger | null;
+}
+
+/** 一条憋着没说的心里话（M3.5 · psyche.rs · ScheduledSay） */
+export interface PsycheScheduledSay {
+  text: string;
+  /** 憋下的轮次（0 = 未知/旧形态） */
+  turn: number;
 }
 
 /** 心理运行时视图（M2.5 · 设计 §9） */
@@ -429,6 +449,8 @@ export interface InspectorPsyche {
   summary: string;
   affects: PsycheAffect[];
   intents: PsycheIntent[];
+  /** 心里话队列（M3.5）：憋着没说出口的话，下一轮主动说 */
+  scheduled: PsycheScheduledSay[];
   /** 衰减轨迹：[情绪名, 采样…]（界面只画小条，不引图表库） */
   trail: [string, AffectTick[]][];
   /** 自动表情（情绪 → 差分表命中） */

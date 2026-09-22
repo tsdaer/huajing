@@ -92,6 +92,8 @@ pub const ORIGIN_MANUAL: &str = "manual";
 pub const ORIGIN_TREE: &str = "tree";
 /// 事件来源：总结管线提案。
 pub const ORIGIN_PIPELINE: &str = "pipeline";
+/// 事件来源：心理外化（M3.5 · 设计 §9.2：意图说出口，意志外化为剧情线）。
+pub const ORIGIN_PSYCHE: &str = "psyche";
 
 // ---------- 常量：命中档位与展示分权重（设计 §8.4 排序口径）----------
 

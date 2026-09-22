@@ -41,9 +41,15 @@
 // 4. auto_emotion：最强情绪名（宿主映射 ui.emit("emotion", …)，情绪→差分表由卡/实体提供）。
 // 5. wants_to_act：strength ≥ threshold − IMPULSE_THRESHOLD_STEP × impulsiveness
 //    − ACTION_THRESHOLD_MARGIN 的意图名，按强度降序、同分按名字升序（阈值随冲动性下降）。
-// 6. from_state / write_into 往返一致（write_into 后 from_state 得到同一 Psyche），
+// 6. 心里话队列（M3.5 · 主动行为，设计 §9.2「strength ≥ 阈值且状态窗口开启 → 触发主动行为」）：
+//    schedule 去重封顶（MAX_SCHEDULED，满了不收——憋一肚子话不等于复读机），条目带
+//    憋下的轮次；consume_ready 只取 turn < 本轮的条目——她这轮刚憋下的话下一轮才说；
+//    proactive_candidate 在 wants_to_act 之上再过滤已触发过的意图（一条意图只催一次）；
+//    mark_triggered 把「哪一轮、何阈值、多强、触发什么」记在意图上（面板可溯源），
+//    已有记录不覆盖。
+// 7. from_state / write_into 往返一致（write_into 后 from_state 得到同一 Psyche），
 //    且不破坏 state 的其他键；坏形状一律宽容降级为默认，绝不 panic。
-// 7. 全部输出确定：模块内不用 HashMap/HashSet，凡排序必显式写死规则
+// 8. 全部输出确定：模块内不用 HashMap/HashSet，凡排序必显式写死规则
 //    （强度降序 + 名字升序）——同输入两次调用同一结果（设计 §7.3 的可回放前提）。
 //
 // 读侧兼容：规范键是复数 psyche.affects / psyche.intents；M1 遗留的单数 psyche.affect
@@ -82,6 +88,10 @@ pub const ACTION_THRESHOLD_MARGIN: f32 = 0.05;
 
 /// 「被…压着」的情绪门槛（设计 §9.2 的例：惦记着坦白(0.4,被害羞压着)）。
 pub const PRESSURE_AFFECT_MIN: f32 = 0.5;
+
+/// 心里话队列上限（M3.5 · 设计 §9.2 的「主动行为」）：憋着没说的话就这么多，
+/// 超出的新话拒收——「憋了一肚子话」不该变成复读机。
+pub const MAX_SCHEDULED: usize = 3;
 
 /// 气质参数默认值（设计 §9.2：缺字段即 0.5 / 0.15 / 0.6 / 0.3）。
 pub const DEFAULT_RISE: f32 = 0.5;
@@ -129,6 +139,13 @@ const RISE_KEY: &str = "rise";
 const DECAY_KEY: &str = "decay";
 const THRESHOLD_KEY: &str = "threshold";
 const IMPULSIVENESS_KEY: &str = "impulsiveness";
+/// 心里话队列键（M3.5 · state.psyche.scheduled）。
+pub const SCHEDULED_KEY: &str = "scheduled";
+/// 意图触发记录键（M3.5 · Intent.triggered）。
+const TRIGGERED_KEY: &str = "triggered";
+const TRIGGER_THRESHOLD_KEY: &str = "threshold";
+const TRIGGER_STRENGTH_KEY: &str = "strength";
+const TRIGGER_ACTION_KEY: &str = "action";
 
 // ---------- 数值兜底：一切外部输入都先过这里 ----------
 
@@ -266,7 +283,7 @@ impl Temperament {
     }
 
     /// 主动行为的生效阈值：基础阈值 − 冲动性加成 − 固定余量（设计 §9.2），下限 0。
-    fn action_threshold(&self) -> f32 {
+    pub fn action_threshold(&self) -> f32 {
         (clamp01(self.threshold)
             - IMPULSE_THRESHOLD_STEP * clamp01(self.impulsiveness)
             - ACTION_THRESHOLD_MARGIN)
@@ -311,6 +328,30 @@ impl Affect {
     }
 }
 
+/// 一条心里话（M3.5 · 主动行为队列的条目）：憋着的话 + 憋下的轮次。
+///
+/// `turn = 0` 表示「不知道憋了多久」（卡内直写 / on_load 时段的旧数据）——
+/// 随时可消费。消费只取 `turn < 当前轮` 的条目：她自己这轮刚憋下的话，
+/// 要到下一轮才主动说出口（设计 §3.1「让该角色在下一轮主动发消息」）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScheduledSay {
+    pub text: String,
+    pub turn: u64,
+}
+
+/// 主动行为的触发记录（M3.5 · 设计 §15 DoD「主动行为可溯源到意图」）：
+/// 哪一轮、过的是什么门槛、触发时多强、触发了什么。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TriggerRecord {
+    pub turn: u64,
+    /// 触发时的生效阈值（threshold − 冲动性加成 − 余量）。
+    pub threshold: f32,
+    /// 触发时的意图强度。
+    pub strength: f32,
+    /// 触发了什么（心里话原文 / 宿主动作的可读说明）。
+    pub action: String,
+}
+
 /// 意图（设计 §9.2 的意志内隐形态）：强度 + 可选绑定的剧情线。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Intent {
@@ -322,6 +363,9 @@ pub struct Intent {
     pub linked_thread: Option<String>,
     /// 起始轮。
     pub since_turn: u64,
+    /// 主动行为的触发记录（M3.5）：None = 还没触发过——同一条意图只触发一次
+    /// 主动行为（重复催促会变成复读机）。
+    pub triggered: Option<TriggerRecord>,
 }
 
 // ---------- 心理状态（卡私有 state.psyche）----------
@@ -339,6 +383,10 @@ pub struct Psyche {
     pub temperament: Temperament,
     /// 最后推进到的轮次（宿主判断是否已 tick 过这一轮）。
     pub last_turn: u64,
+    /// 心里话队列（M3.5 · 设计 §9.2「主动行为」）：憋着没说出口的话。
+    /// api.schedule_say 与宿主侧意图触发都入此队列，下一轮的发言权调度
+    /// 优先消费它（导演投票记满票 + B5 注入「心里话」），说出口即清空。
+    pub scheduled: Vec<ScheduledSay>,
 }
 
 /// feel 的结果：宿主据此决定要不要发 ui.emit 表情事件。
@@ -395,6 +443,7 @@ impl Psyche {
                 .map(Temperament::from_value)
                 .unwrap_or_default(),
             last_turn: u64_at(raw.get(LAST_TURN_KEY)).unwrap_or(0),
+            scheduled: read_scheduled(raw.get(SCHEDULED_KEY)),
         }
     }
 
@@ -417,6 +466,10 @@ impl Psyche {
         psyche.insert(
             INTENTS_KEY.to_string(),
             to_value_or(&self.intents, Value::Array(Vec::new())),
+        );
+        psyche.insert(
+            SCHEDULED_KEY.to_string(),
+            to_value_or(&self.scheduled, Value::Array(Vec::new())),
         );
         psyche.insert(
             TEMPERAMENT_KEY.to_string(),
@@ -578,6 +631,7 @@ impl Psyche {
             strength: clamp01(delta),
             linked_thread: None,
             since_turn: turn,
+            triggered: None,
         };
         self.intents.push(it.clone());
         Some(it)
@@ -599,6 +653,93 @@ impl Psyche {
             }
             None => false,
         }
+    }
+
+    // ---------- 主动行为（M3.5 · 设计 §9.2：心里话队列与触发记录）----------
+
+    /// 憋一句心里话（设计 §3.1 的 api.schedule_say / 宿主侧意图触发共用此队列）：
+    /// 去空白后入队，盖上憋下的轮次；空话不收、重复的话不收、队列满（MAX_SCHEDULED）不收。
+    /// 返回是否收下。
+    pub fn schedule(&mut self, text: &str, turn: u64) -> bool {
+        let text = text.trim();
+        if text.is_empty() {
+            return false;
+        }
+        if self.scheduled.iter().any(|s| s.text == text) {
+            return false;
+        }
+        if self.scheduled.len() >= MAX_SCHEDULED {
+            return false;
+        }
+        self.scheduled.push(ScheduledSay {
+            text: text.to_string(),
+            turn,
+        });
+        true
+    }
+
+    /// 消费到期的心里话（她把话说出口时由宿主调用，传入**本轮**轮次）：
+    /// 取走所有 `turn < 本轮` 的条目（本轮刚憋下的留给下一轮），按入队顺序返回文本。
+    pub fn consume_ready(&mut self, turn: u64) -> Vec<String> {
+        let (ready, keep): (Vec<_>, Vec<_>) = self
+            .scheduled
+            .drain(..)
+            .partition(|s| s.turn < turn);
+        self.scheduled = keep;
+        ready.into_iter().map(|s| s.text).collect()
+    }
+
+    /// 心里话队列是否非空（导演投票记满票的判据）。
+    pub fn has_scheduled(&self) -> bool {
+        !self.scheduled.is_empty()
+    }
+
+    /// 队首心里话（B5「心里话」注入用；None = 队列空）。
+    pub fn first_scheduled(&self) -> Option<&str> {
+        self.scheduled.first().map(|s| s.text.as_str())
+    }
+
+    /// 给意图记下主动行为的触发记录（M3.5）：意图不存在时返回 false。
+    ///
+    /// 阈值与强度取**当下**的值（调用时机就是触发时机）；同一条意图只记一次
+    /// （已有记录不覆盖——第一次触发才是「可溯源」的那一次）。
+    pub fn mark_triggered(&mut self, intent: &str, turn: u64, action: &str) -> bool {
+        let threshold = self.temperament.action_threshold();
+        match self.intents.iter_mut().find(|i| i.name == intent.trim()) {
+            Some(i) => {
+                if i.triggered.is_some() {
+                    return false;
+                }
+                i.triggered = Some(TriggerRecord {
+                    turn,
+                    threshold,
+                    strength: i.strength,
+                    action: action.trim().to_string(),
+                });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 宿主侧主动行为的触发候选（M3.5 · 设计 §9.2「intent.strength ≥ 阈值 → 主动行为」）：
+    /// [`Psyche::wants_to_act`] 之上再过滤掉**已触发过**的意图——一条意图只催一次，
+    /// 说没说出口由消费与外化闭环管，不在轮末反复触发。
+    ///
+    /// 返回最强的一条（强度降序、同分名字升序），没有则 None。
+    pub fn proactive_candidate(&self) -> Option<String> {
+        let threshold = self.temperament.action_threshold();
+        self.intents
+            .iter()
+            .filter(|i| i.strength > 0.0 && i.strength >= threshold && i.triggered.is_none())
+            // max_by 要升序比较器：强度取大者；同分时名字小者胜（b.name.cmp(&a.name)）
+            .max_by(|a, b| {
+                a.strength
+                    .partial_cmp(&b.strength)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| b.name.cmp(&a.name))
+            })
+            .map(|i| i.name.clone())
     }
 
     /// 最强情绪（intensity 最大，同分按 name 升序）。
@@ -860,8 +1001,8 @@ fn read_history(v: Option<&Value>) -> Vec<AffectTick> {
 fn read_intents(v: &Value) -> Vec<Intent> {
     let mut out: Vec<Intent> = Vec::new();
     for entry in as_entries(v) {
-        let (name, strength, linked_thread, since_turn) = match entry {
-            Value::String(s) => (s.trim().to_string(), DEFAULT_INTENT_STRENGTH, None, 0),
+        let (name, strength, linked_thread, since_turn, triggered) = match entry {
+            Value::String(s) => (s.trim().to_string(), DEFAULT_INTENT_STRENGTH, None, 0, None),
             Value::Object(m) => (
                 m.get(NAME_KEY)
                     .and_then(Value::as_str)
@@ -874,6 +1015,7 @@ fn read_intents(v: &Value) -> Vec<Intent> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
                 u64_at(m.get(SINCE_TURN_KEY)).unwrap_or(0),
+                m.get(TRIGGERED_KEY).and_then(read_trigger),
             ),
             _ => continue,
         };
@@ -888,7 +1030,60 @@ fn read_intents(v: &Value) -> Vec<Intent> {
             strength,
             linked_thread,
             since_turn,
+            triggered,
         });
+    }
+    out
+}
+
+/// 触发记录的宽容读侧：坏形状（缺字段/类型不对）整体当没触发过，不部分采信。
+fn read_trigger(v: &Value) -> Option<TriggerRecord> {
+    let m = v.as_object()?;
+    let turn = u64_at(m.get(TURN_KEY))?;
+    let threshold = num_at(m.get(TRIGGER_THRESHOLD_KEY)).map(clamp01)?;
+    let strength = num_at(m.get(TRIGGER_STRENGTH_KEY)).map(clamp01)?;
+    Some(TriggerRecord {
+        turn,
+        threshold,
+        strength,
+        action: m
+            .get(TRIGGER_ACTION_KEY)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    })
+}
+
+/// 心里话队列的宽容读侧：字符串（立即可消费的旧形态）与对象（{text, turn}）
+/// 都吃，噪声条目忽略，超编截断（保留最早的——先憋住的话先说）。
+fn read_scheduled(v: Option<&Value>) -> Vec<ScheduledSay> {
+    let arr = match v.and_then(Value::as_array) {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let mut out: Vec<ScheduledSay> = Vec::new();
+    for e in arr {
+        let (text, turn) = match e {
+            Value::String(s) => (s.trim().to_string(), 0),
+            Value::Object(m) => (
+                m.get("text")
+                    .or_else(|| m.get(NAME_KEY))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                u64_at(m.get(TURN_KEY)).unwrap_or(0),
+            ),
+            _ => continue,
+        };
+        if text.is_empty() || out.iter().any(|s| s.text == text) {
+            continue;
+        }
+        out.push(ScheduledSay { text, turn });
+    }
+    if out.len() > MAX_SCHEDULED {
+        out.truncate(MAX_SCHEDULED);
     }
     out
 }
@@ -1436,6 +1631,112 @@ mod tests {
         // 名次随衰减变化，但规则不变
         p.intend("乙", -0.25, 2); // 0.55 < 0.6
         assert_eq!(p.wants_to_act(), vec!["丙", "甲", "乙"]);
+    }
+
+    // ---------- 主动行为：心里话队列与触发记录（M3.5）----------
+
+    #[test]
+    fn schedule_stores_dedupes_and_caps() {
+        let mut p = Psyche::default();
+        assert!(!p.schedule("   ", 1), "空话不收");
+        assert!(p.schedule("周五一起去图书馆吧", 1));
+        assert!(!p.schedule("  周五一起去图书馆吧  ", 2), "同一段话不重复收");
+        assert!(p.schedule("其实那本工作牌……", 2));
+        assert!(p.schedule("还有一件事", 3));
+        assert_eq!(p.scheduled.len(), MAX_SCHEDULED);
+        assert!(!p.schedule("第四句", 3), "队列满即拒收");
+        // 往返一致：写进 state 再读回来不丢不重
+        let mut state = json!({});
+        p.write_into(&mut state);
+        assert_eq!(Psyche::from_state(&state).scheduled, p.scheduled);
+        // 读侧宽容：字符串（旧形态，turn 视作 0）与对象数组都吃得下
+        let p2 = Psyche::from_state(&json!({
+            "psyche": {"scheduled": [
+                {"text": "对象形态也认", "turn": 4},
+                {"name": "name 字段兜底"},
+                42,
+                null,
+                "   ",
+                "裸字符串也行",
+                "对象形态也认"
+            ]}
+        }));
+        assert_eq!(
+            p2.scheduled,
+            vec![
+                ScheduledSay { text: "对象形态也认".into(), turn: 4 },
+                ScheduledSay { text: "name 字段兜底".into(), turn: 0 },
+                ScheduledSay { text: "裸字符串也行".into(), turn: 0 },
+            ]
+        );
+        // 超编读侧截断（保留最早的三句）
+        let p3 = Psyche::from_state(&json!({
+            "psyche": {"scheduled": ["一", "二", "三", "四", "五"]}
+        }));
+        assert_eq!(
+            p3.scheduled.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["一", "二", "三"]
+        );
+    }
+
+    #[test]
+    fn consume_ready_takes_only_older_says() {
+        let mut p = Psyche::default();
+        assert!(!p.has_scheduled());
+        assert!(p.consume_ready(5).is_empty(), "空队列消费无事发生");
+        p.schedule("上一轮憋下的", 4);
+        p.schedule("这一轮刚憋下的", 5);
+        assert!(p.has_scheduled());
+        // 第 5 轮开口：只说出上一轮憋下的话；本轮刚憋下的留给第 6 轮
+        assert_eq!(p.consume_ready(5), vec!["上一轮憋下的"]);
+        assert!(p.has_scheduled());
+        assert_eq!(p.consume_ready(6), vec!["这一轮刚憋下的"]);
+        assert!(!p.has_scheduled());
+        // turn 0（卡内直写/旧形态）：随时可消费
+        p.schedule("旧的", 0);
+        assert_eq!(p.consume_ready(1), vec!["旧的"]);
+    }
+
+    #[test]
+    fn mark_triggered_records_once_with_current_threshold() {
+        let mut p = with(Temperament::default()); // 生效阈值 0.52
+        p.intend("想解释", 0.8, 1);
+        assert!(p.mark_triggered("想解释", 3, "把工作牌的真相说出口"));
+        let rec = p.intents[0].triggered.as_ref().expect("触发记录");
+        assert_eq!(rec.turn, 3);
+        approx(rec.threshold, 0.52);
+        approx(rec.strength, 0.8);
+        assert_eq!(rec.action, "把工作牌的真相说出口");
+        // 已有记录不覆盖（第一次触发才是可溯源的那次）
+        assert!(!p.mark_triggered("想解释", 9, "又一次"));
+        assert_eq!(p.intents[0].triggered.as_ref().unwrap().turn, 3);
+        assert!(!p.mark_triggered("不存在的意图", 3, "x"));
+        // 往返一致
+        let mut state = json!({});
+        p.write_into(&mut state);
+        assert_eq!(Psyche::from_state(&state), p);
+        // 坏形状整体当没触发过，不部分采信
+        let bad = Psyche::from_state(&json!({
+            "psyche": {"intents": [{"name": "想解释", "strength": 0.5,
+                                    "triggered": {"turn": "不是数字"}}]}
+        }));
+        assert!(bad.intents[0].triggered.is_none());
+    }
+
+    #[test]
+    fn proactive_candidate_skips_triggered_and_picks_strongest() {
+        let mut p = Psyche::default(); // 生效阈值 0.52
+        p.intend("甲", 0.6, 1);
+        p.intend("乙", 0.8, 1);
+        assert_eq!(p.proactive_candidate().as_deref(), Some("乙"), "取最强");
+        p.mark_triggered("乙", 1, "x");
+        assert_eq!(p.proactive_candidate().as_deref(), Some("甲"), "触发过的不再催");
+        p.mark_triggered("甲", 2, "x");
+        assert_eq!(p.proactive_candidate(), None, "全都触发过就不再触发");
+        // 阈值下的意图不候选
+        let mut quiet = Psyche::default();
+        quiet.intend("小心思", 0.5, 1);
+        assert_eq!(quiet.proactive_candidate(), None);
     }
 
     // ---------- summary_line ----------

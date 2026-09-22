@@ -530,7 +530,21 @@ export function setupMock() {
                 ],
               },
             ],
-            intents: [{ name: "惦记着说再见", strength: 0.4, linked_thread: null, since_turn: 2 }],
+            intents: [
+              {
+                name: "惦记着说再见",
+                strength: 0.4,
+                linked_thread: null,
+                since_turn: 2,
+                triggered: {
+                  turn: 3,
+                  threshold: 0.52,
+                  strength: 0.62,
+                  action: "主动想说：「惦记着说再见」",
+                },
+              },
+            ],
+            scheduled: [{ text: "惦记着说再见", turn: 3 }],
             trail: [
               [
                 "喜悦",

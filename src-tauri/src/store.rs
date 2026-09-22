@@ -1090,7 +1090,7 @@ mod tests {
             let r = crate::card::run_hook_full(
                 &loaded.source,
                 crate::card::HookCall::OnMessage { msg: msgs.last().unwrap() },
-                &crate::card::HookEnv { state: st.clone(), blackboard: env, memory: Default::default() },
+                &crate::card::HookEnv { state: st.clone(), blackboard: env, memory: Default::default(), turn: msgs.last().unwrap().turn },
                 meta.seed,
                 &sink,
             );

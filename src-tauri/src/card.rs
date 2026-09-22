@@ -6,7 +6,7 @@
 //! - LuaJIT 关闭 JIT——JIT 编译的 trace 不经过解释器钩子，死循环会杀不死；
 //! - 指令计数上限（超限终止本次执行）与内存上限；
 //! - 宿主侧白名单 API：`ctx.inject` / `ctx.window` / `api.memory` / `api.blackboard`
-//!   / `api.ui.emit` / `api.random` / `api.dice`；
+//!   / `api.ui.emit` / `api.random` / `api.dice` / `api.schedule_say`；
 //! - 一切执行都在错误边界内：卡片崩溃只记日志并降级为静态卡，不崩主程序。
 //!
 //! M1.6 起 hooks 接入运行时（`HookEnv`）：调用方传入本轮可见的角色 state 与
@@ -32,6 +32,7 @@ use std::rc::Rc;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, StdLib, Table, Value, VmState};
 use serde::{Deserialize, Serialize};
 
+use crate::psyche;
 use crate::store::Message;
 
 /// 沙箱载入的标准库（无 os/io/package/debug/ffi/jit；luajit 的 coroutine 随 base 载入）
@@ -76,11 +77,14 @@ pub const BLACKBOARD_KEYS: [&str; 4] = ["day", "clock", "place", "actors"];
 ///   写入走 `api.blackboard.set` 并进 [`HookRun::blackboard`]；
 /// - `memory`：`api.memory.get` 的历史值。M1 恒空——长期记忆由记忆宫殿（M2）提供读侧，
 ///   本版只保证写入不丢（落 `palace.jsonl`）。
+/// - `turn`：hook 运行所在的轮次（M3.5：`api.schedule_say` 的心里话盖这个轮次的章——
+///   「下一轮主动发消息」据此只消费更早憋下的话）。on_load 时段为 0。
 #[derive(Debug, Clone, Default)]
 pub struct HookEnv {
     pub state: serde_json::Value,
     pub blackboard: std::collections::BTreeMap<String, serde_json::Value>,
     pub memory: std::collections::BTreeMap<String, serde_json::Value>,
+    pub turn: u64,
 }
 
 /// `api.ui.emit` 的实时回调（宿主转推前端）。报告里另留一份，供调用方汇总。
@@ -97,6 +101,8 @@ pub struct HookRun {
     pub blackboard: Vec<KvSet>,
     /// `api.memory.set` 的写入（同 key 后写覆盖前写）
     pub memory: Vec<KvSet>,
+    /// `api.schedule_say` 的心里话（M3.5 · 设计 §3.1）：已合并进 state.psyche.scheduled
+    pub scheduled: Vec<String>,
 }
 
 impl HookRun {
@@ -398,6 +404,9 @@ pub struct HookResult {
     pub ui_events: Vec<UiEvent>,
     pub memory: Vec<KvSet>,
     pub blackboard: Vec<KvSet>,
+    /// `api.schedule_say` 收到的心里话（M3.5；已合并进 state.psyche.scheduled，
+    /// 这里留一份给日志与面板，与 memory/blackboard 的报告职责相同）
+    pub scheduled: Vec<String>,
     pub logs: Vec<String>,
 }
 
@@ -481,6 +490,7 @@ pub fn run_hook_full(
     let ui_events = Rc::new(RefCell::new(Vec::new()));
     let memory_log = Rc::new(RefCell::new(Vec::new()));
     let blackboard_log = Rc::new(RefCell::new(Vec::new()));
+    let schedule_log = Rc::new(RefCell::new(Vec::new()));
 
     let state_value = match lua.to_value(&env.state) {
         Ok(v) => v,
@@ -499,6 +509,7 @@ pub fn run_hook_full(
                 &ui_events,
                 &memory_log,
                 &blackboard_log,
+                &schedule_log,
                 on_ui,
             );
             hook.call::<()>((state_value.clone(), api))
@@ -516,6 +527,7 @@ pub fn run_hook_full(
                 &ui_events,
                 &memory_log,
                 &blackboard_log,
+                &schedule_log,
                 on_ui,
             );
             hook.call::<()>((msg_table, state_value.clone(), api))
@@ -529,6 +541,26 @@ pub fn run_hook_full(
 
     // hooks 原地修改 state 表；失败后也读回部分修改（卡作者可在日志里看到错误）
     run.result.state = Some(lua.from_value(state_value).unwrap_or(env.state.clone()));
+
+    // api.schedule_say 的心里话合并进 state.psyche.scheduled（M3.5）：
+    // 队列住进卡私有 state，持久化与重放走既有 state patch 通道，无需新事件类型；
+    // 盖上本轮的章——「下一轮主动发消息」据此只消费更早憋下的话
+    let says = schedule_log.borrow().clone();
+    if !says.is_empty() {
+        run.result.scheduled = says.clone();
+        if let Some(mut st) = run.result.state.take() {
+            let mut p = psyche::Psyche::from_state(&st);
+            for s in &says {
+                p.schedule(s, env.turn);
+            }
+            p.write_into(&mut st);
+            run.result.state = Some(st);
+        }
+        run.result
+            .logs
+            .push(format!("心里话入队 {} 条", says.len()));
+    }
+
     run.result.injections = injections.borrow().clone();
     run.result.ui_events = ui_events.borrow().clone();
     run.result.memory = memory_log.borrow().clone();
@@ -536,6 +568,7 @@ pub fn run_hook_full(
     run.state = run.result.state.clone();
     run.blackboard = run.result.blackboard.clone();
     run.memory = run.result.memory.clone();
+    run.scheduled = run.result.scheduled.clone();
     run
 }
 
@@ -574,7 +607,7 @@ fn make_ctx(lua: &Lua, window: &[Message], injections: &Rc<RefCell<Vec<InjectedT
     ctx
 }
 
-/// api：memory / blackboard / ui.emit / random / dice（设计 §3.1 白名单）
+/// api：memory / blackboard / ui.emit / random / dice / schedule_say（设计 §3.1 白名单）
 ///
 /// memory / blackboard 都是「读快照 + 记增量」：读侧来自 [`HookEnv`]
 /// （memory 读侧 M1 恒空——长期记忆的读由记忆宫殿在 M2 提供），写侧进各自的
@@ -587,6 +620,7 @@ fn make_api(
     ui_events: &Rc<RefCell<Vec<UiEvent>>>,
     memory_log: &Rc<RefCell<Vec<KvSet>>>,
     blackboard_log: &Rc<RefCell<Vec<KvSet>>>,
+    schedule_log: &Rc<RefCell<Vec<String>>>,
     on_ui: &UiSink,
 ) -> Table {
     let api = lua.create_table().expect("create api");
@@ -599,6 +633,22 @@ fn make_api(
         "api.memory",
     );
     let _ = api.set("memory", mem_ns);
+
+    // schedule_say(text)（M3.5 · 设计 §3.1）：让该角色在下一轮主动发消息。
+    // 只收集不落盘——运行结束后由宿主合并进 state.psyche.scheduled
+    // （去重封顶在那里统一做，这里只挡空话）
+    let sched = Rc::clone(schedule_log);
+    let schedule_fn = lua
+        .create_function(move |_, text: String| {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                return Err(mlua::Error::runtime("api.schedule_say 需要非空的话"));
+            }
+            sched.borrow_mut().push(text);
+            Ok(())
+        })
+        .expect("api.schedule_say");
+    let _ = api.set("schedule_say", schedule_fn);
 
     // 黑板：白名单 = 世界层四字段 + 实体作用域键（设计 §6.4 的 `char.小雨.status`），
     // 越权键报 Lua 错误。作用域键的规则写在白名单校验里（见 make_kv_ns 的 dotted 分支）。
@@ -892,11 +942,14 @@ pub fn run_state_hook_full(
         return run; // 没这个钩子：正常静默，不产生任何状态变化
     };
 
-    // TreeEnv 有三组读侧里的两组（state / 黑板），memory 快照补一张空表给 api.memory
+    // TreeEnv 有三组读侧里的两组（state / 黑板），memory 快照补一张空表给 api.memory。
+    // turn 给 0：状态钩子在轮末（消费点之后）才跑，0 章（随时可消费）与盖当轮章
+    // 的首个可消费轮次相同，行为一致。
     let hook_env = HookEnv {
         state: env.state.clone(),
         blackboard: env.blackboard.clone(),
         memory: BTreeMap::new(),
+        turn: 0,
     };
     let state_value = match lua.to_value(&hook_env.state) {
         Ok(v) => v,
@@ -908,6 +961,7 @@ pub fn run_state_hook_full(
     let ui_events = Rc::new(RefCell::new(Vec::new()));
     let memory_log = Rc::new(RefCell::new(Vec::new()));
     let blackboard_log = Rc::new(RefCell::new(Vec::new()));
+    let schedule_log = Rc::new(RefCell::new(Vec::new()));
     let api = make_api(
         &lua,
         seed,
@@ -915,6 +969,7 @@ pub fn run_state_hook_full(
         &ui_events,
         &memory_log,
         &blackboard_log,
+        &schedule_log,
         on_ui,
     );
     if let Err(e) = hook.call::<()>((api, state_value.clone())) {
@@ -924,6 +979,22 @@ pub fn run_state_hook_full(
     }
     // 与 hooks 一致：钩子原地改 state 表，失败后也读回部分修改（卡作者可在日志里看到错误）
     run.result.state = Some(lua.from_value(state_value).unwrap_or(hook_env.state.clone()));
+    // api.schedule_say 与 hooks 同语义（M3.5）：心里话合并进 state.psyche.scheduled
+    let says = schedule_log.borrow().clone();
+    if !says.is_empty() {
+        run.result.scheduled = says.clone();
+        if let Some(mut st) = run.result.state.take() {
+            let mut p = psyche::Psyche::from_state(&st);
+            for s in &says {
+                p.schedule(s, hook_env.turn);
+            }
+            p.write_into(&mut st);
+            run.result.state = Some(st);
+        }
+        run.result
+            .logs
+            .push(format!("心里话入队 {} 条", says.len()));
+    }
     run.result.ui_events = ui_events.borrow().clone();
     run.result.memory = memory_log.borrow().clone();
     run.result.blackboard = blackboard_log.borrow().clone();
@@ -1403,6 +1474,69 @@ return {
                 value: "calm".into()
             }]
         );
+    }
+
+    /// api.schedule_say（M3.5 · 设计 §3.1）：心里话进报告，并合并进 state.psyche.scheduled——
+    /// 队列持久化走既有 state patch 通道。
+    #[test]
+    fn schedule_say_lands_in_report_and_state() {
+        let card = r#"
+return {
+  spec = "charcard/1.0", name = "小雨", first_mes = "f",
+  state = { favorability = 50 },
+  hooks = {
+    on_message = function(msg, state, api)
+      if msg.role == "user" and msg.content:find("约定") then
+        api.schedule_say("那我们说定了，周五见。")
+        api.schedule_say("  别迟到哦。  ")
+        api.schedule_say("")  -- 空话被挡下
+      end
+    end,
+  },
+}
+"#;
+        let m = msg("我们约定一下吧。");
+        let r = run(card, HookCall::OnMessage { msg: &m }, serde_json::json!({}), 42);
+        assert_eq!(r.scheduled.len(), 2, "空话不收：{:?}", r.scheduled);
+        assert_eq!(r.scheduled[0], "那我们说定了，周五见。");
+        assert_eq!(r.scheduled[1], "别迟到哦。", "首尾空白归一");
+        // 合并进 state.psyche.scheduled（卡原本没有 psyche 块，也会就地建立）；
+        // HookEnv 缺省 turn=0（测试 helper 未盖章）——条目随时可消费
+        let st = r.state.expect("state 回传");
+        assert_eq!(
+            st["psyche"]["scheduled"],
+            serde_json::json!([
+                {"text": "那我们说定了，周五见。", "turn": 0},
+                {"text": "别迟到哦。", "turn": 0}
+            ])
+        );
+        assert!(r.logs.iter().any(|l| l.contains("心里话入队 2 条")));
+
+        // 卡已有 psyche 块时不破坏既有字段，同一句话不重复入队
+        let state = serde_json::json!({
+            "psyche": {
+                "affects": [{"name": "期待", "intensity": 0.6}],
+                "scheduled": ["那我们说定了，周五见。"]
+            }
+        });
+        let r2 = run(card, HookCall::OnMessage { msg: &m }, state, 42);
+        let st2 = r2.state.expect("state 回传");
+        let queue2 = st2["psyche"]["scheduled"].as_array().unwrap();
+        assert_eq!(queue2.len(), 2, "重复的那句不重复入队：{queue2:?}");
+        assert_eq!(
+            queue2
+                .iter()
+                .map(|v| v["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["那我们说定了，周五见。", "别迟到哦。"],
+            "已有的保持在先，新话追加在后"
+        );
+        assert_eq!(st2["psyche"]["affects"][0]["name"], "期待", "既有字段保留");
+
+        // 没调 schedule_say 的 hook 不产生任何 psyche 痕迹
+        let r3 = run(TEST_CARD, HookCall::OnMessage { msg: &msg("你好") }, serde_json::json!({ "favorability": 50 }), 42);
+        assert!(r3.scheduled.is_empty());
+        assert!(r3.state.unwrap().get("psyche").is_none(), "静卡 state 保持干净");
     }
 
     #[test]
