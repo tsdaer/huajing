@@ -779,6 +779,7 @@ char 实体 facet 模板按心理学二分法重排（§6.2 已更新）：**倾
 ## 11. LLM 接入
 
 - 统一 **OpenAI 兼容协议**（OpenAI / DeepSeek / GLM / Kimi / Ollama / LM Studio 通吃；Claude 走兼容端点）。
+- **协议只做 Chat Completions 一族**（`/v1/chat/completions` + SSE，embeddings 走 `/v1/embeddings` 非流式）——它是兼容性最广的事实标准。不跟进 OpenAI **Responses API**：其核心卖点（服务端会话状态、内置 agent 工具）与本地优先、上下文全在本地组装的架构相抵触，且国内主流服务商未实现；不做 **Anthropic Messages** 原生协议：Claude 一律走 OpenAI 兼容端点/网关，真有直连需求时再加协议适配层（请求体转换 + SSE 事件名映射）。
 - `providers.toml` 管理多个接入点，可为不同用途指定不同档位（主对话用强模型、自动总结/捕获/分类 evaluator 用便宜档）；角色卡可声明推荐参数（温度、模型档位），用户可覆盖。
 - API key 存本地；v1 明文 + 警示，v2 接系统密钥库（Windows 凭据管理器）。
 - 每次请求在 UI 显示：现状卡、当前状态路径、活跃剧情线、各槽位命中内容与实际 token、花费估算。
