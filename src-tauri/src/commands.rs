@@ -3897,12 +3897,85 @@ fn apply_summary_outcome(
         )?;
         applied += 1;
     }
+
+    // 转述记忆（M3.3 · 设计 §10.4）：A 告知 B → 为每个听众各写一条 hearsay
+    // （content=转述内容、source=告知者、salience 折半、links 继承）——信息跨视角流动的
+    // 唯一通道，召回行尾自带「转述自X」（palace::render_memory_line），翻旧账有据可查。
+    // 每位听众 witnesses = 她自己：没在名单里的角色召不回这件事（视角过滤是硬约束）。
+    // 盖的章是**告知发生的时刻**（听见的时刻，不是原事件时刻）——故事时间从事件流折出，
+    // 与情景记忆同一口径（M3.0 ⑤）。
+    let mut hearsay_slots = base + outcome.episodes.len();
+    for hs in &outcome.hearsays {
+        let hs_turn = hs.turns.first().copied().unwrap_or(to_turn);
+        let (hs_day, hs_clock) = story_time_at_turn(log, root, meta, hs_turn)
+            .unwrap_or((story_day, story_clock.to_string()));
+        for listener in &hs.listeners {
+            hearsay_slots += 1;
+            let obj = palace::MemObject {
+                id: palace::next_id(hearsay_slots),
+                kind: palace::KIND_HEARSAY.to_string(),
+                content: hs.content.clone(),
+                turn: hs_turn,
+                story_day: hs_day,
+                story_clock: hs_clock.clone(),
+                place: hs.place.clone(),
+                actors: vec![hs.source.clone(), listener.clone()],
+                witnesses: vec![listener.clone()],
+                salience: hs.salience * palace::HEARSAY_SALIENCE_FACTOR,
+                emotion: hs.emotion.clone(),
+                links: hs.links.clone(),
+                thread: hs.thread.clone(),
+                source: hs.source.clone(),
+                ts,
+                rehearsals: 0,
+            };
+            let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
+            commit(
+                log,
+                root,
+                meta,
+                LogBody::Memory(event::MemoryEvent {
+                    turn: obj.turn,
+                    origin: "pipeline".into(),
+                    object,
+                    ts,
+                }),
+            )?;
+            applied += 1;
+        }
+    }
+    // 转述顺带揭示的秘密（M3.3 与 M3.1 判定闭环）：听众从此「知情」——视角揭示集
+    // 增项后，M3.1 的深卡判定（known_for + 激活源 3b）对她展开秘密卡，对别人照旧关门。
+    // origin = pipeline：模型产物随事件流重放（is_derived 只认 tree 来源），编辑历史不丢。
+    for hs in &outcome.hearsays {
+        for target in &hs.reveals {
+            commit(
+                log,
+                root,
+                meta,
+                LogBody::Codex(event::CodexEvent {
+                    turn: hs.turns.first().copied().unwrap_or(to_turn),
+                    op: "reveal".into(),
+                    target: target.clone(),
+                    origin: "pipeline".into(),
+                    value: None,
+                    note: Some(format!("听{}说起", hs.source)),
+                    witnesses: hs.listeners.clone(),
+                    ts,
+                }),
+            )?;
+            applied += 1;
+        }
+    }
     // L3 事实：批次末的故事时间（事实是批次里学到的，同样不该盖总结时刻的章）
     let (fact_day, fact_clock) = story_time_at_turn(log, root, meta, to_turn)
         .unwrap_or((story_day, story_clock.to_string()));
+    // id 顺延在转述之后（转述记忆一条提案 × 每位听众各占一号）
+    let fact_base =
+        base + outcome.episodes.len() + outcome.hearsays.iter().map(|h| h.listeners.len()).sum::<usize>();
     for (i, fact) in outcome.facts.iter().enumerate() {
         let mut obj = palace::MemObject {
-            id: palace::next_id(base + outcome.episodes.len() + i + 1),
+            id: palace::next_id(fact_base + i + 1),
             kind: palace::KIND_FACT.to_string(),
             content: format!("{}：{}", fact.key, fact.value),
             turn: to_turn,
@@ -3919,7 +3992,6 @@ fn apply_summary_outcome(
             ts,
             rehearsals: 0,
         };
-        obj.id = palace::next_id(base + outcome.episodes.len() + i + 1);
         let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
         commit(
             log,
@@ -4408,6 +4480,73 @@ return {
             &store::NewSessionRequest {
                 character: "小雨".into(),
                 characters: vec!["小雨".into(), "阿澈".into()],
+                persona: None,
+                day: Some(1),
+                clock: Some("20:55".into()),
+                place: Some("自习区".into()),
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = store::EventLog::new();
+        let board = store::load_blackboard(&root, &meta.id).unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 0,
+                reason: "init".into(),
+                scene_id: None,
+                board: board.clone(),
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Scene(event::SceneEvent {
+                turn: 0,
+                op: "create".into(),
+                scene_id: scene::DEFAULT_SCENE_ID.into(),
+                scene: Some(scene::Scene::from_board(
+                    scene::DEFAULT_SCENE_ID,
+                    "开场",
+                    &board,
+                    0,
+                    "default",
+                    store::unix_now(),
+                )),
+                others: Vec::new(),
+                origin: "default".into(),
+                note: None,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        (dir, meta, root)
+    }
+
+    /// 三人阵容夹具（M3.3 视角记忆用例）：小雨 + 阿澈 + 小玲，时钟 20:55
+    /// （第一轮末步进到 21:05，越过主角色状态树的 21:00 转移门槛），genesis + 缺省场景
+    fn setup_cast3(
+        card_xiaoyu: &str,
+        card_ache: &str,
+        card_ling: &str,
+    ) -> (tempfile::TempDir, store::SessionMeta, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        store::ensure_layout(&root).unwrap();
+        for (name, src) in [("小雨", card_xiaoyu), ("阿澈", card_ache), ("小玲", card_ling)] {
+            let d = root.join(format!("characters/{name}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("card.lua"), src).unwrap();
+        }
+        let meta = store::new_session(
+            &root,
+            &store::NewSessionRequest {
+                character: "小雨".into(),
+                characters: vec!["小雨".into(), "阿澈".into(), "小玲".into()],
                 persona: None,
                 day: Some(1),
                 clock: Some("20:55".into()),
@@ -5514,6 +5653,7 @@ return {
         let outcome = summarize::sanitize(summarize::SummaryOutcome {
             chronicle: String::new(),
             summary_delta: "她记住了那条约定。".into(),
+            hearsays: Vec::new(),
             episodes: vec![summarize::EpisodeDraft {
                 content: "深夜闭馆时她把便签递过来。".into(),
                 salience: 0.9,
@@ -5791,6 +5931,7 @@ state_tree = {
         let outcome = summarize::sanitize(summarize::SummaryOutcome {
             chronicle: String::new(),
             summary_delta: String::new(),
+            hearsays: Vec::new(),
             episodes: vec![summarize::EpisodeDraft {
                 content: "他道了谢，她记住了。".into(),
                 salience: 0.8,
@@ -6131,6 +6272,226 @@ return {
             "小雨应召回自己见证的记忆（话题命中）：{b4a}"
         );
     }
+
+    /// M3.3 验收：视角记忆与转述（串台用例扩展到三人）——A 目击事件后 B 通过对话得知：
+    /// B 的 B4 出现带来源标注的转述记忆（salience 约为亲历一半）、转述揭示的秘密对 B 展开深卡；
+    /// C 始终不知情（B4 召不回、B3 深卡不展开）。设计 §10.4「转述是信息跨视角流动的唯一通道」。
+    #[test]
+    fn hearsay_reaches_only_the_listener_with_halved_salience() {
+        let xiaoyu = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50 },
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '轻松日常。',
+        transitions = {
+          { to = '夜谈', priority = 5,
+            when = function(ev, bb, st)
+              return (bb.clock or '') >= '21:00'
+            end },
+        },
+      },
+      ['夜谈'] = { parent = '日常', directive = '夜深人静。', reveal = { 'char.小雨.secrets.工作牌' } },
+    },
+  },
+}
+"#;
+        let ache = r#"
+return {
+  spec = 'charcard/1.0', name = '阿澈', scenario = '图书馆', personality = '爽朗', first_mes = '（阿澈入席）',
+}
+"#;
+        let ling = r#"
+return {
+  spec = 'charcard/1.0', name = '小玲', scenario = '图书馆', personality = '活泼', first_mes = '（小玲入席）',
+}
+"#;
+        let (_dir, meta, root) = setup_cast3(xiaoyu, ache, ling);
+        // 世界：小雨实体带秘密（只有她自己一直知道，known_by 名单）
+        let dir = root.join("codex/default/entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("char.小雨.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'char.小雨', type = 'char', name = '小雨',
+  aliases = { '夜班管理员' },
+  one_liner = '大学图书馆夜班管理员。',
+  facts = { look = { impression = '旧毛衣' } },
+  secrets = {
+    ['工作牌'] = { content = '她挂着的旧胸牌，其实是已故母亲的遗物。', known_by = { '小雨' } },
+  },
+}
+"#,
+        )
+        .unwrap();
+
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+        assert_eq!(cast.members.len(), 3, "三人阵容");
+
+        // 阿澈与小玲离场（黑板手动事件，重放保留）：状态树 reveal 的见证者只剩小雨
+        let mut proj = project_session(&log, &root, &meta).unwrap();
+        let mut board = blackboard_of(&proj);
+        board.actors = vec!["小雨".into()];
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 0,
+                reason: "manual".into(),
+                scene_id: None,
+                board,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+
+        // 第 1 轮（小雨发言）：跨过 21:00 门槛 → 转移进「夜谈」并 reveal 秘密（见证者=小雨）
+        simulate_turn_as(&root, &meta, &cast, "小雨", &log, 1, "（小雨独自整理书架。）");
+        proj = project_session(&log, &root, &meta).unwrap();
+        let secret_path = "char.小雨.secrets.工作牌";
+        assert!(
+            proj.known_for("小雨").contains(secret_path),
+            "小雨的视角应含自己的秘密：{:?}",
+            proj.known_for("小雨")
+        );
+        assert!(
+            !proj.known_for("阿澈").contains(secret_path),
+            "阿澈此刻还不知道：{:?}",
+            proj.known_for("阿澈")
+        );
+
+        // A 目击事件：亲历记忆（只有小雨见证，salience 0.8）
+        let seq = proj.episodes.len() + proj.memory.len() + 1;
+        let lived = palace::MemObject {
+            id: palace::next_id(seq),
+            kind: palace::KIND_EPISODE.to_string(),
+            content: "小雨把亲手做的猫头鹰书签夹进了阿澈借走的书".into(),
+            turn: 1,
+            story_day: 1,
+            story_clock: "21:05".into(),
+            place: Some("自习区".into()),
+            actors: vec!["小雨".into()],
+            witnesses: vec!["小雨".into()],
+            salience: 0.8,
+            emotion: None,
+            links: vec!["topic:书签".into()],
+            thread: None,
+            source: "manual".into(),
+            ts: store::unix_now(),
+            rehearsals: 0,
+        };
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Memory(event::MemoryEvent {
+                turn: 1,
+                origin: "manual".into(),
+                object: serde_json::to_value(&lived).unwrap(),
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+
+        // B 通过对话得知（第 2 轮阿澈问起、小雨转告）→ 总结管线产出转述提案：
+        // 宿主为阿澈写一条 hearsay（salience 折半），顺带揭示的秘密让他「知情」
+        let cx = load_codex(&root, None, "default");
+        let outcome = summarize::sanitize(summarize::SummaryOutcome {
+            hearsays: vec![summarize::HearsayDraft {
+                content: "小雨告诉阿澈，那只猫头鹰书签是她亲手做的".into(),
+                source: "小雨".into(),
+                listeners: vec!["阿澈".into()],
+                salience: 0.8, // 原事件（亲历）的显著度；宿主写入时折半
+                emotion: Some("得意".into()),
+                place: None,
+                links: vec!["topic:书签".into(), "person:小雨".into()],
+                thread: None,
+                turns: vec![2],
+                reveals: vec![secret_path.into()],
+            }],
+            ..summarize::SummaryOutcome::default()
+        });
+        let applied = apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, 2, 1, "21:15", "scene.main")
+            .unwrap();
+        assert_eq!(applied, 2, "一条转述记忆 + 一条揭示事件：{applied}");
+
+        proj = project_session(&log, &root, &meta).unwrap();
+        // 转述记忆：只有阿澈见证、来源标注、显著度约为亲历一半
+        let hearsay: Vec<palace::MemObject> = proj
+            .episodes
+            .iter()
+            .filter_map(|v| serde_json::from_value::<palace::MemObject>(v.clone()).ok())
+            .filter(|m| m.kind == palace::KIND_HEARSAY)
+            .collect();
+        assert_eq!(hearsay.len(), 1, "应为阿澈写一条转述：{:?}", hearsay);
+        let hs = &hearsay[0];
+        assert_eq!(hs.witnesses, vec!["阿澈".to_string()]);
+        assert_eq!(hs.source, "小雨");
+        assert!((hs.salience - 0.4).abs() < 1e-6, "salience 折半：{}", hs.salience);
+        assert!(hs.links_match("topic:书签"), "links 从原事件继承");
+        // 揭示闭环（M3.1 判定）：听过秘密的人进知情集，第三个人依旧不知道
+        assert!(
+            proj.known_for("阿澈").contains(secret_path),
+            "阿澈听过秘密 → 视角知情集应含该路径：{:?}",
+            proj.known_for("阿澈")
+        );
+        assert!(
+            !proj.known_for("小玲").contains(secret_path),
+            "小玲没听到 → 不知情：{:?}",
+            proj.known_for("小玲")
+        );
+        assert!(proj.known.is_empty(), "见证者揭示不进全局集：{:?}", proj.known);
+
+        // 串台断言①（B 视角）：B4 出现带来源标注的转述，B3 深卡对她展开
+        let b_assembly = simulate_turn_as(&root, &meta, &cast, "阿澈", &log, 3, "小雨，书签的事我听说了。");
+        let b4 = b_assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B4")
+            .map(|l| l.content.clone())
+            .unwrap_or_default();
+        assert!(b4.contains("猫头鹰"), "阿澈的 B4 应召回转述：{b4}");
+        assert!(b4.contains("转述自小雨"), "转述要带来源标注：{b4}");
+        assert!(b4.contains("0.40"), "渲染的显著度是折半后的 0.40：{b4}");
+        let b3 = b_assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B3")
+            .map(|l| l.content.clone())
+            .unwrap_or_default();
+        assert!(
+            b3.contains("已故母亲"),
+            "阿澈听过秘密 → 深卡应对他展开：{b3}"
+        );
+
+        // 串台断言②（C 视角）：转述与秘密都不出现在小玲的任何注入层
+        let c_assembly = simulate_turn_as(&root, &meta, &cast, "小玲", &log, 4, "小玲：你们在聊什么呀？");
+        let b4c = c_assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B4")
+            .map(|l| l.content.clone())
+            .unwrap_or_default();
+        assert!(
+            !b4c.contains("猫头鹰"),
+            "串台：小玲没听到转述，B4 不得出现：{b4c}"
+        );
+        let b3c = c_assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B3")
+            .map(|l| l.content.clone())
+            .unwrap_or_default();
+        assert!(
+            !b3c.contains("已故母亲"),
+            "串台：秘密只对知情者展开：{b3c}"
+        );
+    }
+
     // M3.2 验收（commands 层）：消息级重建时，钩子的黑板写入按消息所在场景重演；
     // 场景事件（手动事件）在重建后原样保留。设计 §10.3 + §7.3-5。
 

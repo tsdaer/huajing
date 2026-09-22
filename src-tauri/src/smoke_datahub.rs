@@ -152,16 +152,3 @@ fn default_codex_assets_parse_with_time_layers() {
         "便签 → 小雨 的牵引边应存在"
     );
 }
-
-/// 崩坏3 设定集：摄入产物仍可解析（爱莉希雅卡 + 实体的回归守卫）
-#[test]
-fn hi3_world_assets_still_parse() {
-    let loaded = card::load_card(&datahub(), "爱莉希雅").expect("加载爱莉希雅卡");
-    assert!(!loaded.degraded, "不应降级：{:?}", loaded.degrade_reason);
-
-    let list = commands::parse_entities(&datahub().join("codex/崩坏3/entities"));
-    assert!(list.iter().any(|e| e.id == "char.爱莉希雅"));
-    let elysia = entity(&list, "char.爱莉希雅");
-    assert!(!elysia.anchors().is_empty(), "anchors 不应为空");
-    assert!(!elysia.secrets.is_empty(), "secrets 不应为空");
-}

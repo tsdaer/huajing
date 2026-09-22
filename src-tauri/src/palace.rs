@@ -71,6 +71,9 @@ pub const KIND_EPISODE: &str = "episode";
 pub const KIND_FACT: &str = "fact";
 /// 记忆类型：转述（A 告诉 B，salience 折半、links 继承，`10.4）。
 pub const KIND_HEARSAY: &str = "hearsay";
+/// 转述记忆的显著度折半系数（`10.4「salience 折半」）：听来的事不如亲历的刻骨，
+/// 写入侧把原事件（亲历）显著度乘以它得到转述显著度。
+pub const HEARSAY_SALIENCE_FACTOR: f32 = 0.5;
 
 /// 缺省显著度（管线未给权重时的中位值）。
 pub const DEFAULT_SALIENCE: f32 = 0.5;

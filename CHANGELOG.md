@@ -8,6 +8,29 @@
 
 ### Added
 
+- **M3.3 视角记忆与转述（设计 §10.4）——信息跨视角流动的唯一通道**：
+  - **转述（hearsay）生成**：总结管线新增 `hearsays` 产物——本批剧情里 A 把某事告诉了 B 时，
+    记录「谁讲的（source）、听的人现在知道了什么（content）、原事件显著度（salience）」；
+    宿主为**每个听众各写一条** `kind = hearsay` 的记忆对象（witnesses = 她自己），
+    **salience 折半**（`palace::HEARSAY_SALIENCE_FACTOR`，听来的不如亲历的刻骨）、
+    links 从原事件继承、盖**告知发生时刻**的故事章（`story_time_at_turn`，与 M3.0 ⑤ 同口径）。
+    召回行尾自带「转述自X」来源标注（B4 渲染既有能力，M2 预留），翻旧账有据可查；
+    没在 listeners 名单里的角色召不回这件事——视角过滤是硬约束
+  - **揭示闭环**：转述提案可带 `reveals`（这番话顺带揭示的秘密路径）——宿主落
+    `origin = pipeline` 的 reveal 事件、见证者 = 听众，听众的视角知情集（`known_of`）增项，
+    M3.1 的深卡判定随之闭环：**听过秘密的人深卡对她展开，没听过的人照旧关门**。
+    `is_derived` 相应收窄：Codex 事件只有 `origin = tree` 算派生（重建时由状态树重导），
+    pipeline 揭示是模型产物，与转述记忆同理编辑历史不丢
+  - **管线提示词**：`hearsays` 进输出骨架与产物规格（转告/坦白/透露的判别要点：
+    content 从听者视角写、听众不含告知者本人、salience 填原事件值宿主才折半、
+    只讲给一个人听的事不写别人）；解析容错与 sanitize 归一（空正文/无听众丢弃、
+    听众剔除告知者、夹紧去重、上限 6 条）各有单测钉死
+  - 验收单测：`hearsay_reaches_only_the_listener_with_halved_salience`（串台用例扩展到三人）——
+    小雨目击事件（亲历记忆 salience 0.8、witnesses=[小雨]）、阿澈通过对话得知
+    → 阿澈的 B4 出现「转述自小雨」且渲染显著度 0.40（约为亲历一半）、
+    转述揭示的工作牌秘密对阿澈展开深卡；小玲的 B4 召不回转述、B3 深卡不展开（始终不知情）。
+    累计 331 例单测 + `pnpm build` 双绿
+
 - **M3.2 场景与多线（设计 §10.3）——「与此同时」的隔离顶层单元**：
   - **场景模型与事件**：新增 `scene.rs`（纯数据与算法，不碰文件不碰网络）与 `SceneEvent`
     （create / switch / split / merge / freeze / resume / update，不随消息级重建丢弃，

@@ -353,7 +353,10 @@ impl LogRecord {
             LogBody::Effect(_) | LogBody::Transition(_) => true,
             LogBody::Blackboard(b) => b.reason == "clock" || b.reason == "hook",
             LogBody::Thread(t) => t.origin != "manual",
-            LogBody::Codex(c) => c.origin != "manual",
+            // 只有**状态树**的揭示算派生（重建时会由 advance_state_tree 重导）；
+            // 总结管线转述带来的揭示（M3.3 · §10.4，origin = pipeline）是模型产物——
+            // 与它伴随写入的转述记忆同理，重放不重新调用模型，编辑历史不得丢弃。
+            LogBody::Codex(c) => c.origin == "tree",
             // 摘要与提案是**模型产物**，不是确定性派生：重放不重新调用模型，
             // 所以它们永远保留（编辑历史只重算状态/转移/心理，设计 §7.3-5 的承诺范围）。
             // 场景事件同理：切场/分场/合场是玩家/导演的动作，不从消息派生。
@@ -1300,6 +1303,27 @@ mod tests {
         assert!(pipeline_thread.is_derived());
         assert!(LogRecord::new(5, effect(1, "k", serde_json::json!(1))).is_derived());
         assert!(!LogRecord::message(6, msg(1, "user", "x")).is_derived());
+
+        // 设定揭示按来源分道（M3.3）：状态树的会随重建重导（派生），
+        // 总结管线转述带来的不会（模型产物，重放不重调模型）
+        let codex = |origin: &str| {
+            LogRecord::new(
+                7,
+                LogBody::Codex(CodexEvent {
+                    turn: 3,
+                    op: "reveal".into(),
+                    target: "char.小雨.secrets.工作牌".into(),
+                    origin: origin.into(),
+                    value: None,
+                    note: None,
+                    witnesses: vec!["阿澈".into()],
+                    ts: 1,
+                }),
+            )
+        };
+        assert!(codex("tree").is_derived());
+        assert!(!codex("pipeline").is_derived());
+        assert!(!codex("manual").is_derived());
     }
 
     #[test]

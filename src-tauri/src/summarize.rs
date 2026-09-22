@@ -7,7 +7,12 @@
 // 六类产物与设计 §5.3 那张图逐条对应（也是 build_prompt 逐条要账的清单）：
 //
 //   1. L1 摘要增量   summary_delta —— 编年史体、第三人称，并入 summary.md（§5.1）
+//      世界层大事记  chronicle    —— 只记公开事件，跨场景共享（M3.2 · §10.4 摘要分卷）
 //   2. 情景记忆      episodes      —— episode 形态入宫殿（§5.2：salience/emotion/links/thread）
+//      转述记忆      hearsays      —— episodes 的伴生清单（M3.3 · §10.4）：本批剧情里
+//                                    A 把某事告诉了 B → 宿主为每个听众各写一条 hearsay
+//                                    （content=转述内容、source=告知者、salience 折半、
+//                                    links 继承）——信息跨视角流动的唯一通道
 //   3. L3 事实键值   facts         —— 跨会话持久的事实（§5.1）
 //   4. 剧情线提案    threads       —— 开线 + **提及时机起草**（§8.3）：grade（克制梯度）/
 //                                    windows（可提及窗口，直接写成 §8.2 的 JSON 形态）/
@@ -46,6 +51,8 @@ use crate::threads;
 
 /// 单批情景记忆条数上限（§5.3；宁少勿滥）。
 pub const MAX_EPISODES: usize = 6;
+/// 单批转述提案条数上限（§10.4；与情景记忆同档——转述是「被人讲起的事」，不该比亲历多）。
+pub const MAX_HEARSAYS: usize = 6;
 /// 单批剧情线提案条数上限（§8.3；开线是大事，不能一轮开一堆）。
 pub const MAX_THREADS: usize = 2;
 /// 单批设定提案条数上限（§6.8；收件箱要人审，给太多等于没给）。
@@ -83,6 +90,20 @@ pub const OUTCOME_SCHEMA_HINT: &str = r#"{
       "links": ["topic:便签", "person:小雨", "place:图书馆"],
       "thread": "thread.周五还书",
       "turns": [14]
+    }
+  ],
+  "hearsays": [
+    {
+      "content": "小雨听说图书馆要拆了，转告了玩家",
+      "source": "小雨",
+      "listeners": ["玩家"],
+      "salience": 0.8,
+      "emotion": "怅然",
+      "place": "图书馆",
+      "links": ["topic:拆迁", "person:小雨"],
+      "thread": "thread.周五还书",
+      "turns": [15],
+      "reveals": []
     }
   ],
   "facts": [{ "key": "玩家名字", "value": "阿澈" }],
@@ -177,6 +198,9 @@ pub struct SummaryOutcome {
     pub chronicle: String,
     /// 情景记忆草稿（入宫殿，§5.2）。
     pub episodes: Vec<EpisodeDraft>,
+    /// 转述提案（M3.3 · §10.4）：本批剧情里 A 把某事告诉了 B——宿主为每个听众
+    /// 各写一条 hearsay 记忆（salience 折半、links 继承），顺带揭示的秘密进知情集。
+    pub hearsays: Vec<HearsayDraft>,
     /// L3 事实键值草稿（§5.1）。
     pub facts: Vec<FactDraft>,
     /// 剧情线提案（含提及时机起草，§8.3）。
@@ -193,6 +217,7 @@ impl SummaryOutcome {
         self.summary_delta.trim().is_empty()
             && self.chronicle.trim().is_empty()
             && self.episodes.is_empty()
+            && self.hearsays.is_empty()
             && self.facts.is_empty()
             && self.threads.is_empty()
             && self.psyche.is_empty()
@@ -221,6 +246,37 @@ pub struct EpisodeDraft {
     pub thread: Option<String>,
     /// 这件事发生的轮次（升序；宿主取首个作 MemObject.turn 溯源）。
     pub turns: Vec<u64>,
+}
+
+/// 转述提案（M3.3 · 设计 §10.4「hearsay」）：本批剧情里 A 把某事告诉了 B。
+///
+/// id / story_day / story_clock / ts 由宿主补；**salience 语义与情景记忆不同**——
+/// 它填的是**原事件（亲历）**的显著度，宿主写入时按 [`palace::HEARSAY_SALIENCE_FACTOR`]
+/// 折半（听来的事不如亲历的刻骨）。每个听众各得一条自己的转述记忆（witnesses = 她自己），
+/// 没在 listeners 里的人不知道（设计 §10.1：信息跨视角流动的唯一通道）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HearsayDraft {
+    /// 转述内容：B 现在知道的那件事本身（一句话、第三人称、从 B 的视角）。
+    pub content: String,
+    /// 告知者（她是从谁那听来的；渲染成「转述自X」）。
+    pub source: String,
+    /// 听到的人（每人各得一条转述记忆；告知者本人不在此列——她的是亲历）。
+    pub listeners: Vec<String>,
+    /// **原事件（亲历）**的显著度 0–1；宿主写入时折半。
+    pub salience: f32,
+    /// 情绪标签（可选）。
+    pub emotion: Option<String>,
+    /// 事发地点（可选）。
+    pub place: Option<String>,
+    /// 关联标签：从原事件继承（topic: / person: / place:）。
+    pub links: Vec<String>,
+    /// 所属剧情线 id（可选）。
+    pub thread: Option<String>,
+    /// 告知发生的轮次（升序；宿主取首个作溯源与故事时刻锚点）。
+    pub turns: Vec<u64>,
+    /// 这番话顺带揭示的秘密路径（实体.secrets.秘密，可选）：宿主落 reveal 事件、
+    /// 见证者 = listeners——听众的视角知情集因此增项，M3.1 的深卡判定随之闭环。
+    pub reveals: Vec<String>,
 }
 
 /// L3 事实草稿（§5.1 键值：玩家的名字、生日、约定、关键事件）。
@@ -349,12 +405,28 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的产物】（设计 §5.3 +
    - thread：属于哪条剧情线（填线 id，如 thread.周五还书），不属于就省略；
    - turns：这件事发生的轮次（本批消息的 turn，升序）。
 
-4. facts —— L3 事实键值（设计 §5.1）
+4. hearsays —— 转述提案（设计 §10.4「转述是信息跨视角流动的唯一通道」）
+   本批剧情里**有人把某件事讲给了别人听**（转告、坦白、透露、道听途说）时记录：谁讲的、
+   听的人现在知道了什么。最多 6 条，没有就给 []。每条字段：
+   - content：听的人现在知道的那件事本身（一句话、第三人称、从听者的视角，
+     如「小雨告诉玩家，图书馆要拆了」）；
+   - source：告知者（讲的人）；
+   - listeners：听到的人（写名字；讲的人自己不算——她的记忆是亲历，进 episodes）；
+     只讲给某一个人听的事，绝不要把别人写进来——没听到的人不会知道这件事；
+   - salience：**原事件（被讲述的那件事）**的显著度 0–1；宿主写入时会自动折半
+     （听来的不如亲历的刻骨），这里不要自己折；
+   - emotion / place / links / thread：可选，语义同 episodes（links 从原事件继承）；
+   - turns：这番话发生的轮次（升序）；
+   - reveals：可选。这番话顺带**揭示了设定集里的秘密**时，填秘密路径
+     （如 char.小雨.secrets.工作牌）——听的人从此算「知情」，深卡才会对她展开；
+     没有就给 []。
+
+5. facts —— L3 事实键值（设计 §5.1）
    跨会话仍然要记得的稳定事实：玩家叫什么、生日、约定、关键事件、稳定偏好。
    key 用简短中文或点分路径（如 玩家名字 / 约定.还书），value 是 JSON 标量或短数组。
    一次性的、会变的、拿不准的不要写；没有就给 []。
 
-5. threads —— 剧情线提案（设计 §8.3「管线提案」，必须一并起草提及时机）
+6. threads —— 剧情线提案（设计 §8.3「管线提案」，必须一并起草提及时机）
    只有当剧情里出现了新的承诺 / 冲突 / 悬念（有起因、将来要了结的事）才提，最多 2 条。
    上文已列出的活跃线不要重复开；没有就给 []。每条字段：
    - title / cause（起因，一句话讲清为什么欠着）/ actors / importance（0–1 重要度）；
@@ -375,14 +447,14 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的产物】（设计 §5.3 +
    - framing：提起时的表演指引一句话（她打算怎么开这个口、被问到会怎样），例如
      「她在意但不好意思催；若对方主动提起，会松一口气」。没有特别指引给 ""。
 
-6. psyche —— 心理评价提案（设计 §9.2：情绪是对「需要是否被满足」的态度体验）
+7. psyche —— 心理评价提案（设计 §9.2：情绪是对「需要是否被满足」的态度体验）
    对照上文的「需要（needs）」清单评价本批消息——某个需要被满足或受挫时：
    - 情绪：{"kind": "feel", "name": "<情绪名>", "intensity": <0–1>, "source": "<哪个需要被满足/受挫>"}；
    - 意图增减：{"kind": "intend", "name": "<意图名>", "intensity": <-1–1>, "source": "<原因>"}
      （正数增强、负数削弱；例如 -0.3 表示「想解释」的冲动被削掉三成）。
    没有明显评价就给 []；不要为了凑数造情绪，也不要写角色的台词倾向（那是生成时的职责）。
 
-7. codex —— 设定提案（设计 §6.8，进设定收件箱；未经确认不进注入，§6.9）
+8. codex —— 设定提案（设计 §6.8，进设定收件箱；未经确认不进注入，§6.9）
    本批消息里即兴发明且值得留下的世界事实（例如「她养了一只叫墨墨的猫」）。kind 四选一：
    - "new_entity"  全新实体（必须人工确认）：{"kind":"new_entity","target":"char.墨墨",
        "value":{"type":"char","name":"墨墨","facts":{"look.impression":"一只黑猫"}},
@@ -442,7 +514,7 @@ pub fn build_prompt(ctx: &SummaryContext<'_>, batch: &[BatchMessage]) -> String 
     );
     push_join(
         &mut out,
-        "角色的需要（needs，第 5 条评价的对照表）",
+        "角色的需要（needs，第 7 条评价的对照表）",
         ctx.needs,
     );
 
@@ -567,6 +639,10 @@ pub fn parse_outcome(raw: &str) -> Result<SummaryOutcome, String> {
             .iter()
             .map(|m| episode_of(m))
             .collect(),
+        hearsays: objects_of(map.get("hearsays"))
+            .iter()
+            .map(|m| hearsay_of(m))
+            .collect(),
         facts: objects_of(map.get("facts"))
             .iter()
             .map(|m| fact_of(m))
@@ -621,6 +697,22 @@ fn episode_of(map: &Map<String, Value>) -> EpisodeDraft {
         links: list_of_text(map.get("links")),
         thread: opt_text_of(map.get("thread")),
         turns: turns_of(map.get("turns")),
+    }
+}
+
+/// 一条转述提案（salience 缺省取 palace::DEFAULT_SALIENCE；reveals 只收非空文本）。
+fn hearsay_of(map: &Map<String, Value>) -> HearsayDraft {
+    HearsayDraft {
+        content: text_of(map.get("content")),
+        source: text_of(map.get("source")),
+        listeners: list_of_text(map.get("listeners")),
+        salience: f32_of(map.get("salience"), palace::DEFAULT_SALIENCE),
+        emotion: opt_text_of(map.get("emotion")),
+        place: opt_text_of(map.get("place")),
+        links: list_of_text(map.get("links")),
+        thread: opt_text_of(map.get("thread")),
+        turns: turns_of(map.get("turns")),
+        reveals: list_of_text(map.get("reveals")),
     }
 }
 
@@ -810,7 +902,7 @@ fn trim_value(v: Value) -> Value {
 ///   窗口」与 §8.4「防反复横跳」相悖，管线不产出无冷却的线）；
 /// - windows 只保留 threads::ResurfaceWindow::from_value 认得的对象（宿主能直接喂进去），
 ///   并按 JSON 文本去重；
-/// - episodes / threads / codex 截断到 MAX_*（保留顺序，先到先得）；
+/// - episodes / hearsays / threads / codex 截断到 MAX_*（保留顺序，先到先得）；
 /// - facts / psyche 不设上限——它们没有「一条顶十条」的破坏力，且都要过收件箱分级与情绪
 ///   槽位互斥；未识别的 kind 归一为最普通的形态（psyche → feel、codex → new_fact）。
 pub fn sanitize(outcome: SummaryOutcome) -> SummaryOutcome {
@@ -820,6 +912,13 @@ pub fn sanitize(outcome: SummaryOutcome) -> SummaryOutcome {
         .filter_map(normalize_episode)
         .collect();
     episodes.truncate(MAX_EPISODES);
+
+    let mut hearsays: Vec<HearsayDraft> = outcome
+        .hearsays
+        .into_iter()
+        .filter_map(normalize_hearsay)
+        .collect();
+    hearsays.truncate(MAX_HEARSAYS);
 
     let facts: Vec<FactDraft> = outcome
         .facts
@@ -851,6 +950,7 @@ pub fn sanitize(outcome: SummaryOutcome) -> SummaryOutcome {
         summary_delta: outcome.summary_delta.trim().to_string(),
         chronicle: outcome.chronicle.trim().to_string(),
         episodes,
+        hearsays,
         facts,
         threads,
         psyche,
@@ -874,6 +974,38 @@ fn normalize_episode(e: EpisodeDraft) -> Option<EpisodeDraft> {
         links: dedup_words(e.links),
         thread: clean_opt(e.thread),
         turns: sorted_turns(e.turns),
+    })
+}
+
+/// 一条转述提案（正文或告知者为空丢弃；没有听众的转述没人听见，同样丢弃）。
+///
+/// 听众里的告知者本人剔除（她的是亲历，不是转述）；salience 是**原事件**的显著度，
+/// 这里只夹紧不折半——折半是宿主写入侧的规则（见 palace::HEARSAY_SALIENCE_FACTOR）。
+fn normalize_hearsay(h: HearsayDraft) -> Option<HearsayDraft> {
+    let content = h.content.trim().to_string();
+    let source = h.source.trim().to_string();
+    if content.is_empty() || source.is_empty() {
+        return None;
+    }
+    let source_key = source.to_ascii_lowercase();
+    let listeners: Vec<String> = dedup_words(h.listeners)
+        .into_iter()
+        .filter(|l| l.to_ascii_lowercase() != source_key)
+        .collect();
+    if listeners.is_empty() {
+        return None;
+    }
+    Some(HearsayDraft {
+        content,
+        source,
+        listeners,
+        salience: clamp_unit(h.salience, palace::DEFAULT_SALIENCE),
+        emotion: clean_opt(h.emotion),
+        place: clean_opt(h.place),
+        links: dedup_words(h.links),
+        thread: clean_opt(h.thread),
+        turns: sorted_turns(h.turns),
+        reveals: dedup_words(h.reveals),
     })
 }
 
@@ -1184,6 +1316,17 @@ mod tests {
       "turns": [15, 14]
     }
   ],
+  "hearsays": [
+    {
+      "content": "小雨告诉玩家，图书馆下个月要拆了",
+      "source": "小雨",
+      "listeners": ["玩家", " 小雨 "],
+      "salience": 0.8,
+      "emotion": "怅然",
+      "links": ["topic:拆迁", "topic:拆迁"],
+      "turns": [15]
+    }
+  ],
   "facts": [
     { "key": "玩家名字", "value": "阿澈" },
     { "key": "约定.还书", "value": "周五" }
@@ -1228,11 +1371,12 @@ mod tests {
     // ---------- 提示词（§5.3 逐条要账）----------
 
     #[test]
-    fn prompt_lists_all_six_products() {
+    fn prompt_lists_all_products() {
         let p = prompt_with(&[], &[], &batch());
         for key in [
             "summary_delta",
             "episodes",
+            "hearsays",
             "facts",
             "threads",
             "psyche",
@@ -1285,12 +1429,14 @@ mod tests {
         let p = prompt_with(&[], &[], &batch());
         assert!(p.contains("只输出一个 JSON 对象"));
         assert!(p.contains(OUTCOME_SCHEMA_HINT));
-        // 骨架自己是合法 JSON，且六类产物一个不少（提示词与解析器的契约）
+        // 骨架自己是合法 JSON，且各类产物一个不少（提示词与解析器的契约）
         let parsed: Value = serde_json::from_str(OUTCOME_SCHEMA_HINT).expect("骨架是合法 JSON");
         let map = parsed.as_object().expect("骨架是对象");
         for key in [
             "summary_delta",
+            "chronicle",
             "episodes",
+            "hearsays",
             "facts",
             "threads",
             "psyche",
@@ -1585,6 +1731,10 @@ mod tests {
             summary_delta: "   ".into(),
             chronicle: String::new(),
             episodes: vec![draft_with("   ", 0.5), draft_with("有效记忆", 0.5)],
+            hearsays: vec![HearsayDraft {
+                content: "  ".into(),
+                ..hearsay_draft("占位")
+            }, hearsay_draft("有效转述")],
             facts: vec![
                 FactDraft {
                     key: "  ".into(),
@@ -1622,6 +1772,8 @@ mod tests {
         assert_eq!(out.facts.len(), 1);
         assert_eq!(out.threads.len(), 1);
         assert_eq!(out.threads[0].title, "有效线");
+        assert_eq!(out.hearsays.len(), 1);
+        assert_eq!(out.hearsays[0].content, "有效转述");
         assert_eq!(out.psyche.len(), 1);
         assert_eq!(out.codex.len(), 1);
     }
@@ -1778,6 +1930,158 @@ mod tests {
         assert_eq!(out.codex[0].kind, CODEX_NEW_FACT);
     }
 
+    // ---------- 转述（M3.3 · §10.4）：解析与归一 ----------
+
+    fn hearsay_draft(content: &str) -> HearsayDraft {
+        HearsayDraft {
+            content: content.to_string(),
+            source: "小雨".into(),
+            listeners: words(&["玩家"]),
+            salience: 0.8,
+            emotion: None,
+            place: None,
+            links: Vec::new(),
+            thread: None,
+            turns: Vec::new(),
+            reveals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_reads_hearsay_fields_and_defaults() {
+        let raw = r#"{
+          "hearsays": [
+            {
+              "content": "小雨告诉玩家，图书馆要拆了",
+              "source": "小雨",
+              "listeners": ["玩家"],
+              "salience": 0.9,
+              "emotion": "怅然",
+              "place": "图书馆",
+              "links": ["topic:拆迁"],
+              "thread": "thread.周五还书",
+              "turns": [15, 14],
+              "reveals": ["char.图书馆.secrets.拆迁"]
+            },
+            { "content": "缺字段的最简形态", "source": "小雨", "listeners": ["玩家"] }
+          ]
+        }"#;
+        let o = parse_outcome(raw).unwrap();
+        assert_eq!(o.hearsays.len(), 2);
+        let hs = &o.hearsays[0];
+        approx(hs.salience, 0.9);
+        assert_eq!(hs.emotion.as_deref(), Some("怅然"));
+        assert_eq!(hs.place.as_deref(), Some("图书馆"));
+        assert_eq!(hs.thread.as_deref(), Some("thread.周五还书"));
+        assert_eq!(hs.turns, vec![15, 14]);
+        assert_eq!(hs.reveals, words(&["char.图书馆.secrets.拆迁"]));
+        // 缺省字段：salience 取宫殿缺省、可选全空
+        let bare = &o.hearsays[1];
+        approx(bare.salience, palace::DEFAULT_SALIENCE);
+        assert!(bare.reveals.is_empty() && bare.turns.is_empty() && bare.links.is_empty());
+
+        // 缺 hearsays 键 = 空清单（不带任何产物进来）
+        assert!(parse_outcome("{}").unwrap().hearsays.is_empty());
+    }
+
+    #[test]
+    fn sanitize_drops_unhearable_or_empty_hearsays() {
+        let out = sanitize(SummaryOutcome {
+            hearsays: vec![
+                hearsay_draft("有效的转述"),
+                hearsay_draft("   "), // 空正文
+                HearsayDraft {
+                    source: "  ".into(),
+                    ..hearsay_draft("没有告知者")
+                },
+                HearsayDraft {
+                    listeners: Vec::new(), // 没有听众 = 没人听见
+                    ..hearsay_draft("自言自语")
+                },
+                HearsayDraft {
+                    listeners: words(&["小雨"]), // 听众只有告知者本人 = 没人听见
+                    ..hearsay_draft("讲给自己听")
+                },
+            ],
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.hearsays.len(), 1);
+        assert_eq!(out.hearsays[0].content, "有效的转述");
+    }
+
+    #[test]
+    fn sanitize_hearsay_clamps_and_dedups() {
+        let mut h = hearsay_draft("夹紧与去重");
+        h.salience = 7.0;
+        h.listeners = words(&["玩家", " 玩家 ", "阿澈", " 小雨 "]);
+        h.links = words(&["topic:拆迁", "topic:拆迁", " person:小雨 "]);
+        h.turns = vec![15, 14, 15];
+        h.reveals = words(&["char.小雨.secrets.工作牌", " char.小雨.secrets.工作牌 ", ""]);
+        let out = sanitize(SummaryOutcome {
+            hearsays: vec![h],
+            ..SummaryOutcome::default()
+        });
+        let hs = &out.hearsays[0];
+        approx(hs.salience, 1.0);
+        assert_eq!(hs.listeners, words(&["玩家", "阿澈"]), "去重，告知者本人剔除");
+        assert_eq!(hs.links, words(&["topic:拆迁", "person:小雨"]));
+        assert_eq!(hs.turns, vec![14, 15]);
+        assert_eq!(hs.reveals, words(&["char.小雨.secrets.工作牌"]));
+    }
+
+    #[test]
+    fn sanitize_truncates_hearsays_keeping_order() {
+        let hearsays: Vec<HearsayDraft> = (0..MAX_HEARSAYS + 3)
+            .map(|i| hearsay_draft(&format!("转述{i}")))
+            .collect();
+        let out = sanitize(SummaryOutcome {
+            hearsays,
+            ..SummaryOutcome::default()
+        });
+        assert_eq!(out.hearsays.len(), MAX_HEARSAYS);
+        assert_eq!(out.hearsays[0].content, "转述0");
+    }
+
+    #[test]
+    fn hearsay_draft_feeds_a_palace_memory() {
+        let mut h = hearsay_draft("小雨告诉玩家，图书馆要拆了");
+        h.salience = 0.8;
+        h.links = words(&["topic:拆迁", "person:小雨"]);
+        h.turns = vec![15];
+        // 宿主写入侧的规则（apply_summary_outcome）：salience 折半、每个听众各一条
+        let listener = &h.listeners[0];
+        let mem = palace::MemObject {
+            id: palace::next_id(7),
+            kind: palace::KIND_HEARSAY.to_string(),
+            content: h.content.clone(),
+            turn: h.turns.first().copied().unwrap_or(0),
+            story_day: 3,
+            story_clock: "第3天 21:05".to_string(),
+            place: h.place.clone(),
+            actors: vec![h.source.clone(), listener.clone()],
+            witnesses: vec![listener.clone()],
+            salience: h.salience * palace::HEARSAY_SALIENCE_FACTOR,
+            emotion: h.emotion.clone(),
+            links: h.links.clone(),
+            thread: h.thread.clone(),
+            source: h.source.clone(),
+            ts: 0,
+            rehearsals: 0,
+        };
+        assert_eq!(mem.kind, palace::KIND_HEARSAY);
+        assert!((mem.salience - 0.4).abs() < 1e-6, "听来的事显著度折半（§10.4）");
+        assert_eq!(mem.witnesses_or_actors(), vec!["玩家".to_string()]);
+        // 渲染行带来源标注（召回时翻旧账有据可查）
+        assert!(palace::render_memory_block(&[palace::RecallHit {
+            mem: mem.clone(),
+            score: 0.4,
+            reasons: vec![],
+        }])
+        .contains("转述自小雨"));
+        // 关联继承：原事件的 links 在召回里照样命中
+        assert!(mem.links_match("topic:拆迁"));
+    }
+
     #[test]
     fn sanitize_is_idempotent() {
         let once = sample_outcome();
@@ -1932,6 +2236,14 @@ mod tests {
         assert_eq!(out.threads.len(), 1);
         assert_eq!(out.psyche.len(), 2);
         assert_eq!(out.codex.len(), 1);
+
+        // 转述：听众里的告知者被剔除、links 去重、salience 保留原值（折半是宿主的事）
+        assert_eq!(out.hearsays.len(), 1);
+        let hs = &out.hearsays[0];
+        assert_eq!(hs.source, "小雨");
+        assert_eq!(hs.listeners, words(&["玩家"]));
+        assert_eq!(hs.links, words(&["topic:拆迁"]));
+        approx(hs.salience, 0.8);
     }
 
     #[test]
