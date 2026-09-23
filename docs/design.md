@@ -781,6 +781,8 @@ char 实体 facet 模板按心理学二分法重排（§6.2 已更新）：**倾
 
 导演（含 LLM 导演 agent）是**元层**：可见全局用于调度，但其输出只产生调度动作（切场/点名/时间推进/开收线），**绝不进入任何角色的上下文**。
 
+**导演树的落地形态（M3.6）**：会话级状态树与卡内状态树**同一套机制**——`sessions/<id>/director.lua` 声明 `state_tree`（剧本包 v0 形态；缺省用内置起承转合树：起=铺陈+开线、承=生长、转=主动制造反转线、合=并场收束），转移在每轮轮末由宿主确定性求值（同 §7.3），判据是导演专属的合成 state 表：`turns_left`（轮数预算余量——剧场目标函数「预算内走完一条完整的开线→收线弧」由预算压力转移兑现）、`stage_turns`、`threads_active`。钩子动作白名单只有四个：`api.open_thread` / `api.resolve_threads` / `api.resurface`（窗口调度权：grade 提前/延后）/ `api.merge_scenes`（合场裁决——「与此同时」的轮换节奏是宿主确定性策略，合场时机由树掌管）。阶段转移落 `director_tree` 事件（走位史回放可重现，消息级重建不丢）。查询 worldline 阶段决定节奏随 M3.7 接入（判据环境加一个字段）。
+
 ## 11. LLM 接入
 
 - 统一 **OpenAI 兼容协议**（OpenAI / DeepSeek / GLM / Kimi / Ollama / LM Studio 通吃；Claude 走兼容端点）。

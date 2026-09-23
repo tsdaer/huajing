@@ -18,6 +18,7 @@ import type {
   SessionMeta,
   Settings,
   StreamEvent,
+  TheaterView,
 } from "./types";
 
 const sessionId = "20260919-101500-000";
@@ -116,6 +117,18 @@ const mockScenes: Scene[] = [
   },
 ];
 let activeScene = "scene.main";
+
+/** mock 的剧场视图（M3.6；浏览器模式只示意，不驱动对话逻辑） */
+let mockTheaterView: TheaterView = {
+  on: false,
+  budget: 0,
+  used: 0,
+  start_turn: 0,
+  last_turn: 0,
+  path: [],
+  stage_directive: "",
+  custom_tree: false,
+};
 
 function sceneView(): SceneView {
   return { scenes: mockScenes.map((sc) => ({ ...sc, flags: {} })), active: activeScene };
@@ -490,6 +503,23 @@ export function setupMock() {
         throw new Error("浏览器 mock 不支持分场/合场：请用 pnpm tauri dev");
       case "update_scene":
         return sceneView();
+      // ---------- 剧场模式（M3.6 · 设计 §10.5）：浏览器 mock 只做视图示意 ----------
+      case "theater_view":
+        return mockTheaterView;
+      case "set_theater": {
+        const on = (a as unknown as { on: boolean }).on;
+        mockTheaterView = {
+          on,
+          budget: on ? (a as unknown as { budget?: number }).budget ?? 20 : 0,
+          used: 0,
+          start_turn: 0,
+          last_turn: 0,
+          path: on ? ["起"] : [],
+          stage_directive: on ? "起：铺陈日常与人物，让张力自然登场。" : "",
+          custom_tree: false,
+        };
+        return mockTheaterView;
+      }
       // 记忆检查器（M2.8）：形状与 commands.rs 的 inspector_data 对齐，
       // 让浏览器调试路径也能看到 M2 的七个面板（数据是示意值，不参与对话逻辑）。
       case "inspector_data":

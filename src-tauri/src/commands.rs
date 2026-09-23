@@ -2597,6 +2597,14 @@ fn finalize_turn(
         }
     }
 
+    // 轮末：剧场模式（M3.6）——导演树起承转合推进 + 交叉剪辑切场。
+    // 只在剧场开着时进；全部动作落事件流（与重放同路径，可回放）
+    if meta.theater.is_some() {
+        if let Err(e) = advance_theater(root, meta, cast, log, tree_cache, runtime, report) {
+            report.logs.push(format!("剧场推进失败：{e}"));
+        }
+    }
+
     // 轮末异步总结（消息已滑出 L0 窗口时才真的干活；不阻塞本轮返回）
     if let Some(flags) = summary_flags {
         spawn_summary(root, &meta.id, flags);
@@ -2771,6 +2779,528 @@ fn director_plan(
 fn meta_max_speakers(meta: &store::SessionMeta, cast: &Cast) -> usize {
     let configured = meta.max_speakers.unwrap_or(DEFAULT_MAX_SPEAKERS as u32) as usize;
     configured.clamp(1, cast.members.len().max(1))
+}
+
+// ---------- 剧场模式与导演树（M3.6 · 设计 §8.5/§10.5）----------
+
+/// 剧场轮数预算缺省值（验收目标：自动跑 20 轮完成至少一次完整的开线→收线弧）
+pub const DEFAULT_THEATER_BUDGET: u32 = 20;
+
+/// 剧场模式视图（进度指示与前端自动轮次的数据源）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TheaterView {
+    pub on: bool,
+    pub budget: u32,
+    /// 已走掉的剧场轮数（当前轮 − 开场轮）
+    pub used: u64,
+    pub start_turn: u64,
+    pub last_turn: u64,
+    /// 导演树当前活跃路径（根→叶；还没开场 = 树根）
+    pub path: Vec<String>,
+    /// 当前阶段的 directive（「这一幕该是什么调子」）
+    pub stage_directive: String,
+    /// 用的是会话自带的 director.lua（false = 内置默认起承转合树）
+    pub custom_tree: bool,
+}
+
+/// 导演树的加载（M3.6 ·「会话模板声明，Lua 走卡沙箱」）：
+/// `sessions/<id>/director.lua` 优先（剧本包 v0 形态），缺省用内置起承转合树。
+/// 自定义树解析失败回落默认树（诊断留痕）——剧场不因坏配置而停摆。
+fn load_director_tree(
+    root: &std::path::Path,
+    session_id: &str,
+) -> (String, std::sync::Arc<statetree::StateTree>, bool) {
+    let custom = std::fs::read_to_string(
+        store::session_dir(root, session_id).join("director.lua"),
+    )
+    .ok()
+    .filter(|s| !s.trim().is_empty());
+    if let Some(source) = custom {
+        match card::state_tree_shape(&source)
+            .map_err(|e| e)
+            .and_then(|shape| statetree::StateTree::from_value(&shape).map_err(|e| e))
+        {
+            Ok(tree) => {
+                for warning in tree.validate() {
+                    crate::diag::record("director", format!("导演树校验：{warning}"));
+                }
+                return (source, std::sync::Arc::new(tree), true);
+            }
+            Err(e) => {
+                crate::diag::record("director", format!("director.lua 解析失败，回落默认树：{e}"));
+            }
+        }
+    }
+    let tree = statetree::StateTree::from_value(&card::state_tree_shape(director::DEFAULT_DIRECTOR_LUA).expect("内置导演树应能解析"))
+        .expect("内置导演树应能解析");
+    (
+        director::DEFAULT_DIRECTOR_LUA.to_string(),
+        std::sync::Arc::new(tree),
+        false,
+    )
+}
+
+/// 剧场模式的轮末推进（M3.6）：导演树求值 → 阶段转移落流 → 调度动作执行 →
+/// 交叉剪辑切场。finalize_turn 与单测共用同一份代码；
+/// 一切动作都是事件（导演树事件 / 线事件 / 场景事件 / 调度事件），回放可重现。
+#[allow(clippy::too_many_arguments)]
+fn advance_theater(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    cast: &Cast,
+    log: &store::EventLog,
+    tree_cache: Option<&TreeCache>,
+    runtime: Option<&SessionRuntime>,
+    report: &mut llm::HookReport,
+) -> Result<(), String> {
+    let Some(theater) = meta.theater.clone() else {
+        return Ok(());
+    };
+    // resolve_thread_at 需要 &TreeCache/&SessionRuntime：调用方没给（单测等）就用临时的空件
+    let fallback_cache;
+    let tree_cache = match tree_cache {
+        Some(tc) => tc,
+        None => {
+            fallback_cache = TreeCache::default();
+            &fallback_cache
+        }
+    };
+    let fallback_runtime;
+    let runtime = match runtime {
+        Some(rt) => rt,
+        None => {
+            fallback_runtime = SessionRuntime::default();
+            &fallback_runtime
+        }
+    };
+    let proj = project_session(log, root, meta)?;
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+    let scene = scene_ctx(&proj);
+    let (source, tree, _custom) = load_director_tree(root, &meta.id);
+
+    // 判据环境：state 槽放**合成表**——轮次预算与阶段时长是导演树专属判据
+    // （角色状态树不看这些）；threads 判据集与角色树同源
+    let threads_active: Vec<String> = proj
+        .threads
+        .iter()
+        .filter_map(|(id, v)| {
+            threads::Thread::from_value(v)
+                .ok()
+                .filter(|t| t.is_active())
+                .map(|_| id.clone())
+        })
+        .collect();
+    let anchor = proj
+        .director_tree
+        .last()
+        .map(|e| e.turn)
+        .unwrap_or(theater.start_turn)
+        .max(theater.start_turn);
+    let stage_turns = turn.saturating_sub(anchor) as i64;
+    let turns_left = theater.budget as i64 - turn.saturating_sub(theater.start_turn) as i64;
+    let env = card::TreeEnv {
+        event: "theater:turn_end".into(),
+        blackboard: blackboard_env(&proj.effective_board(scene.as_deref())),
+        state: serde_json::json!({
+            "turn": turn,
+            "turns_left": turns_left,
+            "stage_turns": stage_turns,
+            "threads_active": threads_active,
+            "scenes_active": proj.scenes.values().filter(|s| s.is_active()).count(),
+        }),
+        threads_active: threads_active.iter().cloned().collect(),
+        ..Default::default()
+    };
+
+    // 开场播种：走位史为空 = 导演还没上场 → 进入树根（跑 on_enter），落第一条走位事件。
+    // 当轮不再求值转移（刚进的状态要站得住一轮）。
+    if proj.director_tree.is_empty() {
+        let path = tree.active_path(&tree.root);
+        let leaf = path.last().cloned().unwrap_or_default();
+        let (actions, hook_logs) = card::run_director_hook(&source, &leaf, "on_enter");
+        report.logs.extend(hook_logs);
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::DirectorTree(event::DirectorTreeEvent {
+                turn,
+                from: Vec::new(),
+                to: path,
+                reason: "剧场开场".into(),
+                ts: store::unix_now(),
+            }),
+        )?;
+        let proj = project_session(log, root, meta)?;
+        execute_director_actions(
+            &proj, root, meta, cast, log, turn, scene.as_deref(), actions,
+            tree_cache, runtime, report,
+        )?;
+        return Ok(());
+    }
+
+    // 阶段转移求值（与角色状态树同引擎：priority 升序、叶先、首个命中即转）
+    let path = proj
+        .director_tree
+        .last()
+        .map(|e| e.to.clone())
+        .unwrap_or_else(|| tree.active_path(&tree.root));
+    let Some(leaf) = path.last().cloned() else {
+        return Ok(());
+    };
+    let decision = match card::eval_state_tree(&source, &path, &env) {
+        Ok(Some(d)) => Some(d),
+        Ok(None) => None,
+        Err(e) => {
+            crate::diag::record("director", format!("导演树求值失败：{e}"));
+            None
+        }
+    };
+    if let Some(d) = decision {
+        let to_path = tree.active_path(&d.to);
+        if to_path.is_empty() {
+            crate::diag::record("director", format!("导演树转移目标未声明，保持原地：{}", d.to));
+        } else {
+            let to_leaf = to_path.last().cloned().unwrap_or_default();
+            // 执行顺序与状态树同构（§7.3-3）：exit 动作 → 转移事件 → enter 动作
+            let (exit_actions, hook_logs) = card::run_director_hook(&source, &leaf, "on_exit");
+            report.logs.extend(hook_logs);
+            execute_director_actions(
+                &proj, root, meta, cast, log, turn, scene.as_deref(), exit_actions,
+                tree_cache, runtime, report,
+            )?;
+            commit(
+                log,
+                root,
+                meta,
+                LogBody::DirectorTree(event::DirectorTreeEvent {
+                    turn,
+                    from: path.clone(),
+                    to: to_path.clone(),
+                    reason: d.reason.clone(),
+                    ts: store::unix_now(),
+                }),
+            )?;
+            let (enter_actions, hook_logs) = card::run_director_hook(&source, &to_leaf, "on_enter");
+            report.logs.extend(hook_logs);
+            let proj = project_session(log, root, meta)?;
+            execute_director_actions(
+                &proj, root, meta, cast, log, turn, scene.as_deref(), enter_actions,
+                tree_cache, runtime, report,
+            )?;
+            report.ui_events.push(llm::UiEmit {
+                kind: "theater".into(),
+                value: format!("剧情进入「{to_leaf}」——{}", d.reason),
+            });
+        }
+    }
+
+    // 交叉剪辑（设计 §10.5）：多路场景且当前场景满节奏轮数 → 切下一路。
+    // 候选 = 全部未归档场景（冻结的分路可被切回——切回即解冻，设计 §10.3
+    // 「被切走的场景冻结，剧场模式下可由导演继续自动推进」）。
+    // 「合场时机」不在这里——它是导演树合段的显式动作（api.merge_scenes）。
+    let proj = project_session(log, root, meta)?;
+    if let Some(cur) = scene_ctx(&proj) {
+        let stages: Vec<String> = proj
+            .scenes
+            .iter()
+            .filter(|(_, sc)| sc.status != scene::STATUS_MERGED)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if stages.len() > 1 {
+            let rounds = rounds_in_current(&proj, log, root, meta, &cur, theater.start_turn);
+            if let director::CutDecision::Cut { to } = director::plan_cut(&director::IntercutQuery {
+                scenes: &stages,
+                current: &cur,
+                rounds_in_current: rounds,
+                cadence: 0,
+            }) {
+                let to_place = proj.scenes.get(&to).map(|sc| sc.place.clone()).unwrap_or_default();
+                // 调度史先落一笔（导演面板可查「为何转场」），再真正切场
+                commit(
+                    log,
+                    root,
+                    meta,
+                    LogBody::Director(event::DirectorEvent {
+                        turn,
+                        op: "cut".into(),
+                        picks: Vec::new(),
+                        direct: Some(to.clone()),
+                        note: Some(format!("交叉剪辑：{cur} 连续推进 {rounds} 轮，转场")),
+                        ts: store::unix_now(),
+                    }),
+                )?;
+                switch_scene_at(
+                    log,
+                    root,
+                    meta,
+                    &proj,
+                    &to,
+                    "director",
+                    Some(format!("与此同时，{to_place}——")),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 当前场景已连续推进的剧场轮数：本轮 − 最近一次「切进来」的轮次
+/// （切场/交叉剪辑都算），没有切场史则从剧场开场起算。
+fn rounds_in_current(
+    proj: &event::Projection,
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    current: &str,
+    start_turn: u64,
+) -> u32 {
+    let mut anchor = start_turn;
+    if let Ok(records) = log.read(root, &meta.id) {
+        for rec in records.iter() {
+            match &rec.body {
+                LogBody::Scene(s) if s.op == "switch" && s.scene_id == current => {
+                    anchor = anchor.max(s.turn);
+                }
+                LogBody::Director(d) if d.op == "cut" && d.direct.as_deref() == Some(current) => {
+                    anchor = anchor.max(d.turn);
+                }
+                _ => {}
+            }
+        }
+    }
+    proj.messages
+        .last()
+        .map(|m| m.turn)
+        .unwrap_or(0)
+        .saturating_sub(anchor) as u32
+}
+
+/// 执行导演动作（顺序执行，逐条落事件）。全部是元层调度：
+/// 开/收线走线的生命周期（origin=director，重建保留），调窗落 retune 事件，合场走场景内核。
+#[allow(clippy::too_many_arguments)]
+fn execute_director_actions(
+    proj: &event::Projection,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    cast: &Cast,
+    log: &store::EventLog,
+    turn: u64,
+    scene: Option<&str>,
+    actions: Vec<director::DirectorAction>,
+    tree_cache: &TreeCache,
+    runtime: &SessionRuntime,
+    report: &mut llm::HookReport,
+) -> Result<(), String> {
+    for action in actions {
+        match action {
+            director::DirectorAction::OpenThread { title, cause, actors, importance } => {
+                let actors = actors.unwrap_or_else(|| {
+                    present_members(cast, proj, scene)
+                        .iter()
+                        .map(|m| cast.display_name(&m.dir))
+                        .collect()
+                });
+                let title = title.unwrap_or_else(|| {
+                    intent_thread_title(proj, cast, scene).unwrap_or_else(|| "主线".into())
+                });
+                let cause =
+                    cause.unwrap_or_else(|| format!("剧场主线：从角色的意图里生长出来——{title}"));
+                open_thread_at(log, root, meta, &title, &cause, &actors, importance, "director")?;
+                report.logs.push(format!("剧场开线：{title}"));
+            }
+            director::DirectorAction::ResolveThreads { thread_id, outcome } => {
+                let ids: Vec<String> = match thread_id {
+                    Some(id) => vec![id],
+                    None => director_opened_active_threads(proj),
+                };
+                if ids.is_empty() {
+                    report.logs.push("剧场收线：没有导演开的活跃线，跳过".into());
+                }
+                for id in ids {
+                    let outcome = outcome.clone().unwrap_or_else(|| "剧场收束。".into());
+                    resolve_thread_at(log, root, meta, &id, &outcome, tree_cache, runtime, "director")?;
+                    report.logs.push(format!("剧场收线：{id}"));
+                }
+            }
+            director::DirectorAction::Resurface { thread_id, direction } => {
+                let Some(mut thread) = proj
+                    .threads
+                    .get(&thread_id)
+                    .and_then(|v| threads::Thread::from_value(v).ok())
+                else {
+                    report.logs.push(format!("剧场调窗：没有这条线（{thread_id}），忽略"));
+                    continue;
+                };
+                let (grade, note) = match direction.as_str() {
+                    "earlier" => (threads::GRADE_EAGER, "导演把这条线往前赶（很想找机会说）"),
+                    "later" => (threads::GRADE_DORMANT, "导演把这条线往后压（先放着别提）"),
+                    _ => continue,
+                };
+                thread.resurface.grade = grade.into();
+                commit(
+                    log,
+                    root,
+                    meta,
+                    LogBody::Thread(event::ThreadEvent {
+                        turn,
+                        op: threads::OP_RETUNE.into(),
+                        thread_id: thread_id.clone(),
+                        thread: Some(thread.to_value()),
+                        origin: "director".into(),
+                        note: Some(note.into()),
+                        ts: store::unix_now(),
+                    }),
+                )?;
+                report.logs.push(format!("剧场调窗：{thread_id} {direction}"));
+            }
+            director::DirectorAction::MergeScenes => {
+                // 合段把全部分路收回（冻结的也算——「两路人马汇合」；已归档的不动）
+                let others: Vec<String> = proj
+                    .scenes
+                    .iter()
+                    .filter(|(id, sc)| {
+                        sc.status != scene::STATUS_MERGED && Some(id.as_str()) != scene
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if others.is_empty() {
+                    report.logs.push("剧场合场：没有其他活跃场景，跳过".into());
+                    continue;
+                }
+                commit(
+                    log,
+                    root,
+                    meta,
+                    LogBody::Director(event::DirectorEvent {
+                        turn,
+                        op: "merge".into(),
+                        picks: Vec::new(),
+                        direct: None,
+                        note: Some(format!("合段裁决：{} 并入当前场景", others.join("、"))),
+                        ts: store::unix_now(),
+                    }),
+                )?;
+                merge_scenes_at(
+                    log,
+                    root,
+                    meta,
+                    proj,
+                    &others,
+                    "director",
+                    Some("两条线在此交汇——".into()),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 开线缺省标题：在场者最强的未外化意图（M3.5 的 proactive_candidate 口径）——
+/// 让剧场主线从角色心里长出来，而不是凭空杜撰
+fn intent_thread_title(
+    proj: &event::Projection,
+    cast: &Cast,
+    scene: Option<&str>,
+) -> Option<String> {
+    let mut best: Option<(f32, String)> = None;
+    for m in present_members(cast, proj, scene) {
+        let p = psyche::Psyche::from_state(&current_state(proj, &m.dir, &m.loaded));
+        for i in &p.intents {
+            if i.linked_thread.is_some() || i.triggered.is_some() {
+                continue;
+            }
+            if best.as_ref().map(|(b, _)| i.strength > *b).unwrap_or(true) {
+                best = Some((i.strength, i.name.clone()));
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// 导演开过、且还活跃的线 id（收束动作的缺省对象；管线/心理外化的线不动）
+fn director_opened_active_threads(proj: &event::Projection) -> Vec<String> {
+    let mut ids: Vec<String> = proj
+        .thread_log
+        .iter()
+        .filter(|e| e.op == threads::OP_OPEN && e.origin == "director")
+        .map(|e| e.thread_id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids.retain(|id| {
+        proj.threads
+            .get(id)
+            .and_then(|v| threads::Thread::from_value(v).ok())
+            .map(|t| t.is_active())
+            .unwrap_or(false)
+    });
+    ids
+}
+
+/// 开/关剧场模式（M3.6）：开启记轮数预算与起点（进度 = 当前轮 − 起点）
+#[tauri::command]
+pub fn set_theater(
+    session_id: String,
+    on: bool,
+    budget: Option<u32>,
+    log: State<'_, store::EventLog>,
+) -> Result<TheaterView, String> {
+    let root = root();
+    let mut meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    meta.theater = if on {
+        let proj = project_session(&log, &root, &meta)?;
+        let last_turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+        Some(store::TheaterConfig {
+            budget: budget.unwrap_or(DEFAULT_THEATER_BUDGET).clamp(4, 200),
+            start_turn: last_turn,
+        })
+    } else {
+        None
+    };
+    store::save_session(&root, &meta).map_err(|e| e.to_string())?;
+    theater_view_of(&log, &root, &meta)
+}
+
+/// 剧场模式视图（进度指示 / 当前阶段 / 剩余轮数）
+#[tauri::command]
+pub fn theater_view(
+    session_id: String,
+    log: State<'_, store::EventLog>,
+) -> Result<TheaterView, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    theater_view_of(&log, &root, &meta)
+}
+
+/// 剧场视图的内核（与 Tauri 无关，便于单测）
+fn theater_view_of(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+) -> Result<TheaterView, String> {
+    let proj = project_session(log, root, meta)?;
+    let last_turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+    let (_source, tree, custom) = load_director_tree(root, &meta.id);
+    let path = proj
+        .director_tree
+        .last()
+        .map(|e| e.to.clone())
+        .unwrap_or_else(|| tree.active_path(&tree.root));
+    let (on, budget, used, start_turn) = match &meta.theater {
+        Some(t) => (true, t.budget, last_turn.saturating_sub(t.start_turn), t.start_turn),
+        None => (false, 0, 0, 0),
+    };
+    Ok(TheaterView {
+        on,
+        budget,
+        used,
+        start_turn,
+        last_turn,
+        stage_directive: tree.directive_of(&path),
+        path,
+        custom_tree: custom,
+    })
 }
 
 /// 发送一条用户消息并流式生成回复。
@@ -3399,22 +3929,36 @@ pub fn switch_scene(
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
     let proj = project_session(&log, &root, &meta)?;
+    switch_scene_at(&log, &root, &meta, &proj, &scene_id, "manual", note)
+}
+
+/// 切场的内核（与 Tauri 无关）：manual（玩家）与 director（交叉剪辑，M3.6）共用。
+/// 场景事件 origin=director 与 manual 同为元层动作——重建不丢。
+fn switch_scene_at(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    proj: &event::Projection,
+    scene_id: &str,
+    origin: &str,
+    note: Option<String>,
+) -> Result<SceneView, String> {
     let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
-    let Some(sc) = proj.scenes.get(&scene_id) else {
+    let Some(sc) = proj.scenes.get(scene_id) else {
         return Err(format!("场景「{scene_id}」不存在"));
     };
     let (place, frozen) = (sc.place.clone(), sc.status == scene::STATUS_FROZEN);
     commit_scene(
-        &log,
-        &root,
-        &meta,
+        log,
+        root,
+        meta,
         event::SceneEvent {
             turn,
             op: "switch".into(),
-            scene_id: scene_id.clone(),
+            scene_id: scene_id.to_string(),
             scene: None,
             others: Vec::new(),
-            origin: "manual".into(),
+            origin: origin.into(),
             note: note.clone(),
             ts: store::unix_now(),
         },
@@ -3426,9 +3970,8 @@ pub fn switch_scene(
             format!("与此同时，{place}——")
         }
     });
-    append_transition(&log, &root, &meta, turn, &scene_id, &transition)
-        .map_err(|e| e.to_string())?;
-    Ok(scene_view(&sync_now(&log, &root, &meta)?))
+    append_transition(log, root, meta, turn, scene_id, &transition).map_err(|e| e.to_string())?;
+    Ok(scene_view(&sync_now(log, root, meta)?))
 }
 
 /// 分场（设计 §10.3：一部分角色离场另立场景，视角跟到新场景）
@@ -3498,8 +4041,22 @@ pub fn merge_scenes(
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
     let proj = project_session(&log, &root, &meta)?;
+    merge_scenes_at(&log, &root, &meta, &proj, &from, "manual", note)
+}
+
+/// 合场的内核（与 Tauri 无关）：manual（玩家，经确认对话框）与
+/// director（导演树的合场裁决，M3.6）共用。
+fn merge_scenes_at(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    proj: &event::Projection,
+    from: &[String],
+    origin: &str,
+    note: Option<String>,
+) -> Result<SceneView, String> {
     let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
-    let active = scene_ctx(&proj).ok_or("这个会话还没有场景可以合场")?;
+    let active = scene_ctx(proj).ok_or("这个会话还没有场景可以合场")?;
     if from.is_empty() {
         return Err("没有指定要并入哪些场景".into());
     }
@@ -3512,7 +4069,7 @@ pub fn merge_scenes(
         .cloned()
         .ok_or("当前聚焦场景不存在")?;
     let mut sources = Vec::new();
-    for id in &from {
+    for id in from {
         let sc = proj
             .scenes
             .get(id)
@@ -3524,30 +4081,30 @@ pub fn merge_scenes(
     let target = target.merge_into(&sources, ts);
     let place = target.place.clone();
     commit_scene(
-        &log,
-        &root,
-        &meta,
+        log,
+        root,
+        meta,
         event::SceneEvent {
             turn,
             op: "merge".into(),
             scene_id: active.clone(),
             scene: Some(target),
-            others: from.clone(),
-            origin: "manual".into(),
+            others: from.to_vec(),
+            origin: origin.into(),
             note: note.clone(),
             ts,
         },
     )?;
     append_transition(
-        &log,
-        &root,
-        &meta,
+        log,
+        root,
+        meta,
         turn,
         &active,
         &note.unwrap_or_else(|| format!("两条线在此交汇——{place}——")),
     )
     .map_err(|e| e.to_string())?;
-    Ok(scene_view(&sync_now(&log, &root, &meta)?))
+    Ok(scene_view(&sync_now(log, root, meta)?))
 }
 
 /// 编辑场景分区（地点/在场者/局部时钟/标题；flags 经黑板面板的场景视图维护）
@@ -3671,10 +4228,12 @@ pub fn open_thread(
 ) -> Result<serde_json::Value, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    open_thread_at(&log, &root, &meta, &title, &cause, &actors, importance)
+    open_thread_at(&log, &root, &meta, &title, &cause, &actors, importance, threads::ORIGIN_MANUAL)
 }
 
-/// 开线的内核（与 Tauri 无关，便于单测）
+/// 开线的内核（与 Tauri 无关，便于单测）。`origin` 标记动作来源
+/// （manual 玩家 / director 导演树——两者都是元层动作，重建不丢）。
+#[allow(clippy::too_many_arguments)]
 fn open_thread_at(
     log: &store::EventLog,
     root: &std::path::Path,
@@ -3683,6 +4242,7 @@ fn open_thread_at(
     cause: &str,
     actors: &[String],
     importance: Option<f32>,
+    origin: &str,
 ) -> Result<serde_json::Value, String> {
     let proj = project_session(log, root, meta)?;
     let board = blackboard_of(&proj);
@@ -3710,7 +4270,7 @@ fn open_thread_at(
             op: threads::OP_OPEN.into(),
             thread_id: id,
             thread: Some(snapshot.clone()),
-            origin: threads::ORIGIN_MANUAL.into(),
+            origin: origin.into(),
             note: None,
             ts: store::unix_now(),
         }),
@@ -3733,10 +4293,11 @@ pub fn resolve_thread(
 ) -> Result<serde_json::Value, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    resolve_thread_at(&log, &root, &meta, &id, &outcome, &tree_cache, &runtime)
+    resolve_thread_at(&log, &root, &meta, &id, &outcome, &tree_cache, &runtime, threads::ORIGIN_MANUAL)
 }
 
-/// 收线的内核（与 Tauri 无关，便于单测）
+/// 收线的内核（与 Tauri 无关，便于单测）。`origin` 标记动作来源
+/// （manual 玩家 / director 导演树——收线三件事对两者一视同仁）。
 #[allow(clippy::too_many_arguments)]
 fn resolve_thread_at(
     log: &store::EventLog,
@@ -3746,6 +4307,7 @@ fn resolve_thread_at(
     outcome: &str,
     tree_cache: &TreeCache,
     runtime: &SessionRuntime,
+    origin: &str,
 ) -> Result<serde_json::Value, String> {
     let character = first_character(meta)?;
     let loaded = card::load_card(root, &character).map_err(|e| e.to_string())?;
@@ -3803,7 +4365,7 @@ fn resolve_thread_at(
             op: threads::OP_RESOLVE.into(),
             thread_id: id.to_string(),
             thread: Some(snapshot.clone()),
-            origin: threads::ORIGIN_MANUAL.into(),
+            origin: origin.into(),
             note: Some(outcome.to_string()),
             ts: store::unix_now(),
         }),
@@ -3814,7 +4376,7 @@ fn resolve_thread_at(
         meta,
         LogBody::Memory(event::MemoryEvent {
             turn,
-            origin: threads::ORIGIN_MANUAL.into(),
+            origin: origin.into(),
             object: serde_json::to_value(&memory).map_err(|e| e.to_string())?,
             ts: store::unix_now(),
         }),
@@ -4028,8 +4590,18 @@ fn timeline_brief(record: &event::LogRecord) -> String {
                     None => format!("调度 → {}", who.join("、")),
                 }
             }
+            "cut" => format!("转场 → {}（{}）", d.direct.clone().unwrap_or_default(), clip(&d.note.clone().unwrap_or_default(), 30)),
+            "merge" => format!("合场裁决（{}）", clip(&d.note.clone().unwrap_or_default(), 40)),
             other => format!("{other}（{} 人）", d.picks.len()),
         },
+        LogBody::DirectorTree(t) => {
+            let from = if t.from.is_empty() {
+                "开场".to_string()
+            } else {
+                t.from.last().cloned().unwrap_or_default()
+            };
+            format!("剧情：{} → {}（{}）", from, t.to.last().cloned().unwrap_or_default(), clip(&t.reason, 40))
+        }
     }
 }
 
@@ -6404,6 +6976,7 @@ return {
             "玩家忘带借书卡，小雨破例让他先把书拿走，约定周五来还。",
             &["小雨".into(), "玩家".into()],
             Some(0.8),
+            threads::ORIGIN_MANUAL,
         )
         .unwrap();
         let id = snapshot["id"].as_str().unwrap().to_string();
@@ -6432,6 +7005,7 @@ return {
             "玩家如约还书，小雨送了张画着太阳的便签。",
             &cache,
             &runtime,
+            threads::ORIGIN_MANUAL,
         )
         .unwrap();
         assert_eq!(resolved["state"], "resolved");
@@ -6503,6 +7077,7 @@ state_tree = {
             "玩家忘带借书卡。",
             &["小雨".into()],
             Some(0.8),
+            threads::ORIGIN_MANUAL,
         )
         .unwrap();
 
@@ -6668,6 +7243,7 @@ return {
             "玩家忘带借书卡。",
             &["小雨".into()],
             Some(0.8),
+            threads::ORIGIN_MANUAL,
         )
         .unwrap();
         let cache = TreeCache::default();
@@ -6680,6 +7256,7 @@ return {
             "玩家如约还书。",
             &cache,
             &runtime,
+            threads::ORIGIN_MANUAL,
         )
         .unwrap();
         let proj = project_session(&log, &root, &meta).unwrap();
@@ -7363,15 +7940,24 @@ return {
             "借书卡的约定",
             &["小雨".to_string()],
             Some(0.6),
+            threads::ORIGIN_MANUAL,
         )
         .unwrap();
 
         // 收线 → 回流
         let tree_cache = TreeCache::default();
         let runtime = SessionRuntime::default();
-        let snapshot =
-            resolve_thread_at(&log, &root, &meta, "thread.周五还书", "玩家如约还了书", &tree_cache, &runtime)
-                .unwrap();
+        let snapshot = resolve_thread_at(
+            &log,
+            &root,
+            &meta,
+            "thread.周五还书",
+            "玩家如约还了书",
+            &tree_cache,
+            &runtime,
+            threads::ORIGIN_MANUAL,
+        )
+        .unwrap();
         assert_eq!(snapshot["state"], threads::STATE_RESOLVED);
 
         let psy = stored_state(&root, &meta)["psyche"].clone();
@@ -7569,4 +8155,288 @@ return {
             "重建后缺省场景分区仍不波及"
         );
     }
+
+    // ---------- M3.6 剧场模式与导演树（设计 §8.5/§10.5）----------
+
+    const XY_PLAIN: &str =
+        "return { spec='charcard/1.0', name='小雨', scenario='图书馆', personality='温柔', first_mes='（开场）' }";
+    const AC_PLAIN: &str =
+        "return { spec='charcard/1.0', name='阿澈', scenario='图书馆', personality='爽朗', first_mes='（入席）' }";
+
+    /// 跑一轮剧场轮（不发 LLM）：用户消息 + 发言人回复 + 生产同一份轮末推进
+    /// （finalize_turn：心理 → 状态树 → **剧场**；总结关闭）。
+    /// 发言人取当前场景的第一位在场者（生产里由导演打分选出，语义同构：只在本场景选人）。
+    fn theater_round(
+        root: &std::path::Path,
+        meta: &store::SessionMeta,
+        cast: &Cast,
+        log: &store::EventLog,
+        turn: u64,
+    ) {
+        let proj = project_session(log, root, meta).unwrap();
+        let scene = scene_ctx(&proj);
+        let speaker = present_members(cast, &proj, scene.as_deref())
+            .first()
+            .unwrap_or_else(|| panic!("第 {turn} 轮没有任何在场角色"))
+            .dir
+            .clone();
+        let mut msg = user_msg(turn, "（剧场继续）");
+        msg.scene_id = scene.clone();
+        log.append(root, &meta.id, LogBody::Message(msg)).unwrap();
+        let mut report =
+            commit_reply_core(root, meta, cast, &speaker, turn, "（回复）", None, log, scene.as_deref())
+                .unwrap();
+        finalize_turn(root, meta, cast, turn, log, None, None, None, scene.as_deref(), &mut report)
+            .unwrap();
+    }
+
+    fn theater_meta(budget: u32) -> Option<store::TheaterConfig> {
+        Some(store::TheaterConfig { budget, start_turn: 0 })
+    }
+
+    /// DoD 第 2 项（单测侧）：剧场自动跑 20 轮，完成至少一次**完整的开线→收线弧**——
+    /// 导演树起承转合走位齐全，导演开的线全部在「合」收束，转移历史可回放。
+    #[test]
+    fn theater_twenty_rounds_completes_a_full_arc() {
+        let (_dir, mut meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        meta.theater = theater_meta(20);
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+
+        for turn in 1..=20 {
+            theater_round(&root, &meta, &cast, &log, turn);
+        }
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+
+        // ① 起承转合走位齐全；第一条是开场播种（from 为空）
+        let stages: Vec<String> = proj
+            .director_tree
+            .iter()
+            .map(|e| e.to.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            stages,
+            vec!["起".to_string(), "承".to_string(), "转".to_string(), "合".to_string()],
+            "导演树应在 20 轮内走完四段：{:?}",
+            proj.director_tree
+        );
+        assert!(proj.director_tree[0].from.is_empty(), "第一条应是开场播种");
+        assert_eq!(proj.director_tree[0].reason, "剧场开场");
+
+        // ② 完整弧：起开主线、转开反转线（≥2 条导演开的线），且全部在合收束
+        let opened: Vec<&event::ThreadEvent> = proj
+            .thread_log
+            .iter()
+            .filter(|e| e.op == threads::OP_OPEN && e.origin == "director")
+            .collect();
+        assert!(
+            opened.len() >= 2,
+            "起与转各应开一条线：{:?}",
+            opened.iter().map(|e| e.thread_id.clone()).collect::<Vec<_>>()
+        );
+        for e in &opened {
+            let t = threads::Thread::from_value(&proj.threads[&e.thread_id]).unwrap();
+            assert_eq!(
+                t.state,
+                threads::STATE_RESOLVED,
+                "导演开的线「{}」应在合段收束",
+                e.thread_id
+            );
+            assert!(t.resolution.is_some(), "收线结果应落在线上");
+        }
+
+        // ③ 转移历史可回放：导演树事件不随消息级重建丢弃（元层动作）
+        let records = log.read(&root, &meta.id).unwrap();
+        let kept: Vec<LogRecord> = records.iter().filter(|r| !r.is_derived()).cloned().collect();
+        let tree_kept = kept.iter().filter(|r| matches!(r.body, LogBody::DirectorTree(_))).count();
+        assert_eq!(tree_kept, proj.director_tree.len(), "走位史全部保留（is_derived=false）");
+        let dir_threads_kept = kept
+            .iter()
+            .filter(|r| {
+                matches!(&r.body, LogBody::Thread(e) if e.origin == "director")
+            })
+            .count();
+        assert!(
+            dir_threads_kept >= opened.len() * 2,
+            "导演开/收线事件（origin=director）重建不丢：{dir_threads_kept}"
+        );
+    }
+
+    /// 交叉剪辑（设计 §10.5）：两路场景按节奏轮换推进，「合」段合场后归于一路；
+    /// 调度史（cut 事件）与切场事件（origin=director）落流可回放。
+    #[test]
+    fn intercut_rotates_between_two_scenes_and_merges_on_the_final_act() {
+        let (_dir, mut meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        meta.theater = theater_meta(20);
+        let log = store::EventLog::new();
+
+        // 分场：阿澈离场另立旧书店（手动事件，重放保留）
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let parent = proj.scenes[scene::DEFAULT_SCENE_ID].clone();
+        let ts = store::unix_now();
+        let (_rest, sc) = parent
+            .split_from("scene.b", "旧书店", "坡下的旧书店", &["阿澈".to_string()], ts)
+            .unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Scene(event::SceneEvent {
+                turn: 0,
+                op: "split".into(),
+                scene_id: "scene.b".into(),
+                scene: Some(sc),
+                others: vec![parent.id.clone()],
+                origin: "manual".into(),
+                note: None,
+                ts,
+            }),
+        )
+        .unwrap();
+
+        let cast = cast_of(&root, &meta);
+        for turn in 1..=20 {
+            theater_round(&root, &meta, &cast, &log, turn);
+        }
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+
+        // ① 交叉剪辑真的发生过：至少两次转场（节奏轮换），调度史带理由
+        let records = log.read(&root, &meta.id).unwrap();
+        let cuts: Vec<&event::DirectorEvent> = records
+            .iter()
+            .filter_map(|r| match &r.body {
+                LogBody::Director(d) if d.op == "cut" => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert!(cuts.len() >= 2, "两路场景应发生节奏轮换：{} 次", cuts.len());
+        assert!(
+            cuts.iter().all(|d| d.note.as_deref().map(|n| n.contains("交叉剪辑")).unwrap_or(false)),
+            "转场调度应记录缘由：{:?}",
+            cuts.iter().map(|d| d.note.clone()).collect::<Vec<_>>()
+        );
+        // 切场事件 origin=director（重建不丢），每次转场都有对应事件
+        let switch_events = records
+            .iter()
+            .filter(|r| {
+                matches!(&r.body, LogBody::Scene(s) if s.op == "switch" && s.origin == "director")
+            })
+            .count();
+        assert_eq!(switch_events, cuts.len(), "每次转场都有对应切场事件");
+
+        // ② 合段把两路并成一路：只剩一个 active 场景，另一路归档
+        let active: Vec<&String> = proj
+            .scenes
+            .iter()
+            .filter(|(_, sc)| sc.is_active())
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(active.len(), 1, "合场后只剩一路：{:?}", proj.scenes);
+        let merged = proj.scenes.values().filter(|sc| sc.status == scene::STATUS_MERGED).count();
+        assert_eq!(merged, 1, "被并入的场景归档留档");
+
+        // ③ 走位史仍然完整（交叉剪辑不打断起承转合）
+        let stages: Vec<String> = proj
+            .director_tree
+            .iter()
+            .map(|e| e.to.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            stages,
+            vec!["起".to_string(), "承".to_string(), "转".to_string(), "合".to_string()],
+            "多场景下的弧完整性：{:?}",
+            proj.director_tree
+        );
+    }
+
+    /// 会话模板声明导演树（sessions/<id>/director.lua）+ 窗口调度权：
+    /// 自定义树覆盖默认树，resurface 动作落 retune 事件（grade 调整），重建不丢。
+    #[test]
+    fn custom_director_tree_resurface_tunes_grade_and_survives_rebuild() {
+        let (_dir, mut meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        // 自定义树：起→承→合；承的 on_exit 把手动开的线往后压（延后）
+        std::fs::write(
+            store::session_dir(&root, &meta.id).join("director.lua"),
+            concat!(
+                "return { state_tree = {\n",
+                "  root = '起',\n",
+                "  states = {\n",
+                "    ['起'] = {\n",
+                "      transitions = { { to = '承', priority = 10,\n",
+                "        when = function(ev, bb, st) return st.stage_turns >= 1 end } },\n",
+                "    },\n",
+                "    ['承'] = {\n",
+                "      has_exit = true,\n",
+                "      on_exit = function(api) api.resurface('thread.周五还书', 'later') end,\n",
+                "      transitions = { { to = '合', priority = 10,\n",
+                "        when = function(ev, bb, st) return st.stage_turns >= 1 end } },\n",
+                "    },\n",
+                "    ['合'] = {\n",
+                "      has_enter = true,\n",
+                "      on_enter = function(api) api.resolve_threads(nil, '收。') end,\n",
+                "    },\n",
+                "  },\n",
+                "} }\n",
+            ),
+        )
+        .unwrap();
+        // 视图应报告自定义树
+        let log = store::EventLog::new();
+        let view = theater_view_of(&log, &root, &meta).unwrap();
+        assert!(view.custom_tree, "应识别会话自带的 director.lua");
+        assert_eq!(view.path, vec!["起".to_string()], "没开场时路径 = 树根");
+
+        // 手动开一条线（natural），剧场开着跑三轮：起 → 承 →（承 on_exit 调窗）合
+        meta.theater = theater_meta(20);
+        let cast = cast_of(&root, &meta);
+        open_thread_at(
+            &log,
+            &root,
+            &meta,
+            "周五还书",
+            "借书卡的约定",
+            &["小雨".to_string()],
+            Some(0.6),
+            threads::ORIGIN_MANUAL,
+        )
+        .unwrap();
+        for turn in 1..=3 {
+            theater_round(&root, &meta, &cast, &log, turn);
+        }
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let stages: Vec<String> = proj
+            .director_tree
+            .iter()
+            .map(|e| e.to.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(stages, vec!["起".to_string(), "承".to_string(), "合".to_string()]);
+        // 调窗生效：grade 降到 dormant，但线**不被**收束（manual 开的线不动）
+        let t = threads::Thread::from_value(&proj.threads["thread.周五还书"]).unwrap();
+        assert_eq!(t.resurface.grade, threads::GRADE_DORMANT, "延后 = dormant");
+        assert_eq!(t.state, threads::STATE_ACTIVE, "导演收束只动自己开的线");
+        // retune 事件落流（origin=director）
+        assert!(
+            log.read(&root, &meta.id)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(&r.body, LogBody::Thread(e) if e.op == threads::OP_RETUNE && e.origin == "director")),
+            "调窗应落 retune 事件"
+        );
+
+        // 重建（丢派生、保留元层动作）后：走位史与调窗结果原样
+        let records = log.read(&root, &meta.id).unwrap();
+        let kept: Vec<LogRecord> = records.iter().filter(|r| !r.is_derived()).cloned().collect();
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &kept, 1).unwrap();
+        log.rewrite(&root, &meta.id, &rebuilt).unwrap();
+        let proj2 = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(
+            proj.director_tree, proj2.director_tree,
+            "走位史重建不丢、不翻倍"
+        );
+        let t2 = threads::Thread::from_value(&proj2.threads["thread.周五还书"]).unwrap();
+        assert_eq!(t2.resurface.grade, threads::GRADE_DORMANT, "调窗结果重建保留");
+    }
+
 }

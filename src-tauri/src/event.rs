@@ -242,6 +242,24 @@ pub struct DirectorEvent {
     pub ts: u64,
 }
 
+/// 导演树阶段转移事件（M3.6 · 设计 §8.5/§10.5）：起承转合的推进落流，回放可重现。
+///
+/// 与调度事件同理：阶段转移是**元层的动作**，不是消息的派生结果——消息级重建
+/// 永远保留它们。折叠进 `Projection.director_tree`（按序追加），当前活跃路径 =
+/// 最后一条的 `to`（没有事件时 = 树根）；转移历史即整棵树的走位记录，
+/// 供「进度指示」与导演面板回放。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectorTreeEvent {
+    pub turn: u64,
+    /// 转移前的活跃路径（根→叶）；剧场开场播种时为空
+    pub from: Vec<String>,
+    /// 转移后的活跃路径（根→叶）
+    pub to: Vec<String>,
+    /// 转移理由（求值命中的 when 描述，给人读）
+    pub reason: String,
+    pub ts: u64,
+}
+
 /// 事件体（messages.jsonl 一行去掉 seq 与 kind 之后的部分）
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogBody {
@@ -256,6 +274,7 @@ pub enum LogBody {
     Memory(MemoryEvent),
     Scene(SceneEvent),
     Director(DirectorEvent),
+    DirectorTree(DirectorTreeEvent),
 }
 
 impl From<Message> for LogBody {
@@ -284,6 +303,7 @@ impl LogBody {
             LogBody::Memory(_) => "memory",
             LogBody::Scene(_) => "scene",
             LogBody::Director(_) => "director",
+            LogBody::DirectorTree(_) => "director_tree",
         }
     }
 
@@ -301,6 +321,7 @@ impl LogBody {
             LogBody::Memory(m) => m.turn,
             LogBody::Scene(s) => s.turn,
             LogBody::Director(d) => d.turn,
+            LogBody::DirectorTree(d) => d.turn,
         }
     }
 
@@ -318,6 +339,7 @@ impl LogBody {
             LogBody::Memory(m) => serde_json::to_value(m),
             LogBody::Scene(s) => serde_json::to_value(s),
             LogBody::Director(d) => serde_json::to_value(d),
+            LogBody::DirectorTree(d) => serde_json::to_value(d),
         }
         .map_err(|e| format!("事件序列化失败：{e}"))?;
         if let Some(obj) = v.as_object_mut() {
@@ -350,6 +372,9 @@ impl LogBody {
             "memory" => serde_json::from_value(v).map(LogBody::Memory).map_err(bad),
             "scene" => serde_json::from_value(v).map(LogBody::Scene).map_err(bad),
             "director" => serde_json::from_value(v).map(LogBody::Director).map_err(bad),
+            "director_tree" => {
+                serde_json::from_value(v).map(LogBody::DirectorTree).map_err(bad)
+            }
             other => Err(format!("未知事件类型：{other}")),
         }
     }
@@ -391,7 +416,10 @@ impl LogRecord {
             LogBody::Message(_) => false,
             LogBody::Effect(_) | LogBody::Transition(_) => true,
             LogBody::Blackboard(b) => b.reason == "clock" || b.reason == "hook",
-            LogBody::Thread(t) => t.origin != "manual",
+            // 线事件：manual 是玩家手动动作；director 是导演树的调度动作（M3.6）——
+            // 两者都是元层动作，重建不重跑导演，必须原样保留。
+            // pipeline / psyche 由重建时的同一份管线代码重演（转述/心里话消费走重放路径）。
+            LogBody::Thread(t) => t.origin != "manual" && t.origin != "director",
             // 只有**状态树**的揭示算派生（重建时会由 advance_state_tree 重导）；
             // 总结管线转述带来的揭示（M3.3 · §10.4，origin = pipeline）是模型产物——
             // 与它伴随写入的转述记忆同理，重放不重新调用模型，编辑历史不得丢弃。
@@ -400,11 +428,13 @@ impl LogRecord {
             // 所以它们永远保留（编辑历史只重算状态/转移/心理，设计 §7.3-5 的承诺范围）。
             // 场景事件同理：切场/分场/合场是玩家/导演的动作，不从消息派生。
             // 导演调度同理（M3.4）：调度史是元层的动作记录，重建不得抹掉。
+            // 导演树阶段转移同理（M3.6）：起承转合的走位史，重建保留。
             LogBody::Summary(_)
             | LogBody::Proposal(_)
             | LogBody::Memory(_)
             | LogBody::Scene(_)
-            | LogBody::Director(_) => false,
+            | LogBody::Director(_)
+            | LogBody::DirectorTree(_) => false,
         }
     }
 
@@ -534,6 +564,9 @@ pub struct Projection {
     pub scene_summaries: BTreeMap<String, String>,
     /// 摘要水位（场景维度）：场景 id → 已总结到哪一轮（批次按场景取）
     pub summary_upto_of: BTreeMap<String, u64>,
+    /// 导演树走位史（M3.6 · 设计 §8.5）：起承转合的阶段转移按序追加；
+    /// 当前活跃路径 = 最后一条的 to（空 = 还没开场，用树根）
+    pub director_tree: Vec<DirectorTreeEvent>,
     pub last_seq: Seq,
 }
 
@@ -886,6 +919,9 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
         LogBody::Scene(s) => fold_scene(p, s),
         // 导演调度只决定谁说话，不产生任何会话状态（设计 §10.5「输出只有调度动作」）
         LogBody::Director(_) => {}
+        // 导演树阶段转移（M3.6）：按序追加——当前活跃路径 = 最后一条的 to，
+        // 转移历史即起承转合的走位记录（进度指示与导演面板的数据源）
+        LogBody::DirectorTree(t) => p.director_tree.push(t.clone()),
     }
 }
 

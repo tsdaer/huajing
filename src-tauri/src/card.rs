@@ -32,6 +32,7 @@ use std::rc::Rc;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, StdLib, Table, Value, VmState};
 use serde::{Deserialize, Serialize};
 
+use crate::director::DirectorAction;
 use crate::psyche;
 use crate::store::Message;
 
@@ -1017,6 +1018,118 @@ pub fn card_has_state_hook(source: &str, state_id: &str, kind: &str) -> bool {
         return false;
     };
     find_state_hook(&table, state_id, kind).is_some()
+}
+
+/// 导演树的沙箱 api（M3.6）：只暴露**调度动作**的收集口（设计 §10.5「输出只产生调度动作」）。
+///
+/// 与角色卡 api 的分野即「导演是元层」：没有 state / memory / blackboard（导演不碰任何
+/// 角色的私有状态），也没有 schedule_say；只有开线 / 收线 / 调窗 / 合场四个动作，
+/// 全部只收集不执行——执行与落盘在宿主（commands.rs 的 advance_theater）。
+fn make_director_api(lua: &Lua, actions: &Rc<RefCell<Vec<DirectorAction>>>) -> Table {
+    let api = lua.create_table().expect("create api");
+
+    // api.open_thread { title=?, cause=?, actors=?, importance=? }
+    let log = Rc::clone(actions);
+    let open_fn = lua
+        .create_function(move |lua, tbl: Option<Table>| {
+            let (title, cause, actors, importance) = match tbl {
+                Some(t) => {
+                    let title = t.get::<String>("title").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                    let cause = t.get::<String>("cause").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                    let actors = match t.get::<Value>("actors") {
+                        Ok(Value::Nil) | Err(_) => None,
+                        Ok(v) => {
+                            let list: Vec<String> = lua.from_value(v).unwrap_or_default();
+                            let list: Vec<String> =
+                                list.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                            if list.is_empty() { None } else { Some(list) }
+                        }
+                    };
+                    let importance = t.get::<f32>("importance").ok();
+                    (title, cause, actors, importance)
+                }
+                None => (None, None, None, None),
+            };
+            log.borrow_mut().push(DirectorAction::OpenThread { title, cause, actors, importance });
+            Ok(())
+        })
+        .expect("api.open_thread");
+    let _ = api.set("open_thread", open_fn);
+
+    // api.resolve_threads(thread_id?, outcome?)：不带 id = 收束导演开的全线
+    let log = Rc::clone(actions);
+    let resolve_fn = lua
+        .create_function(move |_, (thread_id, outcome): (Option<String>, Option<String>)| {
+            let outcome = outcome.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            log.borrow_mut().push(DirectorAction::ResolveThreads { thread_id, outcome });
+            Ok(())
+        })
+        .expect("api.resolve_threads");
+    let _ = api.set("resolve_threads", resolve_fn);
+
+    // api.resurface(thread_id, "earlier" | "later")：窗口调度权（设计 §8.5）
+    let log = Rc::clone(actions);
+    let resurface_fn = lua
+        .create_function(move |_, (thread_id, direction): (String, String)| {
+            let id = thread_id.trim().to_string();
+            let dir = direction.trim().to_string();
+            if id.is_empty() {
+                return Err(mlua::Error::runtime("api.resurface 需要非空的线 id"));
+            }
+            if dir != "earlier" && dir != "later" {
+                return Err(mlua::Error::runtime(
+                    "api.resurface 的方向只认 \"earlier\"（提前）或 \"later\"（延后）",
+                ));
+            }
+            log.borrow_mut().push(DirectorAction::Resurface { thread_id: id, direction: dir });
+            Ok(())
+        })
+        .expect("api.resurface");
+    let _ = api.set("resurface", resurface_fn);
+
+    // api.merge_scenes()：其余活跃场景并入聚焦场景
+    let log = Rc::clone(actions);
+    let merge_fn = lua
+        .create_function(move |_, ()| {
+            log.borrow_mut().push(DirectorAction::MergeScenes);
+            Ok(())
+        })
+        .expect("api.merge_scenes");
+    let _ = api.set("merge_scenes", merge_fn);
+    api
+}
+
+/// 跑导演树的一个状态钩子（M3.6）：收集 [`DirectorAction`] 列表，其余一概不产生。
+///
+/// 与 [`run_state_hook_full`] 同一套沙箱与错误边界：抛错/死循环只进日志，不外抛；
+/// 卡上没有这个钩子 → 空列表（不 panic）。导演树没有 state 可改——钩子签名
+/// `function(api)`，宿主只取动作列表。
+pub fn run_director_hook(source: &str, state_id: &str, kind: &str) -> (Vec<DirectorAction>, Vec<String>) {
+    let mut logs: Vec<String> = Vec::new();
+    let lua = match new_sandbox() {
+        Ok(l) => l,
+        Err(e) => {
+            logs.push(format!("沙箱初始化失败：{e}"));
+            return (Vec::new(), logs);
+        }
+    };
+    let table = match eval_card(&lua, source) {
+        Ok(t) => t,
+        Err(e) => {
+            logs.push(format!("导演树脚本执行失败：{e}"));
+            return (Vec::new(), logs);
+        }
+    };
+    let Some(hook) = find_state_hook(&table, state_id, kind) else {
+        return (Vec::new(), logs); // 没这个钩子：正常静默
+    };
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let api = make_director_api(&lua, &actions);
+    if let Err(e) = hook.call::<()>(api) {
+        logs.push(format!("导演树钩子「{state_id}.{kind}」执行失败：{e}"));
+    }
+    let collected = actions.borrow().clone();
+    (collected, logs)
 }
 
 /// 从卡里取 `state_tree.states[state_id][kind]`（只认函数；取不到一律 None）

@@ -74,6 +74,8 @@ pub fn run() {
             commands::merge_scenes,
             commands::update_scene,
             commands::set_max_speakers,
+            commands::set_theater,
+            commands::theater_view,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,

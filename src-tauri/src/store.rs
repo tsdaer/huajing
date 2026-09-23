@@ -258,6 +258,16 @@ pub fn list_personas(root: &Path) -> StoreResult<Vec<Persona>> {
 
 // ---------- sessions/（设计 §12：session.json + messages.jsonl + state.json + blackboard.json）----------
 
+/// 剧场模式配置（M3.6 · 设计 §10.5）：自动轮次的轮数预算与起点。
+///
+/// `budget` = 本场戏的轮数预算（目标函数「限定轮数内完成完整的开线→收线弧」的轮数）；
+/// `start_turn` = 开场时的最后轮次（进度 = 当前轮 − start_turn）。None = 剧场关闭。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TheaterConfig {
+    pub budget: u32,
+    pub start_turn: u64,
+}
+
 /// 会话元数据（session.json）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -280,6 +290,10 @@ pub struct SessionMeta {
     /// 对冲隔离模式的请求成本）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_speakers: Option<u32>,
+    /// 剧场模式（M3.6 · 设计 §10.5：自动轮次 + 导演树起承转合 + 交叉剪辑）；
+    /// None = 关闭。导演树本体住在 sessions/<id>/director.lua（缺省用内置起承转合树）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theater: Option<TheaterConfig>,
 }
 
 /// 事件流里的一条消息（M2.0 起 messages.jsonl 是类型化事件流，
@@ -471,6 +485,7 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         seed: seed_now(),
         premise: req.premise.clone(),
         max_speakers: None,
+        theater: None,
     };
     let dir = session_dir(root, &meta.id);
     std::fs::create_dir_all(&dir)?;

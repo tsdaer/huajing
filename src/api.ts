@@ -23,6 +23,7 @@ import type {
   SessionMeta,
   Settings,
   StreamEvent,
+  TheaterView,
   TimelineEntry,
 } from "./types";
 
@@ -158,6 +159,13 @@ export const api = {
   /** 配置每轮发言数上限（M3.4 群聊 · 导演调度的限流旋钮；0 = 恢复缺省 2） */
   setMaxSpeakers: (sessionId: string, maxSpeakers: number) =>
     invoke<number>("set_max_speakers", { sessionId, maxSpeakers }),
+
+  // ---------- 剧场模式（M3.6 · 设计 §10.5：自动轮次 + 导演树起承转合 + 交叉剪辑） ----------
+  /** 剧场视图（进度指示：当前阶段 / 已用与剩余轮数） */
+  theaterView: (sessionId: string) => invoke<TheaterView>("theater_view", { sessionId }),
+  /** 开/关剧场模式（on 时给轮数预算，缺省 20） */
+  setTheater: (sessionId: string, on: boolean, budget?: number) =>
+    invoke<TheaterView>("set_theater", { sessionId, on, budget }),
 
   /** 角色私有 state 现状（卡内状态面板） */
   getCardState: (sessionId: string) => invoke<Record<string, unknown>>("get_card_state", { sessionId }),

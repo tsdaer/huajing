@@ -13,6 +13,7 @@ import type {
   SceneView,
   SessionMeta,
   StreamEvent,
+  TheaterView,
   TimelineEntry,
 } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
@@ -294,6 +295,39 @@ async function setMaxSpeakers(n: number) {
   } catch (e) {
     error.value = String(e);
   }
+}
+
+// ---------- 剧场模式（M3.6 · 设计 §10.5）：自动轮次 + 导演树进度 ----------
+const theater = ref<TheaterView | null>(null);
+/** 剧场推进轮的用户位提示词：固定的中性拍点，与草稿互不干扰 */
+const THEATER_CONTINUE = "（剧场继续）";
+
+async function refreshTheater() {
+  try {
+    theater.value = await api.theaterView(props.meta.id);
+  } catch {
+    /* 剧场视图读取失败不阻塞聊天 */
+  }
+}
+
+/** 开/关剧场。开启后立刻从当前轮次起自动跑（预算内） */
+async function setTheater(on: boolean) {
+  error.value = "";
+  try {
+    theater.value = await api.setTheater(props.meta.id, on);
+    if (on) void autoAdvance();
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+/** 剧场自动轮次：导演调度接话。导演可能刚切场，先对齐聚焦场景再推进 */
+async function autoAdvance() {
+  if (generating.value) return;
+  const t = theater.value;
+  if (!t?.on || t.used >= t.budget) return;
+  await loadScenes();
+  await sendText(THEATER_CONTINUE);
 }
 
 /** 输入框占位（随发言权模式变化） */
@@ -586,6 +620,7 @@ async function loadAll() {
     page.value = pageCount.value; // 打开会话时停在最新一页
     void refreshInspector();
     void refreshCard();
+    void refreshTheater();
     void scrollToBottom();
     // 气泡署名用卡片显示名；读取失败退回目录名
     api
@@ -650,8 +685,15 @@ async function saveBlackboard() {
 async function send() {
   const content = draft.value.trim();
   if (!content || generating.value) return;
-  error.value = "";
   draft.value = "";
+  resetComposerHeight();
+  await sendText(content);
+}
+
+/** 发送一段文本并流式接收（手动输入与剧场自动轮次共用） */
+async function sendText(content: string) {
+  if (!content || generating.value) return;
+  error.value = "";
   resetComposerHeight();
   generating.value = true;
   streams.value = [];
@@ -767,6 +809,13 @@ async function finishGeneration(final: StreamEvent) {
   scheduleNote.value = "";
   void refreshInspector();
   void refreshCard();
+  // 剧场模式：刷新进度，预算内自动推进下一轮（出错/用户手动停止就停在原地）
+  const cancelled = final.event === "done" && final.cancelled;
+  if (theater.value?.on) {
+    await refreshTheater();
+    const t = theater.value;
+    if (!error.value && !cancelled && t?.on && t.used < t.budget) void autoAdvance();
+  }
   // 刚聊完一轮：状态树/剧情线/心理/宫殿多半都变了，抽屉开着就顺手重拉（设计 §8/§9 的「面板可查」）
   if (panel.value === "inspector") {
     void loadInspector();
@@ -1122,6 +1171,33 @@ watch(cardGeneration, () => {
           </div>
         </div>
 
+        <!-- 剧场模式条（M3.6 · 设计 §10.5）：导演树阶段 + 轮数预算进度 -->
+        <div
+          v-if="theater?.on"
+          class="flex flex-none flex-wrap items-center gap-2 border-t border-base-300 px-3 py-1.5 text-xs"
+        >
+          <span class="flex-none font-medium tracking-wide text-primary">剧场</span>
+          <span class="flex-none text-base-content/80">「{{ theater.path[theater.path.length - 1] || "…" }}」</span>
+          <span class="min-w-0 flex-1 truncate text-base-content/45" :title="theater.stage_directive">
+            {{ theater.stage_directive }}
+          </span>
+          <progress
+            class="progress progress-primary w-24 flex-none"
+            :value="theater.used"
+            :max="theater.budget || 1"
+            aria-label="剧场进度"
+          ></progress>
+          <span class="flex-none text-base-content/45">{{ theater.used }}/{{ theater.budget }} 轮</span>
+          <button
+            class="btn btn-ghost btn-xs flex-none"
+            :disabled="generating"
+            data-tip="停掉自动轮次（已走到的阶段保留）"
+            @click="setTheater(false)"
+          >
+            收棚
+          </button>
+        </div>
+
         <!-- 输入区：daisyUI textarea + 圆形发送键；多角色时带发言权选择（M3.4 · 设计 §10.5） -->
         <form class="flex-none border-t border-base-300 p-3" @submit.prevent="send">
           <div v-if="speakers.length > 1" class="mb-2 flex flex-wrap items-center gap-1.5">
@@ -1195,6 +1271,15 @@ watch(cardGeneration, () => {
           <p class="mt-2 mb-0 flex flex-wrap items-center gap-1.5 text-[11px] text-base-content/45">
             <kbd class="kbd kbd-xs">Enter</kbd> 发送 ·
             <kbd class="kbd kbd-xs">Shift</kbd>+<kbd class="kbd kbd-xs">Enter</kbd> 换行
+            <button
+              v-if="!theater?.on"
+              class="btn btn-ghost btn-xs ml-auto"
+              :disabled="generating"
+              data-tip="剧场模式：导演树起承转合自动跑一轮数预算（缺省 20 轮），多场景时交叉剪辑"
+              @click="setTheater(true)"
+            >
+              <Icon name="play" :size="13" />剧场
+            </button>
           </p>
         </form>
       </section>

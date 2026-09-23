@@ -85,6 +85,8 @@ pub const OP_ESCALATE: &str = "escalate";
 pub const OP_RESOLVE: &str = "resolve";
 /// 事件 op：放弃。
 pub const OP_ABANDON: &str = "abandon";
+/// 事件 op：导演调窗（M3.6 窗口调度权：grade 提前/延后；快照整体覆盖，与折叠规则一致）。
+pub const OP_RETUNE: &str = "retune";
 
 /// 事件来源：玩家手动。
 pub const ORIGIN_MANUAL: &str = "manual";

@@ -221,6 +221,150 @@ pub fn plan_speakers(q: &SpeechQuery) -> Vec<Pick> {
     scored
 }
 
+// ---------- 剧场模式与导演树（M3.6 · 设计 §8.5/§10.5）----------
+
+/// 导演树钩子（on_enter / on_exit）产出的**调度动作**（设计 §10.5「输出只产生调度动作」）。
+///
+/// 动作由 card.rs 的导演沙箱 api 收集，宿主（commands.rs 的 advance_theater）逐条执行并
+/// 落成事件：开/收线 → ThreadEvent（origin=director）、resurface → ThreadEvent（op=retune）、
+/// 合场 → SceneEvent（origin=director）。全部是元层动作，绝不进入任何角色的上下文。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum DirectorAction {
+    /// 开线（起 / 转）。字段全部可选——缺省由宿主补：标题取在场者最强的未外化意图，
+    /// 没有意图用「主线」；在场者 = 当前场景成员；重要度缺省 0.7
+    OpenThread {
+        title: Option<String>,
+        cause: Option<String>,
+        actors: Option<Vec<String>>,
+        importance: Option<f32>,
+    },
+    /// 收线（合）。`thread_id` 为空 = 收束**导演自己开的**全部活跃线
+    /// （不动管线/心理外化的线——那些有自己的生命周期）
+    ResolveThreads {
+        thread_id: Option<String>,
+        outcome: Option<String>,
+    },
+    /// 窗口调度权（设计 §8.5「提前/延后 resurface 作为节奏工具」）：
+    /// earlier = grade 升到 eager（角色很想找机会说），later = 降到 dormant（暂不进窗口）
+    Resurface { thread_id: String, direction: String },
+    /// 合场裁决：其余活跃场景并入聚焦场景（交叉剪辑的收束拍）
+    MergeScenes,
+}
+
+/// 默认导演树（M3.6 内置）：起承转合四段控一条完整的开线→收线弧。
+///
+/// 会话目录没有 director.lua 时用它——剧场模式开箱即跑。判据全部来自宿主注入的
+/// 合成 state 表：`st.turns_left`（预算余量）/ `st.stage_turns`（本段已走轮数）/
+/// `st.threads_active`（活跃线 id 列表）。预算压力（priority 90）保证小预算也能走完弧：
+/// 目标函数「限定轮数内完成完整的开线→收线弧」由 `turns_left` 阈值兑现。
+pub const DEFAULT_DIRECTOR_LUA: &str = r#"
+-- 默认导演树：起承转合（M3.6 内置；会话目录放 director.lua 可整树替换）
+return {
+  state_tree = {
+    root = "起",
+    states = {
+      ["起"] = {
+        directive = "起：铺陈日常与人物，让张力自然登场。",
+        has_enter = true,
+        on_enter = function(api)
+          -- 开一条主线：标题缺省取在场者最强的未外化意图
+          api.open_thread {}
+        end,
+        transitions = {
+          { to = "承", priority = 10,
+            when = function(ev, bb, st)
+              return st.stage_turns >= 3 and #st.threads_active > 0
+            end },
+          { to = "承", priority = 90,
+            when = function(ev, bb, st) return st.turns_left <= 6 end },
+        },
+      },
+      ["承"] = {
+        directive = "承：让线在对话里生长，铺垫但不急收。",
+        transitions = {
+          { to = "转", priority = 10,
+            when = function(ev, bb, st) return st.stage_turns >= 5 end },
+          { to = "转", priority = 90,
+            when = function(ev, bb, st) return st.turns_left <= 4 end },
+        },
+      },
+      ["转"] = {
+        directive = "转：主动制造反转，一条新线搅进局面。",
+        has_enter = true,
+        on_enter = function(api)
+          api.open_thread {
+            title = "意外",
+            cause = "剧场转段：突如其来的变数搅进局面",
+            importance = 0.8,
+          }
+        end,
+        transitions = {
+          { to = "合", priority = 10,
+            when = function(ev, bb, st) return st.stage_turns >= 3 end },
+          { to = "合", priority = 90,
+            when = function(ev, bb, st) return st.turns_left <= 3 end },
+        },
+      },
+      ["合"] = {
+        directive = "合：收束各线，场景归一，余韵收尾。",
+        has_enter = true,
+        on_enter = function(api)
+          -- 先并场再收线：大家回到同一舞台把话说完
+          api.merge_scenes()
+          api.resolve_threads(nil, "剧场收束：剧情走到了合的段落，各条线有了交代。")
+        end,
+      },
+    },
+  },
+}
+"#;
+
+/// 交叉剪辑的节奏常量：同一场景连续推进 [`INTERCUT_CADENCE`] 轮后换下一路（设计 §10.5）。
+/// 多场景轮换让「与此同时」的两路都有戏份；进入「合」段合场后只剩一路，轮换自然停止。
+pub const INTERCUT_CADENCE: u32 = 3;
+
+/// 交叉剪辑（intercut）的打分输入（设计 §10.5「多场景间自动切换推进」）。
+pub struct IntercutQuery<'a> {
+    /// 可推进的场景（调用方已过滤归档；冻结的分路算——切回即解冻），按折叠序
+    pub scenes: &'a [String],
+    /// 当前聚焦场景
+    pub current: &'a str,
+    /// 当前场景已连续推进的剧场轮数
+    pub rounds_in_current: u32,
+    /// 连续推进多少轮后切场（会话级节奏旋钮；传 0 = 用缺省 [`INTERCUT_CADENCE`]）
+    pub cadence: u32,
+}
+
+/// 交叉剪辑的一步决策：留在当前场景，或切到下一路。
+///
+/// 纯函数（与 plan_speakers 同纪律）：同样的输入必得同样的决策。轮换按可推进场景的
+/// 折叠序循环（A→B→A→B…），保证每一路都有固定戏份；合场不由这里决定——
+/// 它是导演树「合」段的显式动作（[`DirectorAction::MergeScenes`]），时机由树掌管。
+pub fn plan_cut(q: &IntercutQuery) -> CutDecision {
+    let cadence = if q.cadence == 0 { INTERCUT_CADENCE } else { q.cadence };
+    if q.scenes.len() <= 1 || q.rounds_in_current < cadence {
+        return CutDecision::Stay;
+    }
+    // 轮换：当前场景之后的第一路（循环）；找不到（异常输入）就留守
+    let at = q.scenes.iter().position(|s| s == q.current);
+    let n = q.scenes.len();
+    for step in 1..=n {
+        if let Some(to) = at.map(|i| q.scenes[(i + step) % n].clone()) {
+            if to != q.current {
+                return CutDecision::Cut { to };
+            }
+        }
+    }
+    CutDecision::Stay
+}
+
+/// 交叉剪辑的一步决策结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CutDecision {
+    Stay,
+    Cut { to: String },
+}
+
 // ---------- 单测 ----------
 
 #[cfg(test)]
@@ -400,5 +544,110 @@ mod tests {
             max_speakers: 0, // 退化配置也至少给一人（不冷场的下限）
         };
         assert_eq!(plan(&q).len(), 1);
+    }
+
+    // ---------- M3.6 剧场模式与导演树 ----------
+
+    use crate::statetree::StateTree;
+
+    fn active_of(source: &str) -> Vec<String> {
+        let tree = StateTree::from_value(&crate::card::state_tree_shape(source).unwrap())
+            .expect("默认导演树应能解析");
+        tree.active_path(&tree.root)
+    }
+
+    /// 剧场一步：在给定路径与环境下求值默认树，返回命中的转移目标（无则 None）
+    fn step(path: &[&str], turns_left: i64, stage_turns: i64, threads: &[&str]) -> Option<String> {
+        let active: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        let env = crate::card::TreeEnv {
+            event: "theater:turn_end".into(),
+            state: serde_json::json!({
+                "turn": 10,
+                "turns_left": turns_left,
+                "stage_turns": stage_turns,
+                "threads_active": threads,
+            }),
+            threads_active: threads.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        crate::card::eval_state_tree(DEFAULT_DIRECTOR_LUA, &active, &env)
+            .expect("默认树求值不应失败")
+            .map(|d| d.to)
+    }
+
+    #[test]
+    fn default_director_tree_parses_and_walks_the_four_act_arc() {
+        let tree = StateTree::from_value(&crate::card::state_tree_shape(DEFAULT_DIRECTOR_LUA).unwrap())
+            .expect("默认导演树应能解析");
+        assert!(tree.validate().is_empty(), "默认树不应有结构问题：{:?}", tree.validate());
+        let path = tree.active_path(&tree.root);
+        assert_eq!(path, vec!["起".to_string()]);
+
+        // 起：线未开 / 轮数不足都留守；线已开且满三轮 → 承
+        assert_eq!(step(&["起"], 20, 1, &[]), None);
+        assert_eq!(step(&["起"], 20, 3, &["thread.主线"]), Some("承".into()));
+        // 预算压力也能推（turns_left ≤ 6，即使线还没开）
+        assert_eq!(step(&["起"], 6, 1, &[]), Some("承".into()));
+
+        // 承：满五轮 → 转；预算紧 → 转
+        assert_eq!(step(&["起", "承"], 20, 4, &["thread.主线"]), None);
+        assert_eq!(step(&["起", "承"], 20, 5, &["thread.主线"]), Some("转".into()));
+        assert_eq!(step(&["起", "承"], 4, 1, &[]), Some("转".into()));
+
+        // 转：满三轮 → 合；预算见底 → 合
+        assert_eq!(step(&["转"], 20, 2, &[]), None);
+        assert_eq!(step(&["转"], 20, 3, &[]), Some("合".into()));
+        assert_eq!(step(&["转"], 3, 1, &[]), Some("合".into()));
+
+        // 合：终段，无转移（收束在 on_enter 里完成）
+        assert_eq!(step(&["合"], 20, 9, &["thread.主线"]), None);
+    }
+
+    #[test]
+    fn default_tree_hooks_declare_the_arc_actions() {
+        // 起段进场开线、转段进场开反转线、合段进场并场收线——钩子的存在性是结构承诺
+        assert!(crate::card::card_has_state_hook(DEFAULT_DIRECTOR_LUA, "起", "on_enter"));
+        assert!(crate::card::card_has_state_hook(DEFAULT_DIRECTOR_LUA, "转", "on_enter"));
+        assert!(crate::card::card_has_state_hook(DEFAULT_DIRECTOR_LUA, "合", "on_enter"));
+        assert!(!crate::card::card_has_state_hook(DEFAULT_DIRECTOR_LUA, "承", "on_enter"));
+    }
+
+    #[test]
+    fn intercut_rotates_scenes_after_cadence_and_stays_single_scene() {
+        let scenes = vec!["scene.a".to_string(), "scene.b".to_string()];
+        // 未满节奏轮数：留守
+        let q = IntercutQuery {
+            scenes: &scenes,
+            current: "scene.a",
+            rounds_in_current: INTERCUT_CADENCE - 1,
+            cadence: 0,
+        };
+        assert_eq!(plan_cut(&q), CutDecision::Stay);
+        // 满了：轮换到下一路
+        let q = IntercutQuery { rounds_in_current: INTERCUT_CADENCE, ..q };
+        assert_eq!(plan_cut(&q), CutDecision::Cut { to: "scene.b".into() });
+        // 从 b 再轮换回 a（循环）
+        let q = IntercutQuery { current: "scene.b", ..q };
+        assert_eq!(plan_cut(&q), CutDecision::Cut { to: "scene.a".into() });
+        // 单场景 / 空场景：无交叉剪辑可言
+        let solo = vec!["scene.a".to_string()];
+        let q = IntercutQuery { scenes: &solo, ..q };
+        assert_eq!(plan_cut(&q), CutDecision::Stay);
+        let none: Vec<String> = Vec::new();
+        let q = IntercutQuery { scenes: &none, ..q };
+        assert_eq!(plan_cut(&q), CutDecision::Stay);
+        // 会话级节奏旋钮（cadence 覆盖）
+        let q = IntercutQuery { rounds_in_current: 2, cadence: 2, ..q };
+        let scenes2 = vec!["scene.a".to_string(), "scene.b".to_string()];
+        let q = IntercutQuery { scenes: &scenes2, current: "scene.a", ..q };
+        assert_eq!(plan_cut(&q), CutDecision::Cut { to: "scene.b".into() });
+    }
+
+    #[test]
+    fn active_of_reads_the_default_tree_root() {
+        assert_eq!(active_of(DEFAULT_DIRECTOR_LUA), vec!["起".to_string()]);
+        // 自定义树（会话模板覆盖缺省）：同样的机制读 root
+        let custom = r#"return { state_tree = { root = "开端", states = { ["开端"] = {} } } }"#;
+        assert_eq!(active_of(custom), vec!["开端".to_string()]);
     }
 }

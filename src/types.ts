@@ -80,6 +80,32 @@ export interface SessionMeta {
   premise?: string | null;
   /** 每轮发言数上限（M3.4 群聊；缺省 = 2，0 视为恢复缺省） */
   max_speakers?: number | null;
+  /** 剧场模式（M3.6：自动轮次 + 导演树；null = 关闭） */
+  theater?: TheaterConfig | null;
+}
+
+/** 剧场模式配置（M3.6 · 设计 §10.5） */
+export interface TheaterConfig {
+  /** 轮数预算（目标：预算内完成完整的开线→收线弧） */
+  budget: number;
+  /** 开场时的最后轮次（进度 = 当前轮 − start_turn） */
+  start_turn: number;
+}
+
+/** 剧场模式视图（theater_view · 进度指示与自动轮次的数据源） */
+export interface TheaterView {
+  on: boolean;
+  budget: number;
+  /** 已走掉的剧场轮数 */
+  used: number;
+  start_turn: number;
+  last_turn: number;
+  /** 导演树当前活跃路径（根→叶） */
+  path: string[];
+  /** 当前阶段的导演指令（这一幕该是什么调子） */
+  stage_directive: string;
+  /** 用的是会话自带的 director.lua（false = 内置起承转合树） */
+  custom_tree: boolean;
 }
 
 /** messages.jsonl 中的一行 */

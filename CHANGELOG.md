@@ -8,6 +8,43 @@
 
 ### Added
 
+- **M3.6 剧场模式与导演树（设计 §8.5/§10.5）——起承转合控节奏，交叉剪辑控场面，目标函数是「预算内走完一条完整的开线→收线弧」**：
+  - **导演树（会话级状态机，Lua 走卡沙箱）**：与卡内状态树同一套机制——`sessions/<id>/director.lua`
+    声明 `state_tree`（剧本包 v0 形态），缺省用**内置起承转合树**：起（铺陈 + 开线）→
+    承（生长）→ 转（主动制造反转线）→ 合（并场收束）。判据环境是导演专属的合成
+    state 表：`turns_left`（预算余量）/ `stage_turns`（本段已走轮数）/ `threads_active`
+    ——**小预算也能走完弧**由 `turns_left` 阈值的预算压力转移保证（目标函数的兑现形式）
+  - **调度动作白名单**：导演树钩子（on_enter/on_exit）只有四个动作——`api.open_thread`/
+    `api.resolve_threads`/`api.resurface`/`api.merge_scenes`，全部只收集不执行，宿主逐条
+    落事件：开/收线走线的生命周期（origin=director，**与 manual 同为元层动作、重建不丢**，
+    收线三件事——结果记忆/线事件/驱动角色状态树——对导演收线一视同仁）；resurface 落
+    retune 事件（**窗口调度权**：earlier = grade 升 eager 很想找机会说，later = 降 dormant
+    先放着别提）；合场走场景内核（origin=director）。开线缺省标题取**在场者最强的未外化
+    意图**——主线从角色心里长出来，不凭空杜撰；收束只动导演自己开的线（管线/心理外化的
+    线有各自的生命周期）
+  - **阶段转移落流（第 12 类事件 `DirectorTreeEvent`）**：from/to 路径 + 理由，折叠进
+    `Projection.director_tree`（当前活跃路径 = 最后一条的 to），is_derived=false——
+    **起承转合的走位史回放可重现**；剧场开场先「播种」进树根（跑 on_enter 并落第一条
+    走位事件），当轮不再求值转移（刚进的状态站得住一轮）
+  - **交叉剪辑（intercut）**：宿主侧确定性轮换——同一场景连续推进 3 轮（`INTERCUT_CADENCE`）
+    后切下一路（候选 = 全部未归档场景，冻结的分路可被切回——切回即解冻，§10.3「剧场模式
+    下可由导演继续自动推进」）；每次转场先落 `director` 事件（op=cut，记缘由）再切场
+    （origin=director，带「与此同时——」过渡插页）。**合场时机由树掌管**（合段的
+    `api.merge_scenes` 把全部分路收回），轮换在只剩一路后自然停止
+  - **剧场模式 UI**：会话内「剧场」一键开跑（`set_theater`，轮数预算缺省 20、记开场轮次进
+    session.json）——剧场条显示当前阶段、导演指令与 `used/budget` 轮进度，可随时「收棚」；
+    预算内每轮结束自动推进下一轮（前端循环，中性拍点「（剧场继续）」与草稿互不干扰），
+    导演切场后自动对齐聚焦场景；`theater_view` 命令返回进度/阶段/是否自定义树
+  - **单测钉死（DoD 第 2 项单测侧，真机归 M3.11 收口）**：
+    `theater_twenty_rounds_completes_a_full_arc`（20 轮内起承转合走位齐全 + 导演开的线全部
+    在合收束且结果记忆进宫殿 + 走位史/导演线事件重建不丢）、
+    `intercut_rotates_between_two_scenes_and_merges_on_the_final_act`（分场后两路按节奏轮换
+    ≥2 次、合段并成一路归档另一路、弧完整性不受交叉剪辑影响）、
+    `custom_director_tree_resurface_tunes_grade_and_survives_rebuild`（director.lua 覆盖默认树
+    + 调窗落 retune 事件 + 延后=dormant 且导演收束不动 manual 线 + 重建不丢不翻倍）；
+    director.rs 另有默认树四段求值预算压力、intercut 轮换节奏、钩子声明四例。
+    累计 354 例单测 + `pnpm build` 双绿
+
 - **M3.5 主动消息与意图动态（设计 §9.2）——意志从内隐到外显的完整闭环，每一步可溯源**：
   - **`api.schedule_say(text)` 接线（§3.1 声明至此落地）**：卡在 hooks 里说一句
     「让她下一轮主动发消息」——心里话进**卡私有 state 的 psyche.scheduled 队列**
