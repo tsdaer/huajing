@@ -18,6 +18,7 @@ import type {
   PromptAssembly,
   Provider,
   ProviderTest,
+  ResolvePreview,
   RuntimeInfo,
   SceneView,
   SessionMeta,
@@ -25,6 +26,7 @@ import type {
   StreamEvent,
   TheaterView,
   TimelineEntry,
+  WorldlineView,
 } from "./types";
 
 export type NewSessionOptions = {
@@ -166,6 +168,15 @@ export const api = {
   /** 开/关剧场模式（on 时给轮数预算，缺省 20） */
   setTheater: (sessionId: string, on: boolean, budget?: number) =>
     invoke<TheaterView>("set_theater", { sessionId, on, budget }),
+
+  // ---------- 世界主线与世界时钟（M3.7 · 设计 §6.6） ----------
+  /** 世界主线视图（检查器「世界」面板：阶段 / 世界时钟 / 世界级线） */
+  worldlineView: (sessionId: string) => invoke<WorldlineView>("worldline_view", { sessionId }),
+  /** 手动校准世界时钟（flashback 布景 / 纠偏；只认 ≥1 的天数） */
+  worldSetClock: (world: string, day: number) => invoke<number>("world_set_clock", { world, day }),
+  /** 设定史变的解析预览（第 N 天的事实；day 缺省 = 会话当前故事天） */
+  codexResolvePreview: (sessionId: string, day?: number) =>
+    invoke<ResolvePreview>("codex_resolve_preview", { sessionId, day }),
 
   /** 角色私有 state 现状（卡内状态面板） */
   getCardState: (sessionId: string) => invoke<Record<string, unknown>>("get_card_state", { sessionId }),

@@ -13,12 +13,14 @@ import type {
   Persona,
   PromptAssembly,
   Provider,
+  ResolvePreview,
   Scene,
   SceneView,
   SessionMeta,
   Settings,
   StreamEvent,
   TheaterView,
+  WorldlineView,
 } from "./types";
 
 const sessionId = "20260919-101500-000";
@@ -519,6 +521,59 @@ export function setupMock() {
           custom_tree: false,
         };
         return mockTheaterView;
+      }
+      // ---------- 世界主线与世界时钟（M3.7 · 设计 §6.6）：浏览器 mock 只做视图示意 ----------
+      case "worldline_view":
+        return {
+          configured: true,
+          id: "worldline.图书馆拆迁",
+          premise: "老图书馆月底拆除，所有人都在倒数。",
+          path: ["传闻期", "公告期"],
+          stage: "公告期",
+          stage_directive: "公告已贴出，空气里有告别的味道；各角色心怀不同的盘算。",
+          era: "公告期——公告已贴出，空气里有告别的味道…",
+          world_day: 20,
+          session_day: blackboard.day,
+          world_threads: [
+            {
+              id: "thread.最后一个月",
+              title: "最后一个月",
+              cause: "世界大势：闭馆倒计时开始。",
+              state: "active",
+              scope: "world",
+            },
+          ],
+          updated_by: "mock-session",
+        } satisfies WorldlineView;
+      case "world_set_clock":
+        return (a as unknown as { day: number }).day;
+      case "codex_resolve_preview": {
+        const day = (a as unknown as { day?: number }).day ?? blackboard.day;
+        return {
+          day,
+          entities: [
+            {
+              id: "char.小雨",
+              name: "小雨",
+              type: "char",
+              status: "canon",
+              lifecycle: { status: "active", present: true },
+              versions: [
+                { from_day: 15, facet: "one_liner", value: "剪了短发的小雨。", note: "第15天剪发", active: day >= 15 },
+              ],
+              one_liner: day >= 15 ? "剪了短发的小雨。" : "长发的小雨。",
+            },
+            {
+              id: "place.旧书店",
+              name: "旧书店",
+              type: "place",
+              status: "retired",
+              lifecycle: { status: "active", present: true },
+              versions: [],
+              one_liner: "已经关门的旧书店。",
+            },
+          ],
+        } satisfies ResolvePreview;
       }
       // 记忆检查器（M2.8）：形状与 commands.rs 的 inspector_data 对齐，
       // 让浏览器调试路径也能看到 M2 的七个面板（数据是示意值，不参与对话逻辑）。

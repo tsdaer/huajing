@@ -28,7 +28,8 @@ const form = reactive({
   /** 群聊阵容（M3.1）：勾选的目录名；空 = 只用主角色 */
   extra: [] as string[],
   persona: "",
-  day: 1,
+  /** 第几天（M3.7：空 = 从世界时钟出发，回写是 max 不会拉低世界） */
+  day: null as number | null,
   clock: "",
   place: "",
   premise: "",
@@ -159,7 +160,14 @@ async function create() {
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="label" for="new-day">第几天</label>
-              <input id="new-day" class="input input-sm w-full" v-model.number="form.day" type="number" min="1" />
+              <input
+                id="new-day"
+                class="input input-sm w-full"
+                v-model.number="form.day"
+                type="number"
+                min="1"
+                placeholder="续接世界时钟"
+              />
             </div>
             <div>
               <label class="label" for="new-clock">时间（HH:MM）</label>

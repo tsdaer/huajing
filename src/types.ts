@@ -108,6 +108,52 @@ export interface TheaterView {
   custom_tree: boolean;
 }
 
+/** 世界主线视图（worldline_view · M3.7 · 设计 §6.6：检查器「世界」面板的数据源） */
+export interface WorldlineView {
+  /** 这个世界配了 worldline.lua（false = 可选层缺席，其余字段为空档） */
+  configured: boolean;
+  id: string;
+  /** 世界级起因（新会话三问的世界版） */
+  premise: string;
+  /** 当前活跃路径（根→叶） */
+  path: string[];
+  /** 当前阶段名 */
+  stage: string;
+  /** 当前阶段的 directive（B2 世界段的同一份数据） */
+  stage_directive: string;
+  /** B1 时代行（「公告期——公告已贴出…」） */
+  era: string;
+  /** 世界时钟（world.json 持久；会话轮末 max 回写） */
+  world_day: number;
+  /** 本会话的故事时钟 */
+  session_day: number;
+  /** 世界级线（scope=world；含声明未开的占位 state=declared） */
+  world_threads: Array<Record<string, unknown>>;
+  /** 世界时钟最近由谁推进（溯源） */
+  updated_by?: string | null;
+}
+
+/** 设定史变的解析预览（codex_resolve_preview · M3.7 · 设计 §6.5：第 N 天的事实） */
+export interface ResolvePreview {
+  day: number;
+  entities: ResolvePreviewEntity[];
+}
+
+/** 单个实体在指定故事天的解析切片（retired 留档照常列出） */
+export interface ResolvePreviewEntity {
+  id: string;
+  name: string;
+  type: string;
+  /** canon | draft | retired */
+  status: string;
+  /** { status, at_day, in_effect, present, note } */
+  lifecycle: Record<string, unknown>;
+  /** [{ from_day, facet, value, note, active }] */
+  versions: Array<Record<string, unknown>>;
+  /** 按 day 解析出的一句话简介 */
+  one_liner: string;
+}
+
 /** messages.jsonl 中的一行 */
 export interface Message {
   turn: number;

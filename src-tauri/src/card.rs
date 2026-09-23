@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::director::DirectorAction;
 use crate::psyche;
 use crate::store::Message;
+use crate::worldline::WorldlineAction;
 
 /// 沙箱载入的标准库（无 os/io/package/debug/ffi/jit；luajit 的 coroutine 随 base 载入）
 fn sandbox_libs() -> StdLib {
@@ -1143,6 +1144,193 @@ fn find_state_hook(table: &Table, state_id: &str, kind: &str) -> Option<Function
     }
 }
 
+// ---------- 世界主线（M3.7 · 设计 §6.6）：stages 糖 → state_tree 的归一化沙箱入口 ----------
+
+/// 归一化脚本：把设计 §6.6 的 `stages` 列表糖折成 `state_tree`——世界主线与世界级
+/// 状态树（导演树/角色状态树）同一套引擎，零新代码。三件事：
+/// ① 直接声明 `state_tree` 的写法（剧本包形态）原样透传；
+/// ② 声明式 `when = { day = N }` → `function(ev, bb, st) return st.day >= N end`
+///    （判据 `st.day` 是宿主注入的**世界时钟**；缺省恒真——线性弧逐段自然推进）；
+/// ③ 声明式 `on_enter = { reveal = …, open_thread = … }` → 调 worldline api 收集动作的函数
+///    （函数式 on_enter 原样保留）。
+const WORLDLINE_NORM_LUA: &str = r#"
+return function(wl)
+  if type(wl) ~= "table" then return {} end
+  local out = { id = wl.id, premise = wl.premise, world_threads = wl.world_threads }
+  if type(wl.state_tree) == "table" then
+    out.state_tree = wl.state_tree
+    return out
+  end
+  local stages = type(wl.stages) == "table" and wl.stages or {}
+  local states = {}
+  local n = #stages
+  for i = 1, n do
+    local s = stages[i]
+    if type(s.id) == "string" or type(s.id) == "number" then
+      local node = {}
+      if type(s.directive) == "string" then node.directive = s.directive end
+      if i > 1 then node.parent = stages[i - 1].id end
+      local enter = s.on_enter
+      if type(enter) == "function" then
+        node.on_enter = enter
+      elseif type(enter) == "table" then
+        node.on_enter = function(api)
+          if type(enter.reveal) == "table" then
+            for _, r in ipairs(enter.reveal) do api.reveal(r) end
+          elseif type(enter.reveal) == "string" then
+            api.reveal(enter.reveal)
+          end
+          if type(enter.open_thread) == "string" then
+            api.open_thread({ id = enter.open_thread })
+          elseif type(enter.open_thread) == "table" then
+            api.open_thread(enter.open_thread)
+          end
+        end
+      end
+      if type(s.on_exit) == "function" then node.on_exit = s.on_exit end
+      if i < n then
+        local nxt = stages[i + 1]
+        local cond = nxt.when
+        local hit
+        if type(cond) == "function" then
+          hit = cond
+        else
+          local day = (type(cond) == "table" and type(cond.day) == "number") and cond.day or nil
+          hit = function(_ev, _bb, st)
+            if day == nil then return true end
+            return (st.day or 0) >= day
+          end
+        end
+        node.transitions = { { to = nxt.id, priority = 10, when = hit } }
+      end
+      states[tostring(s.id)] = node
+    end
+  end
+  out.state_tree = { root = tostring(stages[1] and stages[1].id or ""), states = states }
+  return out
+end
+"#;
+
+/// worldline.lua 的归一化形态：包一层适配器，让「stages 列表糖」与「直接声明
+/// `state_tree`」两种写法归一到同一张表——转移求值（[`eval_state_tree`]）、结构提取
+/// （[`worldline_shape`]）与阶段钩子（[`run_worldline_hook`]）都吃这一份。
+/// 用户脚本在适配器内执行一次，when/on_enter 的闭包在归一化产物里保持可用。
+pub fn worldline_canonical(source: &str) -> String {
+    format!(
+        "local __norm = (function()\n{WORLDLINE_NORM_LUA}\nend)()\nreturn __norm((function()\n{source}\nend)())"
+    )
+}
+
+/// worldline.lua 的结构与元信息（设计 §6.6）：`{ id, premise, world_threads: [...],
+/// state_tree: <state_tree_shape 形态> }`。没有阶段弧的声明 → `state_tree.root` 为空串，
+/// 宿主按「无主线」处理——worldline 是可选层，坏文件也不该停摆整个世界。
+pub fn worldline_shape(source: &str) -> Result<serde_json::Value, String> {
+    let canonical = worldline_canonical(source);
+    let lua = new_sandbox().map_err(|e| format!("沙箱初始化失败：{e}"))?;
+    let table = eval_card(&lua, &canonical).map_err(|e| format!("worldline.lua 执行失败：{e}"))?;
+    let shape = match table.get::<Value>("state_tree") {
+        Ok(Value::Table(t)) => {
+            let extract: Function = lua
+                .load(SHAPE_TREE_LUA)
+                .set_name("worldline.shape")
+                .eval()
+                .map_err(|e| format!("结构提取脚本装载失败：{e}"))?;
+            let pure: Table = extract
+                .call(t)
+                .map_err(|e| format!("worldline 结构提取失败：{e}"))?;
+            shape_from_pure(&pure)?
+        }
+        _ => empty_shape(),
+    };
+    Ok(serde_json::json!({
+        "id": table.get::<String>("id").unwrap_or_default(),
+        "premise": table.get::<String>("premise").unwrap_or_default(),
+        "world_threads": table.get::<Vec<String>>("world_threads").unwrap_or_default(),
+        "state_tree": shape,
+    }))
+}
+
+/// 世界主线的沙箱 api（M3.7）：只暴露**世界层动作**的收集口（设计 §6.6「阶段转移可
+/// reveal 世界设定 + 开世界级线」）。主线是世界层元层：没有 state / memory / blackboard
+/// ——它不碰任何角色的私有状态；只有揭示与开世界级线两个动作，全部只收集不执行，
+/// 执行与落盘在宿主（commands.rs 的 advance_worldline）。
+fn make_worldline_api(lua: &Lua, actions: &Rc<RefCell<Vec<WorldlineAction>>>) -> Table {
+    let api = lua.create_table().expect("create api");
+
+    // api.reveal("rule.拆迁公告") 或 api.reveal({ "rule.a", "rule.b" })
+    let log = Rc::clone(actions);
+    let reveal_fn = lua
+        .create_function(move |lua, target: Value| {
+            let mut targets: Vec<String> = match &target {
+                Value::String(s) => vec![s.to_string_lossy().to_string()],
+                _ => lua.from_value(target).unwrap_or_default(),
+            };
+            targets.retain(|s| !s.trim().is_empty());
+            if !targets.is_empty() {
+                log.borrow_mut().push(WorldlineAction::Reveal { targets });
+            }
+            Ok(())
+        })
+        .expect("api.reveal");
+    let _ = api.set("reveal", reveal_fn);
+
+    // api.open_thread { id=?, title=?, cause=?, importance=? }：开世界级线（scope=world）
+    let log = Rc::clone(actions);
+    let open_fn = lua
+        .create_function(move |_, tbl: Option<Table>| {
+            let (id, title, cause, importance) = match tbl {
+                Some(t) => {
+                    let id = t.get::<String>("id").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                    let title = t.get::<String>("title").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                    let cause = t.get::<String>("cause").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                    let importance = t.get::<f32>("importance").ok();
+                    (id, title, cause, importance)
+                }
+                None => (None, None, None, None),
+            };
+            log.borrow_mut().push(WorldlineAction::OpenThread { id, title, cause, importance });
+            Ok(())
+        })
+        .expect("api.open_thread");
+    let _ = api.set("open_thread", open_fn);
+    api
+}
+
+/// 跑世界主线的一个阶段钩子（M3.7）：收集 [`WorldlineAction`] 列表，其余一概不产生。
+/// 与 [`run_director_hook`] 同一套沙箱与错误边界：抛错/死循环只进日志，不外抛；
+/// `source` 必须是 [`worldline_canonical`] 的产物；钩子签名 `function(api)`，无 state 可改。
+pub fn run_worldline_hook(
+    source: &str,
+    stage_id: &str,
+    kind: &str,
+) -> (Vec<WorldlineAction>, Vec<String>) {
+    let mut logs: Vec<String> = Vec::new();
+    let lua = match new_sandbox() {
+        Ok(l) => l,
+        Err(e) => {
+            logs.push(format!("沙箱初始化失败：{e}"));
+            return (Vec::new(), logs);
+        }
+    };
+    let table = match eval_card(&lua, source) {
+        Ok(t) => t,
+        Err(e) => {
+            logs.push(format!("worldline 脚本执行失败：{e}"));
+            return (Vec::new(), logs);
+        }
+    };
+    let Some(hook) = find_state_hook(&table, stage_id, kind) else {
+        return (Vec::new(), logs); // 没这个钩子：正常静默
+    };
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let api = make_worldline_api(&lua, &actions);
+    if let Err(e) = hook.call::<()>(api) {
+        logs.push(format!("世界主线钩子「{stage_id}.{kind}」执行失败：{e}"));
+    }
+    let collected = actions.borrow().clone();
+    (collected, logs)
+}
+
 /// 取某个状态的声明式数据（directive/recall/reveal）与整棵树的结构，供宿主注入与面板使用。
 ///
 /// 返回 JSON：`{ root, states: { id: { parent, directive, recall: [...], reveal: [...],
@@ -1561,8 +1749,7 @@ return {
         assert_eq!(cs.card.example_dialogue[0].tag.as_deref(), Some("平静"));
         assert_eq!(
             cs.hook_names,
-            vec!["on_context".to_string(), "on_message".to_string()]
-        );
+            vec!["on_context".to_string(), "on_message".to_string()]        );
         assert_eq!(cs.default_state["favorability"], 50);
     }
 
@@ -2598,5 +2785,95 @@ return {
         let plain = r#"return { name = "静卡", scenario = "s", personality = "p", first_mes = "f" }"#;
         assert!(!card_has_state_hook(plain, "日常", "on_enter"));
         assert!(!card_has_state_hook("return {", "日常", "on_enter"));
+    }
+
+    // ---------- 世界主线（M3.7 · 设计 §6.6）：stages 糖归一与钩子 api ----------
+
+    /// 设计 §6.6 的示例（压缩版）：声明式 when / 声明式 on_enter 都要被归一化吃掉
+    const WL_CARD: &str = r#"
+return {
+  id = "worldline.图书馆拆迁",
+  premise = "老图书馆月底拆除，所有人都在倒数。",
+  stages = {
+    { id = "传闻期", directive = "日常氛围。" },
+    { id = "公告期", when = { day = 20 },
+      directive = "公告已贴出。",
+      on_enter = { reveal = { "rule.拆迁公告" }, open_thread = "thread.最后一个月" } },
+  },
+  world_threads = { "thread.最后一个月" },
+}
+"#;
+
+    fn wl_env(day: i64) -> TreeEnv {
+        TreeEnv {
+            event: "worldline:turn_end".into(),
+            state: serde_json::json!({ "day": day, "stage_turns": 1 }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn worldline_shape_normalizes_stages_into_a_state_tree() {
+        let shape = worldline_shape(WL_CARD).expect("worldline 形状应能提取");
+        assert_eq!(shape["id"], "worldline.图书馆拆迁");
+        assert_eq!(shape["premise"], "老图书馆月底拆除，所有人都在倒数。");
+        assert_eq!(shape["world_threads"][0], "thread.最后一个月");
+        let tree = crate::statetree::StateTree::from_value(&shape["state_tree"])
+            .expect("归一化产物应是一棵合法状态树");
+        assert_eq!(tree.root, "传闻期");
+        let path = tree.active_path(&tree.root);
+        assert_eq!(path, vec!["传闻期".to_string()]);
+        // 公告期是传闻期的子节点（线性弧），directive 与钩子位都在
+        assert_eq!(tree.states["公告期"].parent.as_deref(), Some("传闻期"));
+        assert_eq!(tree.states["公告期"].directive.as_deref(), Some("公告已贴出。"));
+        assert!(tree.states["公告期"].has_enter, "声明式 on_enter 归一成函数");
+        assert_eq!(tree.states["公告期"].transitions.len(), 0, "末段无转移");
+        assert_eq!(tree.states["传闻期"].transitions.len(), 1, "向前一段的转移");
+    }
+
+    #[test]
+    fn worldline_transitions_judge_on_the_world_clock() {
+        let shape = worldline_shape(WL_CARD).unwrap();
+        let tree = crate::statetree::StateTree::from_value(&shape["state_tree"]).unwrap();
+        let canonical = worldline_canonical(WL_CARD);
+        let path = vec!["传闻期".to_string()];
+
+        // day=19 不过门槛，day=20（含当日）转移
+        let early = eval_state_tree(&canonical, &path, &wl_env(19)).unwrap();
+        assert!(early.is_none(), "第 19 天不该进公告期");
+        let decision = eval_state_tree(&canonical, &path, &wl_env(20)).unwrap();
+        let decision = decision.expect("第 20 天应转移");
+        assert_eq!(decision.to, "公告期");
+        // 活跃路径展开后父链正确（走位事件要记完整路径）
+        let to_path = tree.active_path(&decision.to);
+        assert_eq!(to_path, vec!["传闻期".to_string(), "公告期".to_string()]);
+    }
+
+    #[test]
+    fn worldline_hooks_collect_only_world_actions() {
+        let canonical = worldline_canonical(WL_CARD);
+        let (enter, logs) = run_worldline_hook(&canonical, "公告期", "on_enter");
+        assert!(logs.is_empty(), "钩子不应报错：{logs:?}");
+        assert_eq!(
+            enter,
+            vec![
+                crate::worldline::WorldlineAction::Reveal {
+                    targets: vec!["rule.拆迁公告".into()],
+                },
+                crate::worldline::WorldlineAction::OpenThread {
+                    id: Some("thread.最后一个月".into()),
+                    title: None,
+                    cause: None,
+                    importance: None,
+                },
+            ],
+            "声明式 on_enter（reveal + open_thread）归一成动作收集"
+        );
+        // 传闻期没有钩子：空列表，不 panic
+        let (none, _) = run_worldline_hook(&canonical, "传闻期", "on_enter");
+        assert!(none.is_empty());
+        // 没有阶段弧的声明 → root 为空串（宿主按「无主线」处理）
+        let bare = worldline_shape(r#"return { id = "x" }"#).unwrap();
+        assert_eq!(bare["state_tree"]["root"], "");
     }
 }

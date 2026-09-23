@@ -8,6 +8,54 @@
 
 ### Added
 
+- **M3.7 世界主线与世界时钟（设计 §6.6）——世界不随会话生灭：大势跨会话持久，压着所有角色**：
+  - **`worldline.rs`（纯数据与算法）+ `codex/<世界>/worldline.lua`（可选层）**：世界主线 =
+    **世界作用域的状态树**——与卡内状态树/M3.6 导演树同一套引擎，零新代码。设计 §6.6 的
+    `stages` 列表糖由 card.rs 沙箱内的归一化适配器折成 `state_tree`（声明式
+    `when = { day = N }` → 世界时钟判据函数；声明式 `on_enter = { reveal, open_thread }` →
+    动作收集函数；直接声明 `state_tree` 的剧本包写法原样透传）。**缺文件/坏文件回落
+    「无主线」**——纯日常世界照常运转，不让一个手滑的配置瘫痪整个世界
+  - **世界时钟持久（world.json）**：`codex/<世界>/world.json` 是世界级单例——故事天、
+    主线进度（路径 + 推进轮次 + 哪个会话推的）、世界级线快照、未知键原样保留（flatten）。
+    会话**轮末回写**（而非等「会话结束」）：`max(世界, 本会话最远场景)`——语义与结束回写
+    完全一致（max 单调）且崩溃/强退不丢；**多线并行不回退、flashback 会话不拉低**由
+    纯合并函数 `worldline::sync` 保证（时钟只增、进度只前进、线按 id upsert，单测钉死）。
+    新会话建会话表单不填天 = **开局基准取世界时钟**（显式填天 = flashback/指定时点）
+  - **阶段转移落流（第 13 类事件 `WorldlineEvent`）**：from/to 路径 + 理由，折叠进
+    `Projection.worldline`（当前活跃路径 = 最后一条的 to），is_derived=false——
+    **世界大势的走位史重建不丢**。会话首次轮末「承袭」世界进度落第一条走位事件，
+    **不重跑该阶段的 on_enter**（揭示/开线在推进到这里的会话里已经发生过，换会话不重演）；
+    三级回落定当前路径：会话走位史 → world.json 进度 → 树根
+  - **世界层动作白名单**：阶段钩子只有 `api.reveal(…)`（无见证者 = 全局知情——大势对
+    所有人可见）与 `api.open_thread { id/title/cause/importance }`（**世界级线
+    scope=world，没有 actor，任何会话可见可推进**；轮末回写 world.json，别的会话经
+    B1「心里有事」/C1 未决清单感知并接着推）两个动作——主线是世界层元层，
+    不碰任何角色的私有 state/memory/黑板
+  - **注入（大势压着小情绪）**：B1 现状卡新增「时代」行（「公告期——公告已贴出…」，
+    叶阶段 directive 摘要）；B2 指令层**世界段拼在角色 directive 之前**（世界是指令树
+    的超根）；无 worldline 的世界两项全无，注入与 M3.6 一字不差
+  - **导演树联动（M3.6 遗留清偿）**：判据环境补 `worldline_stage` 字段——「公告期不排
+    纯搞笑日常」写成 `st.worldline_stage == "公告期"` 一条 when 即可（树写法不变）；
+    母层查询子层，轮末主线先推进、剧场后求值
+  - **史变收尾（设计 §6.5）**：`codex_resolve_preview` 命令——按故事时钟回答
+    「第 N 天的事实」：versions 逐条标注在第 N 天是否生效、生命周期按生效时刻判定
+    （**flashback 回到生效前逝者仍在场**）、retired 留档照常列出（死亡是正史变更，
+    不是删除）；设定集面板新增「史变预览」区（天数控输入，缺省当前故事天）
+  - **UI**：检查器新增「世界」页签（主线阶段/时代行/世界时钟与会话时钟对照/校准入口/
+    世界级线含「大势将至」声明占位）；新建会话「第几天」可空（占位「续接世界时钟」）
+  - **单测钉死（DoD 第 6 项单测侧，真机归 M3.11 收口）**：
+    `worldline_stage_transition_reveals_opens_and_injects`（day 门槛转移 + 揭示全局知情 +
+    开世界级线 + B1 时代行/B2 世界段进注入 + world.json 双回写 + 走位史重建不丢）、
+    `world_state_persists_across_sessions_and_flashback_never_regresses`（新会话承袭阶段
+    与世界级线、承袭不重演 on_enter、flashback 拉不低时钟、更浅进度不覆盖世界）、
+    `without_worldline_the_world_still_runs_and_clocks_persist`（无主线零注入差异但时钟
+    照常回写）、`director_tree_judges_on_the_worldline_stage`（自定义导演树靠联动转段）、
+    `resolve_preview_serves_versions_and_lifecycle_by_story_clock`（第 10 天取旧版事实/
+    第 25 天取新版/生效前后在场判定/retired 留档）；worldline.rs 另有 sync 合并语义、
+    era 行渲染、树解析五例；card.rs 另有 stages 归一化、世界时钟判据（19 天不转 20 天
+    含当日转）、钩子动作收集三例。
+    累计 370 例单测 + `pnpm build` 双绿
+
 - **M3.6 剧场模式与导演树（设计 §8.5/§10.5）——起承转合控节奏，交叉剪辑控场面，目标函数是「预算内走完一条完整的开线→收线弧」**：
   - **导演树（会话级状态机，Lua 走卡沙箱）**：与卡内状态树同一套机制——`sessions/<id>/director.lua`
     声明 `state_tree`（剧本包 v0 形态），缺省用**内置起承转合树**：起（铺陈 + 开线）→

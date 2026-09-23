@@ -841,6 +841,37 @@ pub fn save_session(root: &Path, meta: &SessionMeta) -> StoreResult<()> {
     Ok(())
 }
 
+// ---------- 世界（M3.7 · 设计 §6.6/§12）：世界元信息、世界时钟与世界级线的持久化 ----------
+
+/// 世界状态文件：`codex/<世界>/world.json`。世界级单例——跨会话持久的时钟基准、
+/// 主线进度与世界级线都在这里；会话事件流只记「本会话见证的走位」。
+pub fn world_path(root: &Path, world: &str) -> PathBuf {
+    root.join("codex").join(world).join("world.json")
+}
+
+/// 读世界状态。缺文件 / 坏文件 = 缺省（第 1 天、无主线）——世界文件是可选层，
+/// 不该让任何会话停摆（与 director.lua 坏配置回落默认树同纪律）。
+pub fn load_world(root: &Path, world: &str) -> crate::worldline::WorldState {
+    std::fs::read_to_string(world_path(root, world))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 写世界状态（目录不存在则建；全量覆盖）
+pub fn save_world(
+    root: &Path,
+    world: &str,
+    state: &crate::worldline::WorldState,
+) -> StoreResult<()> {
+    let path = world_path(root, world);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(state)? + "\n")?;
+    Ok(())
+}
+
 fn seed_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

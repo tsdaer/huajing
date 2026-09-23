@@ -21,6 +21,7 @@ use crate::threads;
 use crate::llm::{self, Provider, StreamEvent};
 use crate::prompt;
 use crate::store::{self, Message, NewSessionRequest, Settings};
+use crate::worldline;
 
 #[tauri::command]
 pub fn app_info() -> serde_json::Value {
@@ -185,6 +186,10 @@ pub fn new_session(
     log: State<'_, store::EventLog>,
 ) -> Result<store::SessionMeta, String> {
     let root = root();
+    // 世界时钟基准（M3.7 · 设计 §6.6）：没有显式指定天就从世界时钟出发——
+    // 新会话开局即续上世界的大势（「各会话读取为开局基准」）；显式天 = 玩家指定的
+    // 时点（flashback 由此成立——回写是 max，更早的会话拉不低世界）
+    let day = baseline_day_from_world(&root, day);
     // 角色阵容（M3.1）：显式给的全量用（首个是主角色），没给就单角色——1v1 行为不变
     let mut cast = characters.unwrap_or_default();
     if !cast.contains(&character) {
@@ -1720,6 +1725,24 @@ fn assemble_prompt_core(
         .map(|t| t.recall_of(&active_path))
         .unwrap_or_default();
 
+    // ---- 世界主线（M3.7 · 设计 §6.6）：B1 时代行 + B2 世界段（大势压着小情绪）----
+    // 世界是会话的母层：阶段 directive 拼在角色 directive 之前，era 行进 B1 现状卡。
+    // 无 worldline 的世界两项全 None，注入与 M3.6 一字不差（可选层）
+    let world_name = session_world(meta);
+    let wl = load_worldline(root, &world_name);
+    let world_state = store::load_world(root, &world_name);
+    let wl_path = worldline_path_of(&wl, proj, &world_state);
+    let (world_directive, era): (Option<String>, Option<String>) = match &wl {
+        Some(w) if !wl_path.is_empty() => (
+            {
+                let d = w.tree.directive_of(&wl_path);
+                (!d.trim().is_empty()).then_some(d)
+            },
+            worldline::era_line(&w.tree, &wl_path),
+        ),
+        _ => (None, None),
+    };
+
     // ---- B3 设定集：别名扫描 → 五激活源 → 分级注入（设计 §6.3）----
     let world = session_world(meta);
     let cx = load_codex(root, codex_cache, &world);
@@ -1793,11 +1816,20 @@ fn assemble_prompt_core(
 
     // ---- B1 心里有事 / 了结未远 · C1 未决事项：剧情线（设计 §8.4/§8.5）----
     // 线本身由事件流持有（thread 事件带全量快照），这里只做「此刻能不能提」的确定性求值。
-    let thread_list: Vec<threads::Thread> = proj
+    let mut thread_list: Vec<threads::Thread> = proj
         .threads
         .values()
         .filter_map(|v| threads::Thread::from_value(v).ok())
         .collect();
+    // 世界级线并入（M3.7 · 设计 §6.6）：world.json 的存档线任何会话可见、可推进——
+    // 同 id 时以本会话自己的为准（那是活的推进记录）
+    for t in &world_state.threads {
+        if let Ok(t) = threads::Thread::from_value(t) {
+            if !proj.threads.contains_key(&t.id) {
+                thread_list.push(t);
+            }
+        }
+    }
     let thread_query = threads::ThreadQuery {
         turn,
         story_day: blackboard.day,
@@ -1888,6 +1920,8 @@ fn assemble_prompt_core(
         pending_threads: &pending,
         psyche_line: psyche_line.as_deref(),
         directive: directive.as_deref(),
+        world_directive: world_directive.as_deref(),
+        era: era.as_deref(),
         // 摘要分卷（M3.2 · 设计 §10.4）：世界层大事记 + 本场景分卷；别的场景不进这次请求
         summary: summary_text.as_deref(),
         cast_note: cast_note.as_deref(),
@@ -2597,12 +2631,25 @@ fn finalize_turn(
         }
     }
 
+    // 轮末：世界主线推进（M3.7 · 设计 §6.6）——阶段转移落 worldline 事件（重建保留），
+    // 世界层动作（reveal / 开世界级线）逐条执行。排在角色状态树之后、剧场之前：
+    // 导演树的判据可以查 `st.worldline_stage`（母层查询子层，得先走完这一步）
+    if let Err(e) = advance_worldline(root, meta, log, report) {
+        report.logs.push(format!("世界主线推进失败：{e}"));
+    }
+
     // 轮末：剧场模式（M3.6）——导演树起承转合推进 + 交叉剪辑切场。
     // 只在剧场开着时进；全部动作落事件流（与重放同路径，可回放）
     if meta.theater.is_some() {
         if let Err(e) = advance_theater(root, meta, cast, log, tree_cache, runtime, report) {
             report.logs.push(format!("剧场推进失败：{e}"));
         }
+    }
+
+    // 轮末：世界回写（M3.7）——world.json 取 max(世界, 本会话)，多线并行不回退、
+    // flashback 不拉低。在轮末连续做而非等「会话结束」：max 单调，语义等价且崩溃不丢
+    if let Err(e) = sync_world_now(root, meta, log) {
+        report.logs.push(format!("世界回写失败：{e}"));
     }
 
     // 轮末异步总结（消息已滑出 L0 窗口时才真的干活；不阻塞本轮返回）
@@ -2878,6 +2925,16 @@ fn advance_theater(
     let scene = scene_ctx(&proj);
     let (source, tree, _custom) = load_director_tree(root, &meta.id);
 
+    // 母层查询子层（M3.7 联动 · 设计 §6.6）：主线阶段进导演判据环境——
+    // 「公告期不排纯搞笑日常」写成 `st.worldline_stage == "公告期"` 即可（树写法不变）
+    let world_name = session_world(meta);
+    let wl = load_worldline(root, &world_name);
+    let world_state = store::load_world(root, &world_name);
+    let worldline_stage = worldline_path_of(&wl, &proj, &world_state)
+        .last()
+        .cloned()
+        .unwrap_or_default();
+
     // 判据环境：state 槽放**合成表**——轮次预算与阶段时长是导演树专属判据
     // （角色状态树不看这些）；threads 判据集与角色树同源
     let threads_active: Vec<String> = proj
@@ -2907,6 +2964,7 @@ fn advance_theater(
             "stage_turns": stage_turns,
             "threads_active": threads_active,
             "scenes_active": proj.scenes.values().filter(|s| s.is_active()).count(),
+            "worldline_stage": worldline_stage,
         }),
         threads_active: threads_active.iter().cloned().collect(),
         ..Default::default()
@@ -3301,6 +3359,511 @@ fn theater_view_of(
         path,
         custom_tree: custom,
     })
+}
+
+// ---------- 世界主线与世界时钟（M3.7 · 设计 §6.6）----------
+
+/// 世界时钟基准（new_session 的内核，可单测）：显式天优先；没有显式天就从世界时钟
+/// 出发（世界还没走过第 1 天 = None，保持建会话缺省——没有 world.json 时行为不变）。
+fn baseline_day_from_world(root: &std::path::Path, day: Option<i64>) -> Option<i64> {
+    match day {
+        Some(d) => Some(d),
+        None => {
+            let w = store::load_world(root, "default");
+            (w.day > 1).then_some(w.day)
+        }
+    }
+}
+
+/// 世界主线视图（检查器「世界」面板的数据源）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorldlineView {
+    /// 这个世界配了 worldline.lua（false = 可选层缺席，其余字段为空档）
+    pub configured: bool,
+    pub id: String,
+    pub premise: String,
+    /// 当前活跃路径（根→叶）：会话走位史最后一条 → world.json 进度 → 树根
+    pub path: Vec<String>,
+    /// 当前阶段名（活跃路径的叶）
+    pub stage: String,
+    /// 当前阶段的 directive（根→叶拼接；B2 世界段的同一份数据）
+    pub stage_directive: String,
+    /// B1 时代行（「公告期——公告已贴出…」）
+    pub era: String,
+    /// 世界时钟（world.json 持久；会话轮末 max 回写）
+    pub world_day: i64,
+    /// 本会话的故事时钟（聚焦场景的局部天）
+    pub session_day: i64,
+    /// 世界级线（scope=world，任何会话可推进；本会话未见的从 world.json 并入）
+    pub world_threads: Vec<serde_json::Value>,
+    /// 世界时钟最近由谁推进（溯源）
+    pub updated_by: Option<String>,
+}
+
+/// 世界主线的加载（M3.7 ·「Lua 走卡沙箱」，与 load_director_tree 同纪律）：
+/// `codex/<世界>/worldline.lua` 可选——缺文件 = 无主线（纯日常世界照常运转）；
+/// 坏文件回落 None 并留诊断，不让一个手滑的配置瘫痪整个世界。
+/// 每次现读（与导演树同款：文件很小，重解析成本可忽略；改文件即生效）。
+pub(crate) fn load_worldline(
+    root: &std::path::Path,
+    world: &str,
+) -> Option<std::sync::Arc<worldline::Worldline>> {
+    let source = std::fs::read_to_string(world_path_of(root, world))
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    match card::worldline_shape(&source)
+        .and_then(|shape| worldline::Worldline::from_shape(&shape, card::worldline_canonical(&source)))
+    {
+        Ok(wl) => {
+            for warning in wl.tree.validate() {
+                crate::diag::record("worldline", format!("世界主线校验：{warning}"));
+            }
+            Some(std::sync::Arc::new(wl))
+        }
+        Err(e) => {
+            crate::diag::record("worldline", format!("worldline.lua 解析失败，按无主线处理：{e}"));
+            None
+        }
+    }
+}
+
+fn world_path_of(root: &std::path::Path, world: &str) -> std::path::PathBuf {
+    root.join("codex").join(world).join("worldline.lua")
+}
+
+/// 当前活跃路径的三级回落：会话走位史（本会话见证的转移）→ world.json 的世界进度
+/// （老会话没见过任何转移，但世界早已在走）→ 树根（worldline 刚配置还没人走到过）。
+fn worldline_path_of(
+    wl: &Option<std::sync::Arc<worldline::Worldline>>,
+    proj: &event::Projection,
+    world: &worldline::WorldState,
+) -> Vec<String> {
+    if let Some(e) = proj.worldline.last() {
+        return e.to.clone();
+    }
+    if let Some(wl) = wl {
+        if let Some(prog) = &world.worldline {
+            if prog.id == wl.id && !prog.path.is_empty() {
+                return prog.path.clone();
+            }
+        }
+        return wl.tree.active_path(&wl.tree.root);
+    }
+    Vec::new()
+}
+
+/// 会话侧该回写的主线进度（proj 走位史的最后一条；没有 = 本会话没推进过，回写 None）
+fn worldline_progress_of(
+    wl: &Option<std::sync::Arc<worldline::Worldline>>,
+    proj: &event::Projection,
+) -> Option<worldline::WorldlineProgress> {
+    let e = proj.worldline.last()?;
+    Some(worldline::WorldlineProgress {
+        id: wl.as_ref().map(|w| w.id.clone()).unwrap_or_default(),
+        path: e.to.clone(),
+        advanced_turn: e.turn,
+        advanced_in: None,
+    })
+}
+
+/// 轮末推进世界主线（M3.7）：阶段转移求值（与导演树同引擎：priority 升序、
+/// 叶先、首个命中即转）→ 转移落 `worldline` 事件（重建保留）→ 阶段钩子的
+/// 世界层动作（reveal / 开世界级线）逐条执行。判据 `st.day` = 聚焦场景的故事天。
+fn advance_worldline(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    log: &store::EventLog,
+    report: &mut llm::HookReport,
+) -> Result<(), String> {
+    let world_name = session_world(meta);
+    let Some(wl) = load_worldline(root, &world_name) else {
+        return Ok(()); // 无主线：世界照常运转（可选层）
+    };
+    let proj = project_session(log, root, meta)?;
+    let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0);
+    let scene = scene_ctx(&proj);
+    let board = proj.effective_board(scene.as_deref());
+
+    // 开局承袭：走位史为空 = 本会话还没见证过世界 → 落第一条走位事件
+    //（不跑 on_enter——那个阶段的钩子在把它推进到这里的会话里已经跑过，
+    // 世界进度不该因换会话重放而重演）
+    let world_state = store::load_world(root, &world_name);
+    let path = worldline_path_of(&Some(wl.clone()), &proj, &world_state);
+    if proj.worldline.is_empty() {
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::Worldline(event::WorldlineEvent {
+                turn,
+                from: Vec::new(),
+                to: path.clone(),
+                reason: format!("开局承袭世界主线（世界时钟第{}天）", world_state.day),
+                ts: store::unix_now(),
+            }),
+        )?;
+        return Ok(());
+    }
+
+    // 阶段转移求值：state 槽 = 主线专属合成表（世界时钟 + 本段已走轮数）
+    let anchor = proj.worldline.last().map(|e| e.turn).unwrap_or(0);
+    let stage_turns = turn.saturating_sub(anchor) as i64;
+    let env = card::TreeEnv {
+        event: "worldline:turn_end".into(),
+        blackboard: blackboard_env(&board),
+        state: serde_json::json!({
+            "day": board.day,
+            "clock": board.clock,
+            "stage_turns": stage_turns,
+            "world_day": world_state.day,
+        }),
+        ..Default::default()
+    };
+    let leaf = path.last().cloned().unwrap_or_default();
+    let decision = match card::eval_state_tree(&wl.source, &path, &env) {
+        Ok(Some(d)) => Some(d),
+        Ok(None) => None,
+        Err(e) => {
+            crate::diag::record("worldline", format!("世界主线求值失败：{e}"));
+            None
+        }
+    };
+    if let Some(d) = decision {
+        let to_path = wl.tree.active_path(&d.to);
+        if to_path.is_empty() {
+            crate::diag::record("worldline", format!("世界主线转移目标未声明，保持原地：{}", d.to));
+        } else {
+            let to_leaf = to_path.last().cloned().unwrap_or_default();
+            // 执行顺序与状态树同构（§7.3-3）：exit 动作 → 转移事件 → enter 动作
+            let (exit_actions, hook_logs) = card::run_worldline_hook(&wl.source, &leaf, "on_exit");
+            report.logs.extend(hook_logs);
+            execute_worldline_actions(&proj, root, meta, log, turn, exit_actions, report)?;
+            commit(
+                log,
+                root,
+                meta,
+                LogBody::Worldline(event::WorldlineEvent {
+                    turn,
+                    from: proj
+                        .worldline
+                        .last()
+                        .map(|e| e.to.clone())
+                        .unwrap_or_default(),
+                    to: to_path,
+                    reason: d.reason.clone(),
+                    ts: store::unix_now(),
+                }),
+            )?;
+            let (enter_actions, hook_logs) =
+                card::run_worldline_hook(&wl.source, &to_leaf, "on_enter");
+            report.logs.extend(hook_logs);
+            let proj = project_session(log, root, meta)?;
+            execute_worldline_actions(&proj, root, meta, log, turn, enter_actions, report)?;
+            report.ui_events.push(llm::UiEmit {
+                kind: "worldline".into(),
+                value: format!("世界进入「{to_leaf}」——{}", d.reason),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 执行世界主线动作（顺序执行，逐条落事件）。只有两个世界层动作：
+/// reveal（无见证者 = 全局知情——大势对所有人可见）与开世界级线（scope=world）。
+fn execute_worldline_actions(
+    proj: &event::Projection,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    log: &store::EventLog,
+    turn: u64,
+    actions: Vec<worldline::WorldlineAction>,
+    report: &mut llm::HookReport,
+) -> Result<(), String> {
+    for action in actions {
+        match action {
+            worldline::WorldlineAction::Reveal { targets } => {
+                for target in targets {
+                    commit(
+                        log,
+                        root,
+                        meta,
+                        LogBody::Codex(event::CodexEvent {
+                            turn,
+                            op: "reveal".into(),
+                            target: target.clone(),
+                            origin: "worldline".into(),
+                            value: None,
+                            note: Some("世界大势所至".into()),
+                            witnesses: Vec::new(),
+                            ts: store::unix_now(),
+                        }),
+                    )?;
+                    report.logs.push(format!("世界主线揭示：{target}"));
+                }
+            }
+            worldline::WorldlineAction::OpenThread { id, title, cause, importance } => {
+                // 世界级线没有 actor：它压着整个世界，谁碰上谁推进
+                let title = title.unwrap_or_else(|| {
+                    proj.worldline
+                        .last()
+                        .and_then(|e| e.to.last().cloned())
+                        .unwrap_or_else(|| "世界主线".into())
+                });
+                let cause = cause.unwrap_or_else(|| "世界大势：主线阶段带来的变局。".into());
+                let value = open_thread_scoped_at(
+                    log, root, meta, &title, &cause, &[], importance, "worldline",
+                    threads::SCOPE_WORLD, id.as_deref(),
+                )?;
+                report
+                    .logs
+                    .push(format!("世界主线开线：{}", value["id"].as_str().unwrap_or(&title)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 轮末世界回写（M3.7）：`world.json` 取 `max(世界, 本会话)`。
+/// 在轮末连续做（而非等「会话结束」）——语义与结束回写完全一致（max 单调），
+/// 崩溃/强退也不丢进度。多场景会话取**最远场景**的故事天（并行的「与此同时」
+/// 各自推进，世界的「现在」以走到最远处为准）。
+pub(crate) fn sync_world_now(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    log: &store::EventLog,
+) -> Result<(), String> {
+    let world_name = session_world(meta);
+    let proj = project_session(log, root, meta)?;
+    let day = proj
+        .scenes
+        .values()
+        .filter(|sc| sc.status != scene::STATUS_MERGED)
+        .map(|sc| sc.day)
+        .max()
+        .unwrap_or_else(|| proj.effective_board(None).day);
+    let wl = load_worldline(root, &world_name);
+    let progress = worldline_progress_of(&wl, &proj);
+    // 世界级线：本会话推过的（scope=world）合回世界——别的会话接着推进
+    let world_threads: Vec<serde_json::Value> = proj
+        .threads
+        .values()
+        .filter_map(|v| threads::Thread::from_value(v).ok())
+        .filter(|t| t.scope == threads::SCOPE_WORLD)
+        .map(|t| t.to_value())
+        .collect();
+    let mut world = store::load_world(root, &world_name);
+    let mut progress = progress;
+    if let Some(p) = &mut progress {
+        p.advanced_in = Some(meta.id.clone());
+    }
+    worldline::sync(
+        &mut world,
+        &meta.id,
+        day,
+        progress,
+        &world_threads,
+        store::unix_now(),
+    );
+    store::save_world(root, &world_name, &world).map_err(|e| e.to_string())
+}
+
+/// 世界主线视图（检查器「世界」面板）
+#[tauri::command]
+pub fn worldline_view(
+    session_id: String,
+    log: State<'_, store::EventLog>,
+) -> Result<WorldlineView, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    worldline_view_of(&log, &root, &meta)
+}
+
+fn worldline_view_of(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+) -> Result<WorldlineView, String> {
+    let world_name = session_world(meta);
+    let proj = project_session(log, root, meta)?;
+    let world = store::load_world(root, &world_name);
+    let wl = load_worldline(root, &world_name);
+    let path = worldline_path_of(&wl, &proj, &world);
+    let (id, premise, directive, era) = match &wl {
+        Some(w) => {
+            let d = w.tree.directive_of(&path);
+            (
+                w.id.clone(),
+                w.premise.clone(),
+                d.clone(),
+                worldline::era_line(&w.tree, &path).unwrap_or_default(),
+            )
+        }
+        None => (String::new(), String::new(), String::new(), String::new()),
+    };
+    // 世界级线 = world.json 的存档 ∪ 本会话自己的（会话侧优先——它是活的推进记录）
+    // ∪ 声明里还没开的（面板预告「大势将至」；声明 id 与 api.open_thread 的 id 对得上）
+    let session_world_threads: Vec<serde_json::Value> = proj
+        .threads
+        .values()
+        .filter_map(|v| threads::Thread::from_value(v).ok())
+        .filter(|t| t.scope == threads::SCOPE_WORLD)
+        .map(|t| t.to_value())
+        .collect();
+    let mut world_threads: Vec<serde_json::Value> = Vec::new();
+    for t in &world.threads {
+        let id = t.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if !session_world_threads
+            .iter()
+            .any(|x| x.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        {
+            world_threads.push(t.clone());
+        }
+    }
+    if let Some(w) = &wl {
+        for title in &w.world_threads {
+            // has_thread 覆盖 world.json 存档；会话侧刚推过的按标题再对一遍
+            if !world.has_thread(title)
+                && !session_world_threads
+                    .iter()
+                    .any(|x| x.get("title").and_then(|v| v.as_str()) == Some(title.as_str()))
+            {
+                world_threads.push(serde_json::json!({
+                    "id": threads::id_from_title(title),
+                    "title": title,
+                    "state": "declared",
+                    "scope": threads::SCOPE_WORLD,
+                }));
+            }
+        }
+    }
+    world_threads.extend(session_world_threads);
+    let session_day = proj.effective_board(None).day;
+    let stage = wl.as_ref().map(|w| w.stage_of(&path)).unwrap_or_default();
+    Ok(WorldlineView {
+        configured: wl.is_some(),
+        id,
+        premise,
+        stage_directive: directive,
+        era,
+        stage,
+        path,
+        world_day: world.day,
+        session_day,
+        world_threads,
+        updated_by: world.updated_by.clone(),
+    })
+}
+
+/// 手动校准世界时钟（玩家纠正/ flashback 布景用）：只认合理的正数，写完即生效
+#[tauri::command]
+pub fn world_set_clock(world: String, day: i64) -> Result<i64, String> {
+    let root = root();
+    let name = if world.trim().is_empty() { "default".into() } else { world };
+    let mut w = store::load_world(&root, &name);
+    w.day = day.max(1);
+    store::save_world(&root, &name, &w).map_err(|e| e.to_string())?;
+    Ok(w.day)
+}
+
+// ---------- 设定史变的解析预览（M3.7 · 设计 §6.5）----------
+
+/// 解析预览：按故事时钟回答「第 N 天，这个世界是什么样」。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResolvePreview {
+    pub day: i64,
+    pub entities: Vec<ResolvePreviewEntity>,
+}
+
+/// 单个实体在指定故事天的解析切片。
+/// versions 追加不覆盖、组装按天解析（facet_at）——这里是同一份解析的**人类视图**：
+/// 生效版本逐条列出（哪条在第 N 天说了算）、生命周期按生效时刻判定、
+/// retired 留档照常可查（死亡是正史变更，不是删除）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResolvePreviewEntity {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// canon | draft | retired
+    pub status: String,
+    /// 生命周期在第 N 天的判定：status（active/departed/dead）、at_day 生效时刻、
+    /// in_effect（已生效）、present（此刻是否算在场——flashback 回到生效前仍在场）
+    pub lifecycle: serde_json::Value,
+    /// 史变版本流：from_day 起生效、在第 N 天是否生效
+    pub versions: Vec<serde_json::Value>,
+    /// 按 day 解析出的一句话简介（versions/variants 覆盖后的「那一天的事实」）
+    pub one_liner: String,
+}
+
+/// 解析预览（day 缺省 = 会话当前故事天）
+#[tauri::command]
+pub fn codex_resolve_preview(
+    session_id: String,
+    day: Option<i64>,
+    log: State<'_, store::EventLog>,
+    codex_cache: State<'_, CodexCache>,
+) -> Result<ResolvePreview, String> {
+    codex_resolve_preview_of(&log, &codex_cache, &root(), &session_id, day)
+}
+
+fn codex_resolve_preview_of(
+    log: &store::EventLog,
+    codex_cache: &CodexCache,
+    root: &std::path::Path,
+    session_id: &str,
+    day: Option<i64>,
+) -> Result<ResolvePreview, String> {
+    let meta = store::load_session(root, session_id).map_err(|e| e.to_string())?;
+    let world = session_world(&meta);
+    let cx = load_codex(root, Some(codex_cache), &world);
+    let proj = project_session(log, root, &meta)?;
+    let board = proj.effective_board(None);
+    let day = day.unwrap_or(board.day);
+    let bb = blackboard_env(&board);
+    let mut entities: Vec<ResolvePreviewEntity> = cx
+        .entities()
+        .iter()
+        .map(|e| {
+            let one_liner = e
+                .facet_at("one_liner", day, &board.clock, &bb)
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| e.one_liner.clone());
+            let lifecycle = match &e.lifecycle {
+                Some(lc) => serde_json::json!({
+                    "status": lc.status,
+                    "at_day": lc.at_day,
+                    "in_effect": lc.in_effect_at(day),
+                    "present": lc.present_at(day),
+                    "note": lc.note,
+                }),
+                None => serde_json::json!({ "status": codex::Lifecycle::ACTIVE, "present": true }),
+            };
+            let versions = e
+                .versions
+                .iter()
+                .map(|v| {
+                    serde_json::json!({
+                        "from_day": v.from_day,
+                        "facet": v.facet,
+                        "value": v.value,
+                        "note": v.note,
+                        "active": v.from_day <= day,
+                    })
+                })
+                .collect();
+            ResolvePreviewEntity {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                ty: e.ty.clone(),
+                status: e.status.clone(),
+                lifecycle,
+                versions,
+                one_liner,
+            }
+        })
+        .collect();
+    entities.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(ResolvePreview { day, entities })
 }
 
 /// 发送一条用户消息并流式生成回复。
@@ -4244,11 +4807,35 @@ fn open_thread_at(
     importance: Option<f32>,
     origin: &str,
 ) -> Result<serde_json::Value, String> {
+    open_thread_scoped_at(
+        log, root, meta, title, cause, actors, importance, origin,
+        threads::SCOPE_SESSION, None,
+    )
+}
+
+/// 开线的内核（带作用域与显式 id）。`scope` = session（会话线，缺省）| world
+/// （世界级线 M3.7 · 设计 §6.6——压着整个世界、任何会话可推进，轮末回写 world.json）；
+/// `id` = 沙箱 api 显式声明的线 id（尊重声明，缺省由标题生成）。
+#[allow(clippy::too_many_arguments)]
+fn open_thread_scoped_at(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    title: &str,
+    cause: &str,
+    actors: &[String],
+    importance: Option<f32>,
+    origin: &str,
+    scope: &str,
+    id: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let proj = project_session(log, root, meta)?;
     let board = blackboard_of(&proj);
     let turn = proj.last_message().map(|m| m.turn).unwrap_or(0);
-    let id = threads::id_from_title(title);
-    let thread = threads::Thread::open(
+    let id = id
+        .map(str::to_string)
+        .unwrap_or_else(|| threads::id_from_title(title));
+    let mut thread = threads::Thread::open(
         &id,
         title,
         cause,
@@ -4260,6 +4847,7 @@ fn open_thread_at(
             story_clock: board.clock.clone(),
         },
     );
+    thread.scope = scope.to_string();
     let snapshot = thread.to_value();
     commit(
         log,
@@ -4601,6 +5189,14 @@ fn timeline_brief(record: &event::LogRecord) -> String {
                 t.from.last().cloned().unwrap_or_default()
             };
             format!("剧情：{} → {}（{}）", from, t.to.last().cloned().unwrap_or_default(), clip(&t.reason, 40))
+        }
+        LogBody::Worldline(t) => {
+            let from = if t.from.is_empty() {
+                "承袭世界".to_string()
+            } else {
+                t.from.last().cloned().unwrap_or_default()
+            };
+            format!("世界：{} → {}（{}）", from, t.to.last().cloned().unwrap_or_default(), clip(&t.reason, 40))
         }
     }
 }
@@ -8437,6 +9033,414 @@ return {
         );
         let t2 = threads::Thread::from_value(&proj2.threads["thread.周五还书"]).unwrap();
         assert_eq!(t2.resurface.grade, threads::GRADE_DORMANT, "调窗结果重建保留");
+    }
+
+    // ---------- M3.7 世界主线与世界时钟（设计 §6.6）----------
+
+    /// 设计 §6.6 的示例主线：传闻期 →(day≥3) 公告期，进公告期揭示世界设定 + 开世界级线
+    const WORLDLINE_LUA: &str = r#"
+return {
+  id = "worldline.图书馆拆迁",
+  premise = "老图书馆月底拆除，所有人都在倒数。",
+  stages = {
+    { id = "传闻期", directive = "日常氛围，偶尔可闻拆迁传闻，多数人不在意。" },
+    { id = "公告期", when = { day = 3 },
+      directive = "公告已贴出，空气里有告别的味道；各角色心怀不同的盘算。",
+      on_enter = {
+        reveal = { "rule.拆迁公告" },
+        open_thread = { id = "thread.最后一个月", title = "最后一个月",
+                        cause = "世界大势：闭馆倒计时开始。", importance = 0.8 },
+      } },
+  },
+  world_threads = { "thread.最后一个月" },
+}
+"#;
+
+    /// 把会话故事时钟拨到指定天（manual 黑板事件，重放保留）
+    fn bump_day(log: &store::EventLog, root: &std::path::Path, meta: &store::SessionMeta, day: i64) {
+        let proj = project_session(log, root, meta).unwrap();
+        let mut board = proj.effective_board(None);
+        board.day = day;
+        log.append(
+            root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: proj.last_message().map(|m| m.turn).unwrap_or(0),
+                reason: "manual".into(),
+                scene_id: None,
+                board,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+    }
+
+    fn worldline_stages(proj: &event::Projection) -> Vec<String> {
+        proj.worldline
+            .iter()
+            .map(|e| e.to.last().cloned().unwrap_or_default())
+            .collect()
+    }
+
+    /// 组装产物里取某层正文
+    fn layer_of<'a>(run: &'a PromptRun, id: &str) -> &'a str {
+        &run.assembly
+            .layers
+            .iter()
+            .find(|l| l.id == id)
+            .expect("应存在该注入层")
+            .content
+    }
+
+    /// DoD 第 6 项（单测侧）：世界主线阶段转移落事件、揭示与开世界级线可溯源、
+    /// 时代行与世界 directive 进注入、进度回写 world.json。
+    #[test]
+    fn worldline_stage_transition_reveals_opens_and_injects() {
+        let (_dir, meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        std::fs::create_dir_all(root.join("codex/default")).unwrap();
+        std::fs::write(root.join("codex/default/worldline.lua"), WORLDLINE_LUA).unwrap();
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+
+        // 第 1 轮：播种「传闻期」（承袭世界，不跑钩子）；day=1 不过门槛
+        theater_round(&root, &meta, &cast, &log, 1);
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(worldline_stages(&proj), vec!["传闻期".to_string()]);
+        assert!(proj.known.is_empty(), "承袭不重跑 on_enter");
+        let world = store::load_world(&root, "default");
+        assert_eq!(world.day, 1, "轮末回写已建立世界时钟基线");
+        assert_eq!(
+            world.worldline.as_ref().map(|p| p.path.clone()),
+            Some(vec!["传闻期".to_string()]),
+            "主线进度回写 world.json"
+        );
+
+        // 拨到第 3 天再来一轮：公告期门槛越过 → 转移 + reveal + 开世界级线
+        bump_day(&log, &root, &meta, 3);
+        theater_round(&root, &meta, &cast, &log, 2);
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(
+            worldline_stages(&proj),
+            vec!["传闻期".to_string(), "公告期".to_string()]
+        );
+        assert!(
+            proj.known.contains("rule.拆迁公告"),
+            "阶段揭示无见证者 = 全局知情"
+        );
+        let t = threads::Thread::from_value(&proj.threads["thread.最后一个月"]).unwrap();
+        assert_eq!(t.scope, threads::SCOPE_WORLD, "主线开的线是世界级线");
+
+        // world.json：时钟与进度双回写、世界级线入档
+        let world = store::load_world(&root, "default");
+        assert_eq!(world.day, 3);
+        assert_eq!(
+            world.worldline.as_ref().map(|p| p.path.clone()),
+            Some(vec!["传闻期".to_string(), "公告期".to_string()])
+        );
+        assert!(
+            world.has_thread("thread.最后一个月"),
+            "世界级线回写 world.json（别的会话可推进）"
+        );
+
+        // 注入：B1 时代行 + B2 世界 directive（无角色状态树时 B2 只有大势）
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &cast,
+            "小雨",
+            &proj.messages,
+            &proj,
+            Some("（继续）"),
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let b1 = layer_of(&run, "B1");
+        assert!(b1.contains("时代:公告期"), "B1 应有时代行：{b1}");
+        let b2 = layer_of(&run, "B2");
+        assert!(
+            b2.contains("公告已贴出"),
+            "B2 应含世界 directive（大势压着小情绪）：{b2}"
+        );
+
+        // 重建（消息级）：worldline 事件是元层动作，走位史不丢
+        let records = log.read(&root, &meta.id).unwrap();
+        let kept: Vec<LogRecord> = records.iter().filter(|r| !r.is_derived()).cloned().collect();
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &kept, 1).unwrap();
+        log.rewrite(&root, &meta.id, &rebuilt).unwrap();
+        let proj2 = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(proj.worldline, proj2.worldline, "走位史重建不丢");
+        assert!(proj2.known.contains("rule.拆迁公告"), "揭示不因重建丢失");
+    }
+
+    /// DoD 第 6 项：跨会话持久——新会话承袭世界进度（阶段与线），flashback 不拉低时钟。
+    #[test]
+    fn world_state_persists_across_sessions_and_flashback_never_regresses() {
+        let (_dir, meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        std::fs::create_dir_all(root.join("codex/default")).unwrap();
+        std::fs::write(root.join("codex/default/worldline.lua"), WORLDLINE_LUA).unwrap();
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+
+        // 会话 A：走到公告期（第 3 天）
+        theater_round(&root, &meta, &cast, &log, 1);
+        bump_day(&log, &root, &meta, 3);
+        theater_round(&root, &meta, &cast, &log, 2);
+
+        // 会话 B（同一世界，无显式天）：开局即续上大势
+        //（基准 = baseline_day_from_world，new_session 命令内部走的就是它）
+        let meta_b = store::new_session(
+            &root,
+            &store::NewSessionRequest {
+                character: "小雨".into(),
+                characters: vec!["小雨".into()],
+                persona: None,
+                day: baseline_day_from_world(&root, None),
+                clock: Some("09:00".into()),
+                place: Some("公告栏".into()),
+                premise: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store::load_blackboard(&root, &meta_b.id).unwrap().day,
+            3,
+            "新会话缺省从世界时钟出发"
+        );
+        let board_b = store::load_blackboard(&root, &meta_b.id).unwrap();
+        let log_b = store::EventLog::new();
+        log_b
+            .append(
+                &root,
+                &meta_b.id,
+                LogBody::Blackboard(event::BlackboardEvent {
+                    turn: 0,
+                    reason: "init".into(),
+                    scene_id: None,
+                    board: board_b,
+                    ts: store::unix_now(),
+                }),
+            )
+            .unwrap();
+        let cast_b = cast_of(&root, &meta_b);
+        theater_round(&root, &meta_b, &cast_b, &log_b, 1);
+
+        // 承袭：不重跑 on_enter（揭示/开线已在 A 发生过），但视图与注入都在公告期
+        let proj_b = project_session(&log_b, &root, &meta_b).unwrap();
+        assert_eq!(worldline_stages(&proj_b), vec!["公告期".to_string()]);
+        assert!(
+            !proj_b.threads.contains_key("thread.最后一个月"),
+            "承袭不重演开线——线住 world.json，不随会话重放"
+        );
+        let view = worldline_view_of(&log_b, &root, &meta_b).unwrap();
+        assert_eq!(view.stage, "公告期");
+        assert_eq!(view.world_day, 3);
+        assert!(
+            view.world_threads
+                .iter()
+                .any(|t| t["id"] == "thread.最后一个月"),
+            "世界级线从 world.json 并入任何会话的视图"
+        );
+
+        // flashback 会话（显式回到第 1 天）结束后，世界时钟不被拉低
+        let meta_c = store::new_session(
+            &root,
+            &store::NewSessionRequest {
+                character: "小雨".into(),
+                characters: vec!["小雨".into()],
+                persona: None,
+                day: baseline_day_from_world(&root, Some(1)),
+                clock: Some("09:00".into()),
+                place: Some("回忆里的自习区".into()),
+                premise: None,
+            },
+        )
+        .unwrap();
+        let board_c = store::load_blackboard(&root, &meta_c.id).unwrap();
+        let log_c = store::EventLog::new();
+        log_c
+            .append(
+                &root,
+                &meta_c.id,
+                LogBody::Blackboard(event::BlackboardEvent {
+                    turn: 0,
+                    reason: "init".into(),
+                    scene_id: None,
+                    board: board_c,
+                    ts: store::unix_now(),
+                }),
+            )
+            .unwrap();
+        let cast_c = cast_of(&root, &meta_c);
+        theater_round(&root, &meta_c, &cast_c, &log_c, 1);
+        let world = store::load_world(&root, "default");
+        assert_eq!(world.day, 3, "flashback 不拉低世界时钟");
+        assert_eq!(
+            world.worldline.as_ref().map(|p| p.path.clone()),
+            Some(vec!["传闻期".to_string(), "公告期".to_string()]),
+            "更浅的进度不覆盖世界"
+        );
+
+        // 基准函数的直接点验：显式天优先、无世界文件回 None
+        assert_eq!(baseline_day_from_world(&root, Some(7)), Some(7));
+        assert_eq!(baseline_day_from_world(&root, None), Some(3));
+    }
+
+    /// 可选层纪律：没有 worldline.lua 的世界一切照旧——无走位、无时代行、无世界段，
+    /// 但世界时钟照常回写（时钟独立于主线存在）。
+    #[test]
+    fn without_worldline_the_world_still_runs_and_clocks_persist() {
+        let (_dir, meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+
+        theater_round(&root, &meta, &cast, &log, 1);
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert!(proj.worldline.is_empty(), "无主线就没有走位史");
+
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &cast,
+            "小雨",
+            &proj.messages,
+            &proj,
+            Some("（继续）"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!layer_of(&run, "B1").contains("时代:"), "无主线就没有时代行");
+        assert!(
+            run.assembly.layers.iter().all(|l| l.id != "B2"),
+            "无主线且无状态树时 B2 整层省略"
+        );
+
+        bump_day(&log, &root, &meta, 9);
+        theater_round(&root, &meta, &cast, &log, 2);
+        let world = store::load_world(&root, "default");
+        assert_eq!(world.day, 9, "世界时钟独立于主线照常回写");
+        assert!(world.worldline.is_none());
+    }
+
+    /// M3.6 遗留联动：导演树判据环境补 `worldline_stage`——「公告期不排纯搞笑日常」
+    /// 写成一条 when 即可（母层查询子层；主线先推进，剧场后求值）。
+    #[test]
+    fn director_tree_judges_on_the_worldline_stage() {
+        let (_dir, mut meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        std::fs::create_dir_all(root.join("codex/default")).unwrap();
+        std::fs::write(root.join("codex/default/worldline.lua"), WORLDLINE_LUA).unwrap();
+        std::fs::write(
+            store::session_dir(&root, &meta.id).join("director.lua"),
+            r#"
+return { state_tree = {
+  root = "起",
+  states = {
+    ["起"] = {
+      directive = "起：铺陈。",
+      transitions = {
+        { to = "转", priority = 10,
+          when = function(ev, bb, st) return st.worldline_stage == "公告期" end },
+      },
+    },
+    ["转"] = { directive = "转：大势压顶。" },
+  },
+} }
+"#,
+        )
+        .unwrap();
+        meta.theater = theater_meta(20);
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+
+        // 第 1 轮：导演播种「起」，主线承袭「传闻期」（不满足转段判据）
+        theater_round(&root, &meta, &cast, &log, 1);
+        bump_day(&log, &root, &meta, 3);
+        // 第 2 轮：主线先进公告期 → 剧场求值时 worldline_stage 已是公告期 → 转
+        theater_round(&root, &meta, &cast, &log, 2);
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let stages: Vec<String> = proj
+            .director_tree
+            .iter()
+            .map(|e| e.to.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            stages,
+            vec!["起".to_string(), "转".to_string()],
+            "导演树应读到主线阶段并转段（自定义树无预算压力，靠的就是联动）：{stages:?}"
+        );
+    }
+
+    /// 解析预览（设计 §6.5 收尾）：按故事时钟回答「第 N 天的事实」——
+    /// versions 生效切换、生命周期生效前仍在场（flashback 里逝者可对话）、retired 留档可查。
+    #[test]
+    fn resolve_preview_serves_versions_and_lifecycle_by_story_clock() {
+        let (_dir, meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        std::fs::create_dir_all(root.join("codex/default/entities")).unwrap();
+        std::fs::write(
+            root.join("codex/default/entities/preview.json"),
+            serde_json::json!({
+                "id": "char.小雨",
+                "type": "char",
+                "name": "小雨",
+                "one_liner": "长发的小雨。",
+                "versions": [
+                    { "day": 15, "facet": "one_liner", "value": "剪了短发的小雨。", "note": "第15天剪发" }
+                ],
+                "lifecycle": { "status": "dead", "at_day": 20, "note": "第20天病故" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("codex/default/entities/retired.json"),
+            serde_json::json!({
+                "id": "place.旧书店",
+                "type": "place",
+                "name": "旧书店",
+                "one_liner": "已经关门的旧书店。",
+                "status": "retired"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let log = store::EventLog::new();
+        let cache = CodexCache::default();
+
+        let early = codex_resolve_preview_of(&log, &cache, &root, &meta.id, Some(10)).unwrap();
+        let e = early.entities.iter().find(|e| e.id == "char.小雨").unwrap();
+        assert_eq!(e.one_liner, "长发的小雨。", "第 10 天取旧版事实");
+        assert_eq!(e.lifecycle["present"], serde_json::json!(true), "死亡生效前仍在场");
+        assert_eq!(e.versions[0]["active"], serde_json::json!(false));
+
+        let late = codex_resolve_preview_of(&log, &cache, &root, &meta.id, Some(25)).unwrap();
+        let e = late.entities.iter().find(|e| e.id == "char.小雨").unwrap();
+        assert_eq!(e.one_liner, "剪了短发的小雨。", "第 25 天取新版事实");
+        assert_eq!(e.lifecycle["in_effect"], serde_json::json!(true));
+        assert_eq!(e.lifecycle["present"], serde_json::json!(false), "生效后不在场");
+        assert_eq!(e.versions[0]["active"], serde_json::json!(true));
+        assert_eq!(e.versions[0]["note"], serde_json::json!("第15天剪发"));
+
+        // retired 留档可查：预览照常列出（状态本身带 retired）
+        assert!(
+            late.entities.iter().any(|e| e.id == "place.旧书店" && e.status == "retired"),
+            "retired 是留档不是删除"
+        );
+
+        // day 缺省 = 会话当前故事天
+        let default_day = codex_resolve_preview_of(&log, &cache, &root, &meta.id, None).unwrap();
+        assert_eq!(default_day.day, 1);
     }
 
 }

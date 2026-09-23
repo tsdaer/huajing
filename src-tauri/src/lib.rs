@@ -20,6 +20,7 @@ mod stimport; // SillyTavern 角色卡导入（M1.8 · 设计 §13）
 mod store;    // DataHub 明文数据层（设计 §12）
 mod summarize; // 自动总结管线：批次 → 六类产物（M2.6 · 设计 §5.3）
 mod watch;    // DataHub 热加载监听（M1.7）
+mod worldline; // 世界主线与世界时钟：世界作用域的阶段弧（M3.7 · 设计 §6.6）
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -76,6 +77,9 @@ pub fn run() {
             commands::set_max_speakers,
             commands::set_theater,
             commands::theater_view,
+            commands::worldline_view,
+            commands::world_set_clock,
+            commands::codex_resolve_preview,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,

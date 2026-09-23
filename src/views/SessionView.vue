@@ -15,6 +15,7 @@ import type {
   StreamEvent,
   TheaterView,
   TimelineEntry,
+  WorldlineView,
 } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
@@ -24,6 +25,7 @@ import PsychePanel from "../components/inspector/PsychePanel.vue";
 import PalacePanel from "../components/inspector/PalacePanel.vue";
 import CodexPanel from "../components/inspector/CodexPanel.vue";
 import SummaryPanel from "../components/inspector/SummaryPanel.vue";
+import WorldPanel from "../components/inspector/WorldPanel.vue";
 
 // M1.5 聊天界面：气泡流 + 流式打字机 + 停止 + 消息编辑/重roll/删除。
 // 黑板与记忆检查器收进右侧抽屉，聊天流为主。界面全部由 daisyUI 组件构成。
@@ -56,6 +58,7 @@ const INSP_TABS = [
   { id: "palace", label: "宫殿" },
   { id: "codex", label: "设定集" },
   { id: "outbox", label: "摘要·收件箱" },
+  { id: "world", label: "世界" },
   { id: "director", label: "导演" },
   { id: "state", label: "卡内状态" },
   { id: "memory", label: "卡内记忆" },
@@ -70,15 +73,50 @@ const M2_TABS: InspTab[] = ["statetree", "threads", "psyche", "palace", "codex",
 const inspTab = ref<InspTab>("layers");
 const inspTabLabel = computed(() => INSP_TABS.find((t) => t.id === inspTab.value)?.label ?? "");
 
-// 切到事件流/导演页签时按需拉一次类型化事件流（M3.0 ④ / M3.4）
+// 切到事件流/导演页签时按需拉一次类型化事件流（M3.0 ④ / M3.4）；世界页签拉世界主线（M3.7）
 watch(inspTab, (tab) => {
   if (tab === "events" || tab === "director") ensureTimeline();
+  if (tab === "world") ensureWorldline();
 });
 
 /** 导演面板的数据源：事件流里的调度史（发言权打分的依据逐条可查，DoD 1） */
 const directorHistory = computed(() =>
   (timeline.value ?? []).filter((e) => e.kind === "director"),
 );
+
+// ---------- 世界主线与世界时钟（M3.7 · 设计 §6.6） ----------
+const worldline = ref<WorldlineView | null>(null);
+const worldlineBusy = ref(false);
+const worldlineError = ref("");
+
+async function loadWorldline() {
+  worldlineBusy.value = true;
+  worldlineError.value = "";
+  try {
+    worldline.value = await api.worldlineView(props.meta.id);
+  } catch (e) {
+    worldlineError.value = String(e);
+  } finally {
+    worldlineBusy.value = false;
+  }
+}
+
+function ensureWorldline() {
+  if (!worldline.value && !worldlineBusy.value) void loadWorldline();
+}
+
+/** 手动校准世界时钟（flashback 布景 / 纠偏） */
+async function calibrateWorld(day: number) {
+  worldlineBusy.value = true;
+  try {
+    await api.worldSetClock("", day);
+    await loadWorldline();
+  } catch (e) {
+    worldlineError.value = String(e);
+  } finally {
+    worldlineBusy.value = false;
+  }
+}
 
 /** 记忆检查器全量投影（状态树 / 剧情线 / 心理 / 宫殿 / 设定集 / 摘要与收件箱） */
 const inspector = ref<InspectorData | null>(null);
@@ -597,12 +635,14 @@ async function loadAll() {
   editingIndex.value = -1;
   draft.value = "";
   page.value = 1;
-  // 换会话：检查器数据作废（下次打开抽屉再拉）；事件流视图同理
+  // 换会话：检查器数据作废（下次打开抽屉再拉）；事件流视图与世界主线视图同理
   inspector.value = null;
   inspError.value = "";
   summaryResult.value = "";
   timeline.value = null;
   timelineError.value = "";
+  worldline.value = null;
+  worldlineError.value = "";
   const id = props.meta.id;
   try {
     const [bb, msgs] = await Promise.all([api.getBlackboard(id), api.readMessages(id)]);
@@ -1487,6 +1527,7 @@ watch(cardGeneration, () => {
               <PalacePanel v-else-if="inspTab === 'palace'" :palace="inspector.palace" @jump="jumpToTurn" />
               <CodexPanel
                 v-else-if="inspTab === 'codex'"
+                :session-id="props.meta.id"
                 :codex="inspector.codex"
                 :known="inspector.known"
                 :active-entities="inspector.activeEntities"
@@ -1502,6 +1543,30 @@ watch(cardGeneration, () => {
                 @decide="decideProposal"
               />
             </template>
+          </template>
+
+          <!-- 世界面板（M3.7 · 设计 §6.6）：世界主线阶段 / 世界时钟 / 世界级线 -->
+          <template v-else-if="inspTab === 'world'">
+            <div class="flex items-center justify-between gap-2">
+              <p class="m-0 text-xs text-base-content/50">世界主线与世界时钟（B1 时代行 / B2 世界段的同一份数据）</p>
+              <button class="btn btn-ghost btn-xs flex-none" :disabled="worldlineBusy" @click="loadWorldline">
+                <span v-if="worldlineBusy" class="loading loading-spinner loading-xs"></span>
+                <Icon v-else name="refresh" :size="13" />刷新
+              </button>
+            </div>
+            <div v-if="worldlineError" role="alert" class="alert alert-error alert-soft py-2 text-xs break-words">
+              {{ worldlineError }}
+            </div>
+            <p v-else-if="!worldline" class="m-0 flex items-center gap-2 text-xs text-base-content/50">
+              <span v-if="worldlineBusy" class="loading loading-spinner loading-xs"></span>
+              {{ worldlineBusy ? "正在读世界…" : "还没有数据，点「刷新」重拉。" }}
+            </p>
+            <WorldPanel
+              v-else
+              :world="worldline"
+              :busy="worldlineBusy"
+              @calibrate="calibrateWorld"
+            />
           </template>
 
           <!-- 导演面板（M3.4 · 设计 §10.5）：发言权调度史，逐条可查「为何轮到她」 -->

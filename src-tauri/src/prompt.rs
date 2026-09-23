@@ -68,6 +68,10 @@ pub struct SceneSnapshot {
     pub actors: Vec<String>,
     #[serde(default)]
     pub weather: Option<String>,
+    /// 时代（M3.7 · 设计 §6.6：世界主线阶段行——「公告期——公告已贴出…」；
+    /// 没有 worldline 的世界 = None，这一行不出现）
+    #[serde(default)]
+    pub era: Option<String>,
     /// 心里有事：**仅在提及窗口内**的活跃剧情线，各附一句 framing（设计 §8.4）
     #[serde(default)]
     pub concerns: Vec<String>,
@@ -96,6 +100,7 @@ impl SceneSnapshot {
                 bb.actors.clone()
             },
             weather: None,
+            era: None,
             concerns: Vec::new(),
             resolutions: Vec::new(),
         }
@@ -109,12 +114,22 @@ impl SceneSnapshot {
         self
     }
 
+    /// 挂上时代行（M3.7 · 设计 §6.6）：世界大势是现状的一部分
+    pub fn with_era(mut self, era: Option<&str>) -> Self {
+        self.era = era.filter(|e| !e.trim().is_empty()).map(str::to_string);
+        self
+    }
+
     /// 紧凑单行渲染（预算 ≤80 token，六要素中"时间/地点/人物/起因"的投影）
     pub fn render(&self) -> String {
         let actors = self.actors.join(",");
         let mut s = format!("{} · {} · 在场:{}", self.story_clock, self.place, actors);
         if let Some(w) = &self.weather {
             s.push_str(&format!(" · {}", w));
+        }
+        if let Some(era) = &self.era {
+            // 世界大势压着所有角色（设计 §6.6）：时代是现状卡的一行，无条件在场
+            s.push_str(&format!(" · 时代:{}", era));
         }
         if !self.concerns.is_empty() {
             // 克制契约（A1）在这里落地：措辞明确「时机合适时可自然提起」，不是任务清单
@@ -254,6 +269,11 @@ pub struct BuildInputs<'a> {
     pub psyche_line: Option<&'a str>,
     /// B2 指令层：状态树活跃路径的 directive（根→叶拼接，子覆盖父）（M2.3 · 设计 §4.1/§7.4）
     pub directive: Option<&'a str>,
+    /// B2 指令层的**世界段**（M3.7 · 设计 §6.6）：世界主线阶段的 directive——
+    /// 拼在角色 directive 之前（大势压着小情绪）；没有 worldline = None
+    pub world_directive: Option<&'a str>,
+    /// B1 时代行（M3.7 · 设计 §6.6）：「公告期——公告已贴出…」；没有 worldline = None
+    pub era: Option<&'a str>,
     /// C1 滚动摘要（M2.6 · 设计 §5.3：总结管线产出的编年史体梗概，空则省略）
     pub summary: Option<&'a str>,
     /// 隔离模式的「只扮演 X」提示（M3.1 · 设计 §10.2；单角色为 None，A1 不变）
@@ -413,6 +433,7 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     // B1 故事现状卡：**无条件保底**（设计 §4.2）——超层预算也一字不动，只在账目里说明
     let b1_limit = budget.limit("B1");
     let snapshot = SceneSnapshot::from_blackboard(inputs.blackboard)
+        .with_era(inputs.era)
         .with_threads(inputs.concerns, inputs.resolutions);
     let b1 = format!("<scene>\n{}\n</scene>", snapshot.render());
     let b1_trimmed = (estimate_tokens(&b1) > b1_limit)
@@ -433,10 +454,20 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     });
 
     // B2 指令层（设计 §4.1：状态树 directive 根→叶，子覆盖父；「输出约束」的落点——
-    // 把开放生成收窄到当前状态允许的表演空间，§7.4）
+    // 把开放生成收窄到当前状态允许的表演空间，§7.4）。
+    // M3.7：世界主线阶段的 directive 拼在最前（设计 §6.6「大势压着小情绪」）——
+    // 世界段是这棵指令树的超根。
     let b2_limit = budget.limit("B2");
-    if let Some(d) = inputs.directive.filter(|d| !d.trim().is_empty()) {
-        let (content, cut) = fit_tagged("directive", d, b2_limit);
+    let char_directive = inputs.directive.filter(|d| !d.trim().is_empty());
+    let world_directive = inputs.world_directive.filter(|d| !d.trim().is_empty());
+    let b2_text = match (world_directive, char_directive) {
+        (Some(w), Some(c)) => Some(format!("{w}\n\n{c}")),
+        (Some(w), None) => Some(w.to_string()),
+        (None, Some(c)) => Some(c.to_string()),
+        (None, None) => None,
+    };
+    if let Some(d) = b2_text {
+        let (content, cut) = fit_tagged("directive", &d, b2_limit);
         if !content.is_empty() {
             b_messages.push(ChatMessage {
                 role: "system".into(),
@@ -1157,6 +1188,8 @@ mod tests {
             pending_threads: &[],
             psyche_line: None,
             directive: None,
+            world_directive: None,
+            era: None,
             summary: None,
             history,
             user_content,

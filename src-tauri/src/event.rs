@@ -260,6 +260,21 @@ pub struct DirectorTreeEvent {
     pub ts: u64,
 }
 
+/// 世界主线阶段转移（M3.7 · 设计 §6.6）：世界作用域状态树的走位史。
+/// 与 [`DirectorTreeEvent`] 同构——世界大势压着所有角色，转移史按序追加，
+/// 会话里只记「本会话见证的走位」；跨会话的持久进度在 `codex/<世界>/world.json`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorldlineEvent {
+    pub turn: u64,
+    /// 转移前的活跃路径（根→叶）；开局承袭时为空
+    pub from: Vec<String>,
+    /// 转移后的活跃路径（根→叶）
+    pub to: Vec<String>,
+    /// 转移理由（求值命中的 when 描述，给人读）
+    pub reason: String,
+    pub ts: u64,
+}
+
 /// 事件体（messages.jsonl 一行去掉 seq 与 kind 之后的部分）
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogBody {
@@ -275,6 +290,7 @@ pub enum LogBody {
     Scene(SceneEvent),
     Director(DirectorEvent),
     DirectorTree(DirectorTreeEvent),
+    Worldline(WorldlineEvent),
 }
 
 impl From<Message> for LogBody {
@@ -304,6 +320,7 @@ impl LogBody {
             LogBody::Scene(_) => "scene",
             LogBody::Director(_) => "director",
             LogBody::DirectorTree(_) => "director_tree",
+            LogBody::Worldline(_) => "worldline",
         }
     }
 
@@ -322,6 +339,7 @@ impl LogBody {
             LogBody::Scene(s) => s.turn,
             LogBody::Director(d) => d.turn,
             LogBody::DirectorTree(d) => d.turn,
+            LogBody::Worldline(d) => d.turn,
         }
     }
 
@@ -340,6 +358,7 @@ impl LogBody {
             LogBody::Scene(s) => serde_json::to_value(s),
             LogBody::Director(d) => serde_json::to_value(d),
             LogBody::DirectorTree(d) => serde_json::to_value(d),
+            LogBody::Worldline(d) => serde_json::to_value(d),
         }
         .map_err(|e| format!("事件序列化失败：{e}"))?;
         if let Some(obj) = v.as_object_mut() {
@@ -375,6 +394,7 @@ impl LogBody {
             "director_tree" => {
                 serde_json::from_value(v).map(LogBody::DirectorTree).map_err(bad)
             }
+            "worldline" => serde_json::from_value(v).map(LogBody::Worldline).map_err(bad),
             other => Err(format!("未知事件类型：{other}")),
         }
     }
@@ -429,12 +449,14 @@ impl LogRecord {
             // 场景事件同理：切场/分场/合场是玩家/导演的动作，不从消息派生。
             // 导演调度同理（M3.4）：调度史是元层的动作记录，重建不得抹掉。
             // 导演树阶段转移同理（M3.6）：起承转合的走位史，重建保留。
+            // 世界主线转移同理（M3.7）：世界大势的走位史，重建保留。
             LogBody::Summary(_)
             | LogBody::Proposal(_)
             | LogBody::Memory(_)
             | LogBody::Scene(_)
             | LogBody::Director(_)
-            | LogBody::DirectorTree(_) => false,
+            | LogBody::DirectorTree(_)
+            | LogBody::Worldline(_) => false,
         }
     }
 
@@ -567,6 +589,9 @@ pub struct Projection {
     /// 导演树走位史（M3.6 · 设计 §8.5）：起承转合的阶段转移按序追加；
     /// 当前活跃路径 = 最后一条的 to（空 = 还没开场，用树根）
     pub director_tree: Vec<DirectorTreeEvent>,
+    /// 世界主线走位史（M3.7 · 设计 §6.6）：本会话见证的世界阶段转移按序追加；
+    /// 当前活跃路径 = 最后一条的 to（空 = 开局承袭 world.json 的世界进度）
+    pub worldline: Vec<WorldlineEvent>,
     pub last_seq: Seq,
 }
 
@@ -922,6 +947,9 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
         // 导演树阶段转移（M3.6）：按序追加——当前活跃路径 = 最后一条的 to，
         // 转移历史即起承转合的走位记录（进度指示与导演面板的数据源）
         LogBody::DirectorTree(t) => p.director_tree.push(t.clone()),
+        // 世界主线阶段转移（M3.7）：按序追加——当前活跃路径 = 最后一条的 to，
+        // 走位史即世界大势的演变记录（B1 时代行 / B2 世界 directive 的数据源）
+        LogBody::Worldline(t) => p.worldline.push(t.clone()),
     }
 }
 
