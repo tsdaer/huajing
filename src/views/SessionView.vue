@@ -153,15 +153,29 @@ function openInspector() {
 }
 
 /** 收件箱：确认 / 否决一条提案，动作进事件流，成功后刷新全量视图 */
-async function decideProposal(id: string, accept: boolean) {
+async function decideProposal(id: string, accept: boolean, note?: string) {
   decidingId.value = id;
   try {
-    await api.decideProposal(props.meta.id, id, accept);
+    await api.decideProposal(props.meta.id, id, accept, note);
     await loadInspector();
   } catch (e) {
     error.value = String(e);
   } finally {
     decidingId.value = "";
+  }
+}
+
+/** 收件箱批量处理（M3.8 · DoD 8）：全部确认 / 全部否决 */
+const decidingAll = ref(false);
+async function decideAllProposals(accept: boolean) {
+  decidingAll.value = true;
+  try {
+    await api.decideAllProposals(props.meta.id, accept);
+    await loadInspector();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    decidingAll.value = false;
   }
 }
 
@@ -330,6 +344,23 @@ async function setMaxSpeakers(n: number) {
   maxSpeakers.value = n;
   try {
     await api.setMaxSpeakers(props.meta.id, n);
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+/** 即兴模式开关（M3.8 · 设计 §6.8-4，默认关） */
+const improv = ref(props.meta.improv ?? false);
+watch(
+  () => props.meta.improv,
+  (n) => {
+    improv.value = n ?? false;
+  },
+);
+async function setImprov(on: boolean) {
+  improv.value = on;
+  try {
+    await api.setImprov(props.meta.id, on);
   } catch (e) {
     error.value = String(e);
   }
@@ -1264,6 +1295,19 @@ watch(cardGeneration, () => {
                 点名 {{ dir }}
               </button>
             </div>
+            <label
+              class="flex items-center gap-1 text-[11px] text-base-content/45"
+              data-tip="即兴模式（默认关）：被提及的实体太薄时，便宜模型现场补一条「设定·暂定」；会话结束进收件箱确认"
+            >
+              <input
+                type="checkbox"
+                class="toggle toggle-xs"
+                :checked="improv"
+                aria-label="即兴模式"
+                @change="setImprov(($event.target as HTMLInputElement).checked)"
+              />
+              即兴
+            </label>
             <label v-if="!speaker" class="ml-auto flex items-center gap-1 text-[11px] text-base-content/45">
               每轮至多
               <select
@@ -1531,16 +1575,20 @@ watch(cardGeneration, () => {
                 :codex="inspector.codex"
                 :known="inspector.known"
                 :active-entities="inspector.activeEntities"
+                @refresh="loadInspector"
               />
               <SummaryPanel
                 v-else
+                :session-id="props.meta.id"
                 :summary="inspector.summary"
                 :proposals="inspector.proposals"
                 :summarizing="summarizing"
                 :result="summaryResult"
                 :deciding="decidingId"
+                :deciding-all="decidingAll"
                 @summarize="summarizeNow"
                 @decide="decideProposal"
+                @decide-all="decideAllProposals"
               />
             </template>
           </template>

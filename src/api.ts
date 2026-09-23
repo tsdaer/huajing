@@ -10,6 +10,7 @@ import type {
   CardSummary,
   DiagRecord,
   ImportReport,
+  CompletionResult,
   InspectorData,
   InspectorProposal,
   MemRecord,
@@ -21,6 +22,7 @@ import type {
   ResolvePreview,
   RuntimeInfo,
   SceneView,
+  SemanticCheck,
   SessionMeta,
   Settings,
   StreamEvent,
@@ -113,6 +115,22 @@ export const api = {
   /** 设定收件箱：确认或否决一条提案，返回更新后的提案 */
   decideProposal: (sessionId: string, id: string, accept: boolean, note?: string) =>
     invoke<InspectorProposal>("decide_proposal", { sessionId, id, accept, note }),
+  /** 设定收件箱批量处理（M3.8）：全部确认 / 全部否决，返回处理条数 */
+  decideAllProposals: (sessionId: string, accept: boolean) =>
+    invoke<number>("decide_all_proposals", { sessionId, accept }),
+  /** 手动补全（M3.8 · 设计 §6.8-1）：为缺失 facet 生成草稿（未落流，diff 卡片审阅用） */
+  codexComplete: (sessionId: string, target: string) =>
+    invoke<CompletionResult>("codex_complete", { sessionId, target }),
+  /** 手动补全的接受侧（M3.8）：propose+accept 落流并物化进正史，返回写入条数 */
+  codexCompleteApply: (
+    sessionId: string,
+    target: string,
+    facets: Record<string, unknown>,
+    note?: string,
+  ) => invoke<number>("codex_complete_apply", { sessionId, target, facets, note }),
+  /** 语义矛盾检测（M3.8 · §6.8-3 可选）：对一条待审提案跑便宜档对照判断 */
+  codexSemanticCheck: (sessionId: string, id: string) =>
+    invoke<SemanticCheck>("codex_semantic_check", { sessionId, id }),
   /** 手动触发一次总结（可能较慢；正常路径是消息滑出窗口后自动触发） */
   summarizeNow: (sessionId: string) => invoke<string>("summarize_now", { sessionId }),
 
@@ -161,6 +179,9 @@ export const api = {
   /** 配置每轮发言数上限（M3.4 群聊 · 导演调度的限流旋钮；0 = 恢复缺省 2） */
   setMaxSpeakers: (sessionId: string, maxSpeakers: number) =>
     invoke<number>("set_max_speakers", { sessionId, maxSpeakers }),
+  /** 即兴模式开关（M3.8 · 设计 §6.8-4，默认关） */
+  setImprov: (sessionId: string, improv: boolean) =>
+    invoke<boolean>("set_improv", { sessionId, improv }),
 
   // ---------- 剧场模式（M3.6 · 设计 §10.5：自动轮次 + 导演树起承转合 + 交叉剪辑） ----------
   /** 剧场视图（进度指示：当前阶段 / 已用与剩余轮数） */

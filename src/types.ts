@@ -61,6 +61,8 @@ export interface Settings {
   wizard_done: boolean;
   /** 出网代理；空则自动（环境变量 → Windows 系统代理 → 直连） */
   proxy?: string | null;
+  /** 运行期自动接受既有实体的小事实（M3.8 · §6.8-2 分级；缺省关 = 进收件箱人工） */
+  auto_accept_minor_facts?: boolean;
 }
 
 /** 用户人格（personas/*.json） */
@@ -82,6 +84,8 @@ export interface SessionMeta {
   max_speakers?: number | null;
   /** 剧场模式（M3.6：自动轮次 + 导演树；null = 关闭） */
   theater?: TheaterConfig | null;
+  /** 即兴模式（M3.8 · §6.8-4：薄实体现场补「设定·暂定」；缺省关） */
+  improv?: boolean;
 }
 
 /** 剧场模式配置（M3.6 · 设计 §10.5） */
@@ -564,6 +568,8 @@ export interface InspectorEntity {
   oneLiner: string;
   /** 恒注入的辨识锚点（跨 200 轮不漂移） */
   anchors: string[];
+  /** 缺失的模板 facet 路径（M3.8：编辑器高亮 +「补全」按钮） */
+  missing: string[];
 }
 
 /** 设定集视图 */
@@ -578,11 +584,40 @@ export interface InspectorProposal {
   id: string;
   /** propose | accept | reject */
   status: string;
-  /** new_entity | new_fact | fact_change | relation | episode | thread | psyche */
+  /** new_entity | new_fact | fact_change | relation | transient | episode | thread | psyche */
   kind: string;
   turn: number;
+  /** pipeline | complete | improv | manual（M3.8 起投影带出） */
+  origin?: string;
   payload?: unknown;
   note?: string | null;
+  /** 冲突双源呈现的「正史现值」一侧（M3.8：new_fact/fact_change 才有） */
+  currentValue?: { facet: string; value: unknown; source: string } | null;
+}
+
+/** 手动补全的一个 facet 草稿（complete.rs 校验结论随条目给出） */
+export interface CompletionItem {
+  facet: string;
+  value: unknown;
+  /** 非空 = 该条被确定性校验驳回（anchors 等），不可接受 */
+  rejected?: string | null;
+  /** 非空 = 警告级冲突（双源呈现，人工裁决） */
+  warn?: { detail: string; current?: unknown } | null;
+}
+
+/** 语义矛盾检测结果（codex_semantic_check · §6.8-3 可选 LLM 检测） */
+export interface SemanticCheck {
+  id: string;
+  contradictions: string[];
+  provider: string;
+}
+
+/** 手动补全的生成结果（codex_complete 命令返回；未落流的草稿） */
+export interface CompletionResult {
+  target: string;
+  items: CompletionItem[];
+  note: string;
+  provider: string;
 }
 
 /** 记忆检查器的全量投影（M2.8 面板一次拉全） */

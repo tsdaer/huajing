@@ -274,6 +274,9 @@ pub struct BuildInputs<'a> {
     pub world_directive: Option<&'a str>,
     /// B1 时代行（M3.7 · 设计 §6.6）：「公告期——公告已贴出…」；没有 worldline = None
     pub era: Option<&'a str>,
+    /// B2「设定·暂定」行（M3.8 · 设计 §6.8-4）：即兴模式现场补的暂定事实，
+    /// 带标记进当轮注入；空切片 = 即兴没开/没触发，B2 与之前一字不差
+    pub improv_lines: &'a [String],
     /// C1 滚动摘要（M2.6 · 设计 §5.3：总结管线产出的编年史体梗概，空则省略）
     pub summary: Option<&'a str>,
     /// 隔离模式的「只扮演 X」提示（M3.1 · 设计 §10.2；单角色为 None，A1 不变）
@@ -457,15 +460,31 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     // 把开放生成收窄到当前状态允许的表演空间，§7.4）。
     // M3.7：世界主线阶段的 directive 拼在最前（设计 §6.6「大势压着小情绪」）——
     // 世界段是这棵指令树的超根。
+    // M3.8：即兴模式的「设定·暂定」行拼在末尾（§6.8-4：便宜模型现场补的暂定事实，
+    // 带标记注入，确认前只活在这一轮）。
     let b2_limit = budget.limit("B2");
     let char_directive = inputs.directive.filter(|d| !d.trim().is_empty());
     let world_directive = inputs.world_directive.filter(|d| !d.trim().is_empty());
-    let b2_text = match (world_directive, char_directive) {
-        (Some(w), Some(c)) => Some(format!("{w}\n\n{c}")),
-        (Some(w), None) => Some(w.to_string()),
-        (None, Some(c)) => Some(c.to_string()),
-        (None, None) => None,
-    };
+    let improv_block = (!inputs.improv_lines.is_empty()).then(|| {
+        let mut s = String::from("【设定·暂定】以下是本轮临时采用的补充设定（未经确认的草稿，可自然引用，不要当作长期设定复述）：");
+        for line in inputs.improv_lines {
+            s.push('\n');
+            s.push_str("· ");
+            s.push_str(line);
+        }
+        s
+    });
+    let mut b2_parts: Vec<&str> = Vec::new();
+    if let Some(w) = world_directive.as_deref() {
+        b2_parts.push(w);
+    }
+    if let Some(c) = char_directive.as_deref() {
+        b2_parts.push(c);
+    }
+    if let Some(i) = improv_block.as_deref() {
+        b2_parts.push(i);
+    }
+    let b2_text = (!b2_parts.is_empty()).then(|| b2_parts.join("\n\n"));
     if let Some(d) = b2_text {
         let (content, cut) = fit_tagged("directive", &d, b2_limit);
         if !content.is_empty() {
@@ -1190,6 +1209,7 @@ mod tests {
             directive: None,
             world_directive: None,
             era: None,
+            improv_lines: &[],
             summary: None,
             history,
             user_content,

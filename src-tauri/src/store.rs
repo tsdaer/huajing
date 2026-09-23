@@ -3,7 +3,7 @@
 //! M1.1 范围：providers / settings / personas 读写；会话目录骨架与
 //! messages.jsonl 追加式落盘（可回放）。卡片加载与热加载见 card.rs（M1.2）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -180,6 +180,10 @@ pub struct Settings {
     /// 模型上下文窗口（token；缺省按 32768 计）。设计 §4.2：输入预算 = 上下文 × 75%
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<usize>,
+    /// 运行期自动接受既有实体的小事实（M3.8 · 设计 §6.8-2 分级捕获的中档）。
+    /// false = 进收件箱人工确认（缺省）；瞬时状态写黑板与全新实体必人工不受它影响。
+    #[serde(default)]
+    pub auto_accept_minor_facts: bool,
 }
 
 impl Settings {
@@ -209,6 +213,7 @@ impl Default for Settings {
             wizard_done: false,
             proxy: None,
             context_window: None,
+            auto_accept_minor_facts: false,
         }
     }
 }
@@ -294,6 +299,10 @@ pub struct SessionMeta {
     /// None = 关闭。导演树本体住在 sessions/<id>/director.lua（缺省用内置起承转合树）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theater: Option<TheaterConfig>,
+    /// 即兴模式（M3.8 · 设计 §6.8-4，默认关）：激活实体过薄时，便宜模型现场补一条
+    /// 「设定·暂定」注入当轮生效；提案照落收件箱，确认后才算正史。
+    #[serde(default)]
+    pub improv: bool,
 }
 
 /// 事件流里的一条消息（M2.0 起 messages.jsonl 是类型化事件流，
@@ -486,6 +495,7 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         premise: req.premise.clone(),
         max_speakers: None,
         theater: None,
+        improv: false,
     };
     let dir = session_dir(root, &meta.id);
     std::fs::create_dir_all(&dir)?;
@@ -869,6 +879,41 @@ pub fn save_world(
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(state)? + "\n")?;
+    Ok(())
+}
+
+// ---------- 收件箱正史物化（M3.8 · 设计 §6.9）：确认的提案落世界级 grown.json ----------
+
+/// 正史增量文件：`codex/<世界>/grown.json`。玩家手写的实体文件**永不被机器改写**
+/// （anchors 等手写内容不被覆盖）；收件箱确认的提案物化成这里的补丁，加载设定集时
+/// 应用（`codex::apply_grown`）：新实体追加、既有实体深合并。明文 JSON，可手动审阅删除。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GrownFile {
+    /// 实体 id → 补丁（新实体 = 全量骨架；既有实体 = 部分覆盖：facts 深合并、
+    /// aliases/relations 追加去重、secrets 按 key 合并）
+    #[serde(default)]
+    pub entities: BTreeMap<String, serde_json::Value>,
+}
+
+pub fn grown_path(root: &Path, world: &str) -> PathBuf {
+    root.join("codex").join(world).join("grown.json")
+}
+
+/// 读正史增量。缺文件 = 空（从没有过收件箱写入）。
+pub fn load_grown(root: &Path, world: &str) -> GrownFile {
+    std::fs::read_to_string(grown_path(root, world))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 写正史增量（目录不存在则建；全量覆盖）
+pub fn save_grown(root: &Path, world: &str, grown: &GrownFile) -> StoreResult<()> {
+    let path = grown_path(root, world);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(grown)? + "\n")?;
     Ok(())
 }
 

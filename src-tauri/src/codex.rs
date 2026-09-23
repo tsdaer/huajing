@@ -33,6 +33,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::prompt::estimate_tokens;
+use crate::store;
 
 // ---------- 常量（设计 §6）----------
 
@@ -577,6 +578,107 @@ fn fact_path<'a>(e: &'a CodexEntity, path: &str) -> Option<&'a Value> {
         cur = cur.get(p)?;
     }
     Some(cur)
+}
+
+/// 静态正史取值（点分路径；不含 variants/versions 的时间层）。
+///
+/// 一致性校验的「正史现值」一侧用静态 canon：冲突呈现关心的是写定的设定，
+/// 「第 N 天取旧版」的解析（facet_at）需要时钟上下文，那里不适合做校验依据。
+pub fn static_fact<'a>(e: &'a CodexEntity, path: &str) -> Option<&'a Value> {
+    fact_path(e, path)
+}
+
+/// 把收件箱确认的正史增量（grown.json，M3.8 · 设计 §6.9）应用到实体列表上。
+///
+/// 合并语义（确定性、幂等——同一补丁应用两次与一次结果一致）：
+/// - 补丁 id 不存在 → 追加为新实体（补丁即全量骨架，缺 id 时用键补）；
+/// - 补丁 id 已存在 → **深合并**：facts 递归合并（对象并集、标量后写覆盖）、
+///   aliases 并入去重、relations 按 to+kind 去重追加、secrets 按 key 覆盖合并；
+///   one_liner/status/type 等标量仅在补丁给出非空值时覆盖。
+///
+/// 玩家手写的实体文件永不被机器改写——增量住在 grown.json 里，撤掉一行即回滚。
+pub fn apply_grown(mut entities: Vec<CodexEntity>, grown: &store::GrownFile) -> Vec<CodexEntity> {
+    for (id, patch) in &grown.entities {
+        let mut patch = patch.clone();
+        if let Some(obj) = patch.as_object_mut() {
+            obj.entry("id").or_insert_with(|| Value::String(id.clone()));
+        }
+        match entities.iter().position(|e| &e.id == id) {
+            Some(idx) => {
+                // 部分补丁缺 name/type 必填字段：借既有实体的补齐再解析
+                //（补丁只带增量是常态，不能因此整个丢弃）
+                if let Err(_) = CodexEntity::from_value(&patch) {
+                    let base = &entities[idx];
+                    if let Some(obj) = patch.as_object_mut() {
+                        obj.entry("name").or_insert_with(|| Value::String(base.name.clone()));
+                        obj.entry("type").or_insert_with(|| Value::String(base.ty.clone()));
+                    }
+                }
+                match CodexEntity::from_value(&patch) {
+                    Ok(parsed) => merge_entity(&mut entities[idx], parsed),
+                    Err(e) => {
+                        crate::diag::record("codex", format!("正史增量 {id} 解析失败，已跳过：{e}"))
+                    }
+                }
+            }
+            None => match CodexEntity::from_value(&patch) {
+                Ok(parsed) => entities.push(parsed),
+                Err(e) => {
+                    crate::diag::record("codex", format!("正史增量 {id} 解析失败，已跳过：{e}"))
+                }
+            },
+        }
+    }
+    entities
+}
+
+/// 把补丁实体并入既有实体（幂等：并集语义，标量后写覆盖）。
+/// type 不覆盖——改既有实体的类型会换模板、改注入语义，撤增量重写是正道。
+fn merge_entity(base: &mut CodexEntity, patch: CodexEntity) {
+    if !patch.one_liner.is_empty() {
+        base.one_liner = patch.one_liner;
+    }
+    for a in patch.aliases {
+        if !base.aliases.iter().any(|x| x == &a) {
+            base.aliases.push(a);
+        }
+    }
+    merge_facts(&mut base.facts, patch.facts);
+    for (key, secret) in patch.secrets {
+        base.secrets.insert(key, secret);
+    }
+    for r in patch.relations {
+        if !base.relations.iter().any(|x| x.to == r.to && x.kind == r.kind) {
+            base.relations.push(r);
+        }
+    }
+    if !patch.live.is_empty() {
+        for l in patch.live {
+            if !base.live.contains(&l) {
+                base.live.push(l);
+            }
+        }
+    }
+}
+
+/// facts 递归合并：两边都是对象 → 并集递归；否则补丁值覆盖
+fn merge_facts(base: &mut BTreeMap<String, Value>, patch: BTreeMap<String, Value>) {
+    for (key, value) in patch {
+        match base.get_mut(&key) {
+            Some(Value::Object(prev_obj)) if value.is_object() => {
+                let patch_map: BTreeMap<String, Value> =
+                    value.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let mut prev_map: BTreeMap<String, Value> =
+                    prev_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                merge_facts(&mut prev_map, patch_map);
+                *prev_obj = prev_map.into_iter().collect();
+            }
+            Some(slot) => *slot = value,
+            None => {
+                base.insert(key, value);
+            }
+        }
+    }
 }
 
 // ---------- 字段读取小工具（Lua/JSON 宽容解析）----------
@@ -3051,6 +3153,78 @@ mod tests {
     }
 
     // ---------- anchors 保护级（§6.8）----------
+
+    /// 正史增量合并（M3.8 · §6.9）：既有实体深合并、新实体追加、幂等可重放
+    #[test]
+    fn apply_grown_merges_idempotently_and_appends_new_entities() {
+        let base = CodexEntity::from_value(&json!({
+            "id": "char.小雨", "type": "char", "name": "小雨", "one_liner": "夜班管理员。",
+            "aliases": ["管理员"],
+            "facts": {
+                "schedule": "18:00–24:00 值班",
+                "look": { "impression": "旧毛衣。", "anchors": ["泪痣"] }
+            },
+            "relations": [ { "to": "place.图书馆", "kind": "works_at" } ]
+        }))
+        .unwrap();
+        let grown = store::GrownFile {
+            entities: [
+                ("char.小雨".to_string(), json!({
+                    "facts": {
+                        "schedule": "周三也休息",
+                        "look": { "impression2": "袖口的铅笔灰" }
+                    },
+                    "aliases": ["夜班之星"],
+                    "relations": [
+                        { "to": "place.图书馆", "kind": "works_at" },
+                        { "to": "item.便签", "kind": "fond_of" }
+                    ]
+                })),
+                ("char.墨墨".to_string(), json!({
+                    "type": "char", "name": "墨墨",
+                    "facts": { "look": { "impression": "一只黑猫" } }
+                })),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let once = apply_grown(vec![base], &grown);
+        assert_eq!(once.len(), 2, "新实体追加");
+        let xiaoyu = once.iter().find(|e| e.id == "char.小雨").unwrap();
+        // 深合并：同键覆盖、兄弟键保留、嵌套对象并集
+        assert_eq!(
+            codex_static(&once, "char.小雨", "schedule"),
+            Some(&json!("周三也休息"))
+        );
+        assert_eq!(
+            codex_static(&once, "char.小雨", "look.impression"),
+            Some(&json!("旧毛衣。")),
+            "补丁没写的兄弟键不能丢"
+        );
+        assert_eq!(
+            codex_static(&once, "char.小雨", "look.impression2"),
+            Some(&json!("袖口的铅笔灰"))
+        );
+        assert!(xiaoyu.anchors().contains(&"泪痣".to_string()));
+        assert!(xiaoyu.aliases.contains(&"夜班之星".to_string()));
+        assert_eq!(xiaoyu.relations.len(), 2, "重复关系去重、新关系追加");
+        // 新实体补丁即全量骨架
+        let momo = once.iter().find(|e| e.id == "char.墨墨").unwrap();
+        assert_eq!(momo.name, "墨墨");
+        assert_eq!(momo.status, "canon", "收件箱确认进来的就是正史");
+        // 幂等：同一补丁再应用一次，结果不变（重放安全）
+        let twice = apply_grown(once.clone(), &grown);
+        assert_eq!(twice, once, "apply_grown 必须幂等");
+    }
+
+    /// 测试辅助：应用后按 id+路径取静态 fact
+    fn codex_static<'a>(
+        entities: &'a [CodexEntity],
+        id: &str,
+        path: &str,
+    ) -> Option<&'a Value> {
+        entities.iter().find(|e| e.id == id).and_then(|e| static_fact(e, path))
+    }
 
     #[test]
     fn anchors_conflict_rejects_proposals() {

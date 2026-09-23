@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::card;
 use crate::codex;
+use crate::complete;
 use crate::director;
 use crate::event::{self, LogBody, LogRecord};
 use crate::palace;
@@ -1114,7 +1115,20 @@ fn load_codex(
     world: &str,
 ) -> Arc<codex::Codex> {
     let dir = codex_entities_dir(root, world);
-    let fp = world_fingerprint(&dir);
+    let mut fp = world_fingerprint(&dir);
+    // 指纹混入 grown.json（M3.8）：确认提案后文件变了，缓存自然失效（改文件即生效，同款判据）
+    let grown_file = store::grown_path(root, world);
+    if let Ok(md) = std::fs::metadata(&grown_file) {
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        for byte in format!("grown:{}:{}", md.len(), mtime).bytes() {
+            fp = (fp ^ byte as u64).wrapping_mul(1099511628211);
+        }
+    }
     if let Some(cache) = cache {
         if let Ok(map) = cache.0.lock() {
             if let Some((cached, codex)) = map.get(world) {
@@ -1124,7 +1138,9 @@ fn load_codex(
             }
         }
     }
-    let codex = Arc::new(codex::Codex::build(parse_entities(&dir)));
+    // 正史增量在解析后应用（M3.8 · 设计 §6.9）：收件箱确认的提案经它进注入
+    let entities = codex::apply_grown(parse_entities(&dir), &store::load_grown(root, world));
+    let codex = Arc::new(codex::Codex::build(entities));
     if let Some(cache) = cache {
         if let Ok(mut map) = cache.0.lock() {
             map.insert(world.to_string(), (fp, codex.clone()));
@@ -1906,6 +1922,24 @@ fn assemble_prompt_core(
     };
 
     let summary_text = proj.summary_for(scene);
+    // B2「设定·暂定」（M3.8 · 设计 §6.8-4）：本轮落流的 improv 提案回读进注入。
+    // 注入内容从投影取（不重调模型）——重放/重建时同一提案事件还在，同一行还在，
+    // 这正是「重放语义不随模型漂移」的兑现形式。
+    let improv_lines: Vec<String> = proj
+        .proposals
+        .values()
+        .filter_map(|v| {
+            if v.get("origin").and_then(|o| o.as_str()) != Some("improv")
+                || v.get("turn").and_then(|t| t.as_u64()) != Some(turn)
+            {
+                return None;
+            }
+            v.get("payload")
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
+        .collect();
     let inputs = prompt::BuildInputs {
         settings: &settings,
         persona: persona.as_ref(),
@@ -1922,6 +1956,7 @@ fn assemble_prompt_core(
         directive: directive.as_deref(),
         world_directive: world_directive.as_deref(),
         era: era.as_deref(),
+        improv_lines: &improv_lines,
         // 摘要分卷（M3.2 · 设计 §10.4）：世界层大事记 + 本场景分卷；别的场景不进这次请求
         summary: summary_text.as_deref(),
         cast_note: cast_note.as_deref(),
@@ -3902,7 +3937,7 @@ pub async fn send_message(
     // 接入点（chat 档；先校验再落盘用户消息，配置错误不产生半截会话）
     let provider = pick_chat_provider(&root)?;
 
-    let proj = project_session(&log, &root, &meta)?;
+    let mut proj = project_session(&log, &root, &meta)?;
     let scene = scene_ctx(&proj);
 
     // 发言人解析（见函数头注释）
@@ -3998,6 +4033,30 @@ pub async fn send_message(
     }
 
     let first = &picks[0];
+    // 即兴模式（M3.8 · 设计 §6.8-4，默认关）：本轮被提及的实体过薄时，便宜模型
+    // 现场补一条「设定·暂定」——提案先落流（origin=improv），组装时经投影回读进 B2。
+    // 失败静默跳过：即兴是锦上添花，永远不能挡住说话。
+    if meta.improv {
+        match maybe_improv(
+            &root,
+            &meta,
+            &codex_cache,
+            &content,
+            &proj,
+            scene.as_deref(),
+            turn,
+            &log,
+        )
+        .await
+        {
+            Ok(Some(id)) => {
+                proj = project_session(&log, &root, &meta)?;
+                crate::diag::record("improv", format!("即兴补设定：{id}"));
+            }
+            Ok(None) => {}
+            Err(e) => crate::diag::record("improv", format!("即兴补设定失败（跳过）：{e}")),
+        }
+    }
     // on_context 在此运行并事件化落盘：卡片可能顺手改了 state/黑板/界面事件。
     // （第一位发言人的组装——此时用户消息尚未落盘，随 content 单独进上下文）
     let run = assemble_prompt_core(
@@ -4735,6 +4794,351 @@ pub fn set_max_speakers(session_id: String, max_speakers: u32) -> Result<u32, St
     Ok(meta.max_speakers.unwrap_or(DEFAULT_MAX_SPEAKERS as u32))
 }
 
+/// 即兴模式开关（M3.8 · 设计 §6.8-4，默认关）
+#[tauri::command]
+pub fn set_improv(session_id: String, improv: bool) -> Result<bool, String> {
+    let root = root();
+    let mut meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    meta.improv = improv;
+    store::save_session(&root, &meta).map_err(|e| e.to_string())?;
+    Ok(meta.improv)
+}
+
+// ---------- 即兴模式（M3.8 · 设计 §6.8-4）：薄实体现场补「设定·暂定」----------
+
+/// 发送路径的即兴步骤：本轮文本提及的实体过薄（`complete::THIN_THRESHOLD`）时，
+/// 调便宜档补一条暂定事实并落 improv 提案。
+///
+/// 返回 `Ok(Some(id))` = 落了一条提案（调用方随后重投影，让组装经投影回读注入行）；
+/// `Ok(None)` = 没触发（未开 / 无薄实体 / 模型没给出有效内容）；`Err` = 管线侧失败，
+/// 调用方记诊断跳过——即兴永远不挡说话。
+#[allow(clippy::too_many_arguments)]
+async fn maybe_improv(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    codex_cache: &CodexCache,
+    user_text: &str,
+    proj: &event::Projection,
+    scene: Option<&str>,
+    turn: u64,
+    log: &store::EventLog,
+) -> Result<Option<String>, String> {
+    let cx = load_codex(root, Some(codex_cache), &session_world(meta));
+    // 会话种子：本轮输入 + 当前场景最近几条（即兴要顺着刚聊起来的话头长）
+    let mut seed = String::from(user_text);
+    for m in proj.messages.iter().rev() {
+        if seed.lines().count() >= 8 {
+            break;
+        }
+        if let Some(sc) = scene {
+            if proj.scene_of_message(m) != sc {
+                continue;
+            }
+        }
+        seed = format!("{}：{}\n{seed}", m.name.as_deref().unwrap_or(m.role.as_str()), m.content);
+    }
+    let Some(entity) = complete::improv_candidates(&cx, &seed).into_iter().next() else {
+        return Ok(None);
+    };
+    let world_lines: Vec<String> = cx
+        .entities()
+        .iter()
+        .filter(|e| e.status != "retired")
+        .take(40)
+        .map(|e| format!("{} {} {}——{}", e.id, e.ty, e.name, e.one_liner))
+        .collect();
+    let prompt_text = complete::build_improv_prompt(entity, &world_lines, &seed);
+    let provider = pick_util_provider(root)?;
+    let proxy = store::load_settings(root)
+        .ok()
+        .and_then(|s| s.proxy)
+        .filter(|p| !p.trim().is_empty());
+    let raw = llm::chat_complete(
+        &provider,
+        &[llm::ChatMessage {
+            role: "user".into(),
+            content: prompt_text,
+        }],
+        1024,
+        0.6,
+        proxy.as_deref(),
+    )
+    .await?;
+    let Some(draft) = complete::parse_improv(&raw)? else {
+        return Ok(None);
+    };
+    // anchors 最高保护级：即兴也不许碰（§6.8-3）
+    let proposal_value = serde_json::json!({ "facet": draft.facet, "value": draft.value });
+    if let Some(reason) = cx
+        .get(&entity.id)
+        .and_then(|e| codex::anchors_conflict(e, &proposal_value))
+    {
+        crate::diag::record("improv", format!("即兴提案与辨识点冲突，丢弃：{reason}"));
+        return Ok(None);
+    }
+    let id = format!("improv.{}.{}", entity.id, turn);
+    commit(
+        log,
+        root,
+        meta,
+        LogBody::Proposal(event::ProposalEvent {
+            turn,
+            id: id.clone(),
+            op: "propose".into(),
+            kind: "new_fact".into(),
+            origin: "improv".into(),
+            payload: Some(serde_json::json!({
+                "target": entity.id,
+                "value": { "facet": draft.facet, "value": draft.value },
+                "text": draft.text,
+                "provisional": true,
+                "reason": format!("第 {turn} 轮即兴补一条暂定设定（{}）", provider.name),
+            })),
+            note: None,
+            ts: store::unix_now(),
+        }),
+    )?;
+    Ok(Some(id))
+}
+
+/// 手动补全（M3.8 · 设计 §6.8-1）：为选中实体的缺失 facet 生成草稿。
+///
+/// 读实体 + 一跳关系 + 世界概览 → util 档生成 → 返回未落流的草稿（前端 diff 卡片
+/// 呈现：接受 = codex_complete_apply 走提案通道物化；重写 = 再调一次；丢弃 = 无事发生）。
+#[tauri::command]
+pub async fn codex_complete(
+    session_id: String,
+    target: String,
+    codex_cache: State<'_, CodexCache>,
+) -> Result<serde_json::Value, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let cx = load_codex(&root, Some(&codex_cache), &session_world(&meta));
+    let entity = cx
+        .get(&target)
+        .ok_or_else(|| format!("实体 {target} 不存在"))?
+        .clone();
+    let missing = complete::missing_facets(&entity);
+    if missing.is_empty() {
+        return Err("这个实体的模板 facets 都齐了，没什么可补的".into());
+    }
+    // 一跳关系邻体（relations.to 指向的实体，一行一个）
+    let neighbors: Vec<String> = entity
+        .relations
+        .iter()
+        .filter_map(|r| {
+            cx.get(&r.to).map(|n| {
+                format!("{} {} {}——{}", n.id, n.ty, n.name, n.one_liner)
+            })
+        })
+        .collect();
+    let world_lines: Vec<String> = cx
+        .entities()
+        .iter()
+        .filter(|e| e.status != "retired")
+        .take(40)
+        .map(|e| format!("{} {} {}——{}", e.id, e.ty, e.name, e.one_liner))
+        .collect();
+    // 时代基调（M3.7 世界主线的叶阶段 directive）：补全要与「现在」的大势一致。
+    // 路径回落用世界时钟进度（补全不依赖会话事件流，任何入口都能拿到同一大势）
+    let world_name = session_world(&meta);
+    let era = load_worldline(&root, &world_name).and_then(|wl| {
+        let world_state = store::load_world(&root, &world_name);
+        let path = match world_state.worldline {
+            Some(prog) if prog.id == wl.id && !prog.path.is_empty() => prog.path,
+            _ => wl.tree.active_path(&wl.tree.root),
+        };
+        worldline::era_line(&wl.tree, &path)
+    });
+    let ctx = complete::CompletionContext {
+        entity: &entity,
+        neighbors: &neighbors,
+        world_lines: &world_lines,
+        premise: meta.premise.as_deref(),
+        era: era.as_deref(),
+    };
+    let prompt_text = complete::build_completion_prompt(&ctx);
+    let provider = pick_util_provider(&root)?;
+    let proxy = store::load_settings(&root)
+        .ok()
+        .and_then(|s| s.proxy)
+        .filter(|p| !p.trim().is_empty());
+    let raw = llm::chat_complete(
+        &provider,
+        &[llm::ChatMessage {
+            role: "user".into(),
+            content: prompt_text,
+        }],
+        4096,
+        0.4,
+        proxy.as_deref(),
+    )
+    .await?;
+    let (facets, note) = complete::parse_completion(&raw)
+        .map_err(|e| format!("补全回复解析失败：{e}"))?;
+    // 逐 facet 校验（确定性先行）：anchors 冲突的条目直接剔除并说明
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for (facet, value) in &facets {
+        let payload = serde_json::json!({ "facet": facet, "value": value });
+        let issues = complete::validate_proposal(&cx, &target, "new_fact", &payload);
+        let rejected = issues
+            .iter()
+            .find(|i| i.level == complete::IssueLevel::Reject)
+            .map(|i| i.detail.clone());
+        let warn = issues
+            .iter()
+            .find(|i| i.level == complete::IssueLevel::Warn)
+            .map(|i| serde_json::json!({ "detail": i.detail, "current": i.current }));
+        items.push(serde_json::json!({
+            "facet": facet,
+            "value": value,
+            "rejected": rejected,
+            "warn": warn,
+        }));
+    }
+    Ok(serde_json::json!({
+        "target": target,
+        "items": items,
+        "note": note,
+        "provider": provider.name,
+    }))
+}
+
+/// 语义矛盾检测（M3.8 · 设计 §6.8-3「可选 LLM 语义矛盾检测」）：按需对收件箱里的
+/// 一条 codex 提案跑一次便宜档对照判断。结论只返回给界面做双源呈现，确认/否决时
+/// 随 note 留档进事件流——重放不重调模型，与摘要产物同纪律。
+#[tauri::command]
+pub async fn codex_semantic_check(
+    session_id: String,
+    id: String,
+    log: tauri::State<'_, store::EventLog>,
+    codex_cache: tauri::State<'_, CodexCache>,
+) -> Result<serde_json::Value, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    let entry = proj
+        .proposals
+        .get(&id)
+        .ok_or_else(|| format!("提案 {id} 不存在"))?;
+    let payload = entry.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+    let target = payload
+        .get("target")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if target.is_empty() {
+        return Err("这条提案没有目标实体，语义检查无对象".into());
+    }
+    let cx = load_codex(&root, Some(&codex_cache), &session_world(&meta));
+    let entity = cx
+        .get(&target)
+        .ok_or_else(|| format!("实体 {target} 不在设定集里"))?;
+    let fact_brief = serde_json::to_string_pretty(&serde_json::json!({
+        "id": entity.id,
+        "name": entity.name,
+        "one_liner": entity.one_liner,
+        "facts": entity.facts,
+    }))
+    .map_err(|e| e.to_string())?;
+    let proposal_brief = serde_json::to_string_pretty(&payload)
+        .map_err(|e| e.to_string())?;
+    let prompt_text = complete::build_semantic_check_prompt(&fact_brief, &proposal_brief);
+    let provider = pick_util_provider(&root)?;
+    let proxy = store::load_settings(&root)
+        .ok()
+        .and_then(|s| s.proxy)
+        .filter(|p| !p.trim().is_empty());
+    let raw = llm::chat_complete(
+        &provider,
+        &[llm::ChatMessage {
+            role: "user".into(),
+            content: prompt_text,
+        }],
+        1024,
+        0.2,
+        proxy.as_deref(),
+    )
+    .await?;
+    let contradictions = complete::parse_semantic_check(&raw);
+    Ok(serde_json::json!({
+        "id": id,
+        "contradictions": contradictions,
+        "provider": provider.name,
+    }))
+}
+
+/// 手动补全的接受侧：一条提案落 propose + accept（origin=complete，动作可溯源），
+/// 物化与收件箱确认同一条路——确认即写正史进注入。
+#[tauri::command]
+pub fn codex_complete_apply(
+    session_id: String,
+    target: String,
+    facets: std::collections::BTreeMap<String, serde_json::Value>,
+    note: Option<String>,
+    log: State<'_, store::EventLog>,
+) -> Result<usize, String> {
+    codex_complete_apply_core(&log, &root(), &session_id, target, facets, note)
+}
+
+fn codex_complete_apply_core(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    session_id: &str,
+    target: String,
+    facets: std::collections::BTreeMap<String, serde_json::Value>,
+    note: Option<String>,
+) -> Result<usize, String> {
+    let meta = store::load_session(root, session_id).map_err(|e| e.to_string())?;
+    let world = session_world(&meta);
+    let turn = project_session(log, root, &meta)?
+        .last_message()
+        .map(|m| m.turn)
+        .unwrap_or(0);
+    let mut applied = 0usize;
+    for (facet, value) in &facets {
+        let id = format!("complete.{}.{}.{}", target, turn, facet);
+        let payload = serde_json::json!({
+            "target": target,
+            "value": { "facet": facet, "value": value },
+            "reason": "手动补全（模板驱动）",
+        });
+        commit(
+            log,
+            root,
+            &meta,
+            LogBody::Proposal(event::ProposalEvent {
+                turn,
+                id: id.clone(),
+                op: "propose".into(),
+                kind: "new_fact".into(),
+                origin: "complete".into(),
+                payload: Some(payload.clone()),
+                note: note.clone(),
+                ts: store::unix_now(),
+            }),
+        )?;
+        commit(
+            log,
+            root,
+            &meta,
+            LogBody::Proposal(event::ProposalEvent {
+                turn,
+                id,
+                op: "accept".into(),
+                kind: "new_fact".into(),
+                origin: "manual".into(),
+                payload: None,
+                note: Some("补全卡片接受".into()),
+                ts: store::unix_now(),
+            }),
+        )?;
+        materialize_accepted(root, &world, "new_fact", payload);
+        applied += 1;
+    }
+    Ok(applied)
+}
+
 // ---------- 记忆检查器 v0（设计 §4.2：组装结果逐层可见）----------
 
 /// 预览组装：按当前状态干跑一轮（不含用户消息），不发送。
@@ -5346,6 +5750,7 @@ fn inspector_payload(
     });
 
     // 设定集：世界清单（草稿与正史都列，注入只认 canon）
+    // M3.8：每个实体带缺失 facet 清单（实体编辑器高亮 +「补全」按钮的数据源）
     let world = session_world(meta);
     let cx = load_codex(root, codex_cache, &world);
     let entities: Vec<serde_json::Value> = cx
@@ -5355,7 +5760,48 @@ fn inspector_payload(
             serde_json::json!({
                 "id": e.id, "name": e.name, "type": e.ty, "status": e.status,
                 "oneLiner": e.one_liner, "anchors": e.anchors(),
+                "missing": complete::missing_paths(e),
             })
+        })
+        .collect();
+
+    // 收件箱富化（M3.8 · DoD 8「冲突双源呈现」）：codex 类提案带正史现值——
+    // 收件箱里「现状 vs 提案」两边都有出处
+    let proposals: Vec<serde_json::Value> = proj
+        .proposals
+        .values()
+        .map(|p| {
+            let mut enriched = p.clone();
+            if let Some(obj) = enriched.as_object_mut() {
+                let kind = obj.get("kind").and_then(|k| k.as_str()).unwrap_or_default();
+                if matches!(kind, "new_fact" | "fact_change") {
+                    let target = obj
+                        .get("payload")
+                        .and_then(|v| v.get("target"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default();
+                    let facet = obj
+                        .get("payload")
+                        .and_then(|v| {
+                            let value = v.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                            facet_and_value(v, &value)
+                        })
+                        .map(|(f, _)| f);
+                    if let (Some(entity), Some(facet)) = (cx.get(target), facet) {
+                        if let Some(current) = codex::static_fact(entity, &facet) {
+                            obj.insert(
+                                "currentValue".into(),
+                                serde_json::json!({
+                                    "facet": facet,
+                                    "value": current,
+                                    "source": format!("{target}（正史）"),
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+            enriched
         })
         .collect();
 
@@ -5376,14 +5822,15 @@ fn inspector_payload(
         "palace": palace_view,
         "codex": { "world": world, "count": entities.len(), "entities": entities },
         "summary": proj.summary,
-        "proposals": proj.proposals.values().cloned().collect::<Vec<_>>(),
+        "proposals": proposals,
         "known": proj.known_for(&character).into_iter().collect::<Vec<_>>(),
         "blackboard": board,
         "activeEntities": runtime.map(|r| r.previously_active(&meta.id)).unwrap_or_default(),
     }))
 }
 
-/// 设定收件箱：确认或否决一条提案（设计 §6.9：确认/否决动作进事件流，回放不受影响）
+/// 设定收件箱：确认或否决一条提案（设计 §6.9：确认/否决动作进事件流，回放不受影响）。
+/// 确认的 codex 提案（M3.8）同时物化进世界的 grown.json——「确认写正史进注入」的兑现点。
 #[tauri::command]
 pub fn decide_proposal(
     session_id: String,
@@ -5392,15 +5839,25 @@ pub fn decide_proposal(
     note: Option<String>,
     log: State<'_, store::EventLog>,
 ) -> Result<serde_json::Value, String> {
-    let root = root();
-    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let turn = project_session(&log, &root, &meta)?
+    decide_proposal_core(&log, &root(), &session_id, id, accept, note)
+}
+
+fn decide_proposal_core(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    session_id: &str,
+    id: String,
+    accept: bool,
+    note: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let meta = store::load_session(root, session_id).map_err(|e| e.to_string())?;
+    let turn = project_session(log, root, &meta)?
         .last_message()
         .map(|m| m.turn)
         .unwrap_or(0);
     let proj = commit(
-        &log,
-        &root,
+        log,
+        root,
         &meta,
         LogBody::Proposal(event::ProposalEvent {
             turn,
@@ -5413,11 +5870,205 @@ pub fn decide_proposal(
             ts: store::unix_now(),
         }),
     )?;
+    if accept {
+        if let Some(entry) = proj.proposals.get(&id) {
+            materialize_accepted(
+                root,
+                &session_world(&meta),
+                entry.get("kind").and_then(|k| k.as_str()).unwrap_or_default(),
+                entry.get("payload").cloned().unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
     Ok(proj
         .proposals
         .get(&id)
         .cloned()
         .unwrap_or_else(|| serde_json::json!({ "id": id })))
+}
+
+/// 收件箱批量处理（M3.8 · DoD 8）：全部确认 / 全部否决。
+/// 只动 status = propose 的条目；codex 提案照走单条同款物化。
+#[tauri::command]
+pub fn decide_all_proposals(
+    session_id: String,
+    accept: bool,
+    log: State<'_, store::EventLog>,
+) -> Result<usize, String> {
+    decide_all_proposals_core(&log, &root(), &session_id, accept)
+}
+
+fn decide_all_proposals_core(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    session_id: &str,
+    accept: bool,
+) -> Result<usize, String> {
+    let meta = store::load_session(root, session_id).map_err(|e| e.to_string())?;
+    let pending: Vec<String> = project_session(log, root, &meta)?
+        .proposals
+        .iter()
+        .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) == Some("propose"))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let world = session_world(&meta);
+    for id in &pending {
+        let proj = commit(
+            log,
+            root,
+            &meta,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: project_session(log, root, &meta)?
+                    .last_message()
+                    .map(|m| m.turn)
+                    .unwrap_or(0),
+                id: id.clone(),
+                op: if accept { "accept" } else { "reject" }.into(),
+                kind: String::new(),
+                origin: "manual".into(),
+                payload: None,
+                note: Some(if accept { "批量确认" } else { "批量否决" }.into()),
+                ts: store::unix_now(),
+            }),
+        )?;
+        if accept {
+            if let Some(entry) = proj.proposals.get(id) {
+                materialize_accepted(
+                    root,
+                    &world,
+                    entry.get("kind").and_then(|k| k.as_str()).unwrap_or_default(),
+                    entry.get("payload").cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+    }
+    Ok(pending.len())
+}
+
+/// 确认的 codex 提案物化进世界的 grown.json（M3.8 · 设计 §6.9）。
+///
+/// 只认四种 codex 类型；其他类型（thread/psyche 等）只改状态不写设定集。
+/// payload 形态宽容：value 里带 `facet`（或 `path`/`key`）字段的写指定路径，
+/// 否则整个 value 当作该 facet 的内容无法落点——留诊断跳过（提案仍是收件箱里的记录）。
+fn materialize_accepted(root: &std::path::Path, world: &str, kind: &str, payload: serde_json::Value) {
+    const MATERIALIZABLE: [&str; 4] = ["new_entity", "new_fact", "fact_change", "relation"];
+    if !MATERIALIZABLE.contains(&kind) {
+        return;
+    }
+    let Some(target) = payload
+        .get("target")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let value = payload.get("value").cloned().unwrap_or(serde_json::Value::Null);
+    if value.is_null() {
+        return;
+    }
+    let mut grown = store::load_grown(root, world);
+    let entry = grown.entities.entry(target.clone()).or_insert_with(|| serde_json::json!({}));
+    let obj = match entry.as_object_mut() {
+        Some(o) => o,
+        None => {
+            crate::diag::record("codex", format!("正史增量 {target} 不是对象，跳过物化"));
+            return;
+        }
+    };
+    match kind {
+        "new_entity" => {
+            // 全量骨架；id 以提案 target 为准
+            *entry = value;
+            if let Some(o) = entry.as_object_mut() {
+                o.insert("id".into(), serde_json::json!(target));
+            }
+        }
+        "new_fact" | "fact_change" => {
+            let Some((facet, val)) = facet_and_value(&payload, &value) else {
+                crate::diag::record(
+                    "codex",
+                    format!("提案 {target} 的 value 没有可辨识的 facet 路径，未物化"),
+                );
+                return;
+            };
+            let facts = obj
+                .entry("facts")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(f) = facts.as_object_mut() {
+                f.insert(facet, val);
+            }
+        }
+        "relation" => {
+            let rel = if value.is_object() {
+                value
+            } else {
+                serde_json::Value::Null
+            };
+            if rel.is_null() {
+                return;
+            }
+            let rels = obj.entry("relations").or_insert_with(|| serde_json::json!([]));
+            if let Some(list) = rels.as_array_mut() {
+                let to = rel.get("to").and_then(|t| t.as_str()).unwrap_or_default();
+                let rkind = rel.get("kind").and_then(|k| k.as_str()).unwrap_or_default();
+                let dup = list.iter().any(|r| {
+                    r.get("to").and_then(|t| t.as_str()) == Some(to)
+                        && r.get("kind").and_then(|k| k.as_str()) == Some(rkind)
+                });
+                if !dup {
+                    list.push(rel);
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Err(e) = store::save_grown(root, world, &grown) {
+        crate::diag::record("codex", format!("正史增量写入失败：{e}"));
+    }
+}
+
+/// 提案的 facet 路径宽容解析：value/payload 里带 `facet`（或 `path`/`key`）+ `value`
+/// 的写指定路径；value 本身是 {facet, value} 对象也认。
+fn facet_and_value(
+    payload: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    for layer in [payload, value] {
+        if let Some(obj) = layer.as_object() {
+            let facet = obj
+                .get("facet")
+                .or_else(|| obj.get("path"))
+                .or_else(|| obj.get("key"))
+                .and_then(|f| f.as_str())
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(str::to_string);
+            if let Some(facet) = facet {
+                if let Some(v) = obj.get("value") {
+                    return Some((facet, v.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 瞬时状态提案的 {key, value} 解析（value 形态见 PRODUCT_SPEC 第 8 类的 transient 行）
+fn transient_key_value(value: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    let obj = value.as_object()?;
+    let key = obj
+        .get("key")
+        .and_then(|k| k.as_str())
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)?;
+    let val = obj.get("value")?;
+    if val.is_null() {
+        return None;
+    }
+    Some((key, val.clone()))
 }
 
 /// 记忆检查器数据（M2.8 面板）：一次性给前端全部投影视图
@@ -5580,6 +6231,8 @@ fn apply_summary_outcome(
     root: &std::path::Path,
     meta: &store::SessionMeta,
     cx: &codex::Codex,
+    // 投影视图（M3.8 瞬时状态写黑板要取场景分区/世界层的现状）
+    proj: &event::Projection,
     outcome: summarize::SummaryOutcome,
     from_turn: u64,
     to_turn: u64,
@@ -5785,8 +6438,14 @@ fn apply_summary_outcome(
         applied += 1;
     }
 
-    // 设定提案：与 anchors 冲突的直接驳回（设计 §6.8 最高保护级）
-    for draft in &outcome.codex {
+    // 设定提案：运行期捕获分级（M3.8 · 设计 §6.8-2）+ anchors 驳回（§6.8 最高保护级）
+    //   瞬时状态 → 直接写黑板（不进收件箱）；既有实体小事实 → 按配置自动接受；
+    //   全新实体 / 关系 / 改写 → 收件箱人工。
+    let auto_minor = store::load_settings(root)
+        .map(|s| s.auto_accept_minor_facts)
+        .unwrap_or(false);
+    let world = session_world(meta);
+    for (i, draft) in outcome.codex.iter().enumerate() {
         let payload = serde_json::json!({
             "target": draft.target,
             "value": draft.value,
@@ -5795,7 +6454,7 @@ fn apply_summary_outcome(
         let conflict = cx
             .get(&draft.target)
             .and_then(|e| codex::anchors_conflict(e, &draft.value));
-        let id = format!("codex.{}.{}", draft.target, to_turn);
+        let id = format!("codex.{}.{}.{}", draft.target, to_turn, i);
         if let Some(reason) = conflict {
             crate::diag::record(
                 "summary",
@@ -5816,24 +6475,99 @@ fn apply_summary_outcome(
                     ts,
                 }),
             )?;
-        } else {
-            commit(
-                log,
-                root,
-                meta,
-                LogBody::Proposal(event::ProposalEvent {
-                    turn: to_turn,
-                    id,
-                    op: "propose".into(),
-                    kind: draft.kind.clone(),
-                    origin: "pipeline".into(),
-                    payload: Some(payload),
-                    note: None,
-                    ts,
-                }),
-            )?;
+            applied += 1;
+            continue;
         }
-        applied += 1;
+        match complete::capture_grade(&draft.kind, &draft.target, cx) {
+            complete::CaptureGrade::Transient => {
+                // 直接写黑板：键值进 extra（场景 flags 或世界层）；黑板事件就是记录，
+                // 不进收件箱——瞬时状态不值得人工审（§6.8-2）
+                let Some((key, val)) = transient_key_value(&draft.value) else {
+                    continue;
+                };
+                let mut board = match proj.scenes.get(scene_id) {
+                    Some(sc) => store::Blackboard {
+                        day: sc.day,
+                        clock: sc.clock.clone(),
+                        place: sc.place.clone(),
+                        actors: sc.actors.clone(),
+                        extra: sc.flags.clone(),
+                    },
+                    None => proj
+                        .blackboard
+                        .clone()
+                        .unwrap_or_else(store::Blackboard::default_board),
+                };
+                board.extra.insert(key, val);
+                commit(
+                    log,
+                    root,
+                    meta,
+                    LogBody::Blackboard(event::BlackboardEvent {
+                        turn: to_turn,
+                        reason: "pipeline".into(),
+                        board,
+                        scene_id: Some(scene_id.to_string()),
+                        ts,
+                    }),
+                )?;
+                applied += 1;
+            }
+            grade if grade == complete::CaptureGrade::MinorFact && auto_minor => {
+                // 既有实体的小事实 + 用户开了自动接受：连落 propose 与 accept 两条事件
+                // （动作可溯源），物化与手动确认同一条路
+                commit(
+                    log,
+                    root,
+                    meta,
+                    LogBody::Proposal(event::ProposalEvent {
+                        turn: to_turn,
+                        id: id.clone(),
+                        op: "propose".into(),
+                        kind: draft.kind.clone(),
+                        origin: "pipeline".into(),
+                        payload: Some(payload.clone()),
+                        note: None,
+                        ts,
+                    }),
+                )?;
+                commit(
+                    log,
+                    root,
+                    meta,
+                    LogBody::Proposal(event::ProposalEvent {
+                        turn: to_turn,
+                        id,
+                        op: "accept".into(),
+                        kind: draft.kind.clone(),
+                        origin: "pipeline".into(),
+                        payload: None,
+                        note: Some("小事实自动接受（设置：运行期自动接受）".into()),
+                        ts,
+                    }),
+                )?;
+                materialize_accepted(root, &world, &draft.kind, payload);
+                applied += 2;
+            }
+            _ => {
+                commit(
+                    log,
+                    root,
+                    meta,
+                    LogBody::Proposal(event::ProposalEvent {
+                        turn: to_turn,
+                        id,
+                        op: "propose".into(),
+                        kind: draft.kind.clone(),
+                        origin: "pipeline".into(),
+                        payload: Some(payload),
+                        note: None,
+                        ts,
+                    }),
+                )?;
+                applied += 1;
+            }
+        }
     }
 
     // 剧情线提案（含提及时机起草，设计 §8.3）
@@ -5977,6 +6711,7 @@ async fn run_summary(
         &root,
         &meta,
         &cx,
+        &proj,
         outcome,
         from_turn,
         to_turn,
@@ -7480,9 +8215,10 @@ return {
                 reason: "剧情里提到".into(),
             }],
         });
-        let applied =
-            apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, to_turn, 1, "20:00", "scene.main")
-                .unwrap();
+        let applied = apply_summary_outcome(
+            &log, &root, &meta, &cx, &proj, outcome, 1, to_turn, 1, "20:00", "scene.main",
+        )
+        .unwrap();
         assert!(applied >= 5, "摘要 + 2 条记忆 + 3 条提案：{applied}");
 
         let proj = project_session(&log, &root, &meta).unwrap();
@@ -7742,8 +8478,11 @@ state_tree = {
             codex: Vec::new(),
         });
         // 假装总结发生在很久以后：调用方传来的「当前」黑板已是第 9 天深夜
-        apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, 1, 9, "23:50", "scene.main")
-            .unwrap();
+        let proj_view = project_session(&log, &root, &meta).unwrap();
+        apply_summary_outcome(
+            &log, &root, &meta, &cx, &proj_view, outcome, 1, 1, 9, "23:50", "scene.main",
+        )
+        .unwrap();
 
         let proj = project_session(&log, &root, &meta).unwrap();
         let objects: Vec<palace::MemObject> = proj
@@ -8207,8 +8946,11 @@ return {
             }],
             ..summarize::SummaryOutcome::default()
         });
-        let applied = apply_summary_outcome(&log, &root, &meta, &cx, outcome, 1, 2, 1, "21:15", "scene.main")
-            .unwrap();
+        let proj_view = project_session(&log, &root, &meta).unwrap();
+        let applied = apply_summary_outcome(
+            &log, &root, &meta, &cx, &proj_view, outcome, 1, 2, 1, "21:15", "scene.main",
+        )
+        .unwrap();
         assert_eq!(applied, 2, "一条转述记忆 + 一条揭示事件：{applied}");
 
         proj = project_session(&log, &root, &meta).unwrap();
@@ -9441,6 +10183,291 @@ return { state_tree = {
         // day 缺省 = 会话当前故事天
         let default_day = codex_resolve_preview_of(&log, &cache, &root, &meta.id, None).unwrap();
         assert_eq!(default_day.day, 1);
+    }
+
+    // ---------- M3.8 设定补全管线（设计 §6.8）----------
+
+    /// 往世界 default 的实体目录写一个最小 char 实体（分级/物化测试的靶子）
+    fn seed_entity(root: &std::path::Path, id: &str, extra: serde_json::Value) {
+        let dir = codex_entities_dir(root, "default");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut obj = serde_json::json!({
+            "id": id,
+            "type": id.split('.').next().unwrap_or("char"),
+            "name": id.split('.').nth(1).unwrap_or(id),
+            "one_liner": "测试实体。",
+        });
+        if let (Some(dst), Some(src)) = (obj.as_object_mut(), extra.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        std::fs::write(dir.join(format!("{id}.json")), serde_json::to_string(&obj).unwrap()).unwrap();
+    }
+
+    /// DoD 8「确认写正史进注入」：确认的 codex 提案物化进 grown.json，
+    /// 下一次 load_codex（同一世界任何会话）都能读到
+    #[test]
+    fn accepted_codex_proposal_materializes_into_grown_history() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        seed_entity(&root, "char.小雨", serde_json::json!({ "facts": { "schedule": "夜班" } }));
+        let log = store::EventLog::new();
+
+        // 管线提案（新事实 + 全新实体）进事件流
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: 2,
+                id: "codex.char.小雨.2.0".into(),
+                op: "propose".into(),
+                kind: "new_fact".into(),
+                origin: "pipeline".into(),
+                payload: Some(serde_json::json!({
+                    "target": "char.小雨",
+                    "value": { "facet": "schedule", "value": "周三也休息" },
+                    "reason": "第 2 轮提到"
+                })),
+                note: None,
+                ts: 0,
+            }),
+        )
+        .unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: 2,
+                id: "codex.char.墨墨.2.1".into(),
+                op: "propose".into(),
+                kind: "new_entity".into(),
+                origin: "pipeline".into(),
+                payload: Some(serde_json::json!({
+                    "target": "char.墨墨",
+                    "value": { "type": "char", "name": "墨墨", "facts": { "look": { "impression": "一只黑猫" } } },
+                    "reason": "第 2 轮即兴发明"
+                })),
+                note: None,
+                ts: 0,
+            }),
+        )
+        .unwrap();
+
+        // 全部确认（批量路径与单条共用物化内核）
+        let n = decide_all_proposals_core(&log, &root, &meta.id, true).unwrap();
+        assert_eq!(n, 2);
+
+        // 正史增量落了文件，且 load_codex 能读到（「进注入」）
+        let grown = store::load_grown(&root, "default");
+        assert!(grown.entities.contains_key("char.小雨"));
+        assert!(grown.entities.contains_key("char.墨墨"));
+        let cx = load_codex(&root, None, "default");
+        assert_eq!(
+            codex::static_fact(cx.get("char.小雨").unwrap(), "schedule"),
+            Some(&serde_json::json!("周三也休息")),
+            "确认的新事实覆盖了原值"
+        );
+        assert!(cx.get("char.墨墨").is_some(), "确认的新实体进了设定集");
+        assert_eq!(cx.get("char.墨墨").unwrap().status, "canon");
+
+        // 手写实体文件不被机器改写：磁盘上的原文件还是夜班
+        let raw = std::fs::read_to_string(codex_entities_dir(&root, "default").join("char.小雨.json"))
+            .unwrap();
+        assert!(raw.contains("夜班"), "增量住在 grown.json，不动手写文件");
+
+        // 重建（编辑历史）不丢确认动作：提案事件不是派生产物
+        let records = log.read(&root, &meta.id).unwrap();
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &records, 1)
+            .unwrap();
+        assert!(rebuilt.iter().any(|r| matches!(&r.body, LogBody::Proposal(p) if p.op == "accept")));
+
+        // 幂等重放：重复确认一条已确认的提案不再改 grown（状态机后写覆盖，物化只发生一次）
+        let grown_before = store::load_grown(&root, "default");
+        decide_proposal_core(&log, &root, &meta.id, "codex.char.小雨.2.0".into(), true, None).unwrap();
+        assert_eq!(store::load_grown(&root, "default"), grown_before);
+    }
+
+    /// §6.8-2 运行期捕获分级：瞬时状态直接写黑板、小事实按配置自动接受、
+    /// 全新实体必须人工
+    #[test]
+    fn runtime_capture_grades_split_transient_minor_and_new_entity() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        seed_entity(&root, "char.小雨", serde_json::json!({ "facts": { "schedule": "夜班" } }));
+        let log = store::EventLog::new();
+        let cx = load_codex(&root, None, "default");
+
+        let outcome = summarize::SummaryOutcome {
+            codex: vec![
+                summarize::CodexDraft {
+                    kind: "transient".into(),
+                    target: String::new(),
+                    value: serde_json::json!({ "key": "天气", "value": "雨渐大" }),
+                    reason: "第 3 轮".into(),
+                },
+                summarize::CodexDraft {
+                    kind: "new_fact".into(),
+                    target: "char.小雨".into(),
+                    value: serde_json::json!({ "facet": "schedule", "value": "周三休息" }),
+                    reason: "第 3 轮提到".into(),
+                },
+                summarize::CodexDraft {
+                    kind: "new_entity".into(),
+                    target: "char.墨墨".into(),
+                    value: serde_json::json!({ "type": "char", "name": "墨墨" }),
+                    reason: "第 3 轮即兴发明".into(),
+                },
+            ],
+            ..summarize::SummaryOutcome::default()
+        };
+
+        // 缺省（不自动接受）：transient → 黑板；小事实与全新实体都进收件箱待审
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let applied = apply_summary_outcome(
+            &log, &root, &meta, &cx, &proj, outcome, 2, 3, 1, "20:00", "scene.main",
+        )
+        .unwrap();
+        assert_eq!(applied, 3);
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let sc = proj.scenes.get("scene.main").expect("genesis 场景");
+        assert_eq!(sc.flags.get("天气"), Some(&serde_json::json!("雨渐大")), "瞬时状态写进场景 flags");
+        assert!(
+            proj.blackboard.as_ref().map(|b| b.extra.contains_key("天气")).unwrap_or(false)
+                || sc.flags.contains_key("天气"),
+            "世界层镜像或场景分区至少一处可见"
+        );
+        assert_eq!(
+            proj.proposals.get("codex.char.小雨.3.1").unwrap()["status"],
+            "propose",
+            "小事实缺省仍要人工"
+        );
+        assert_eq!(
+            proj.proposals.get("codex.char.墨墨.3.2").unwrap()["status"],
+            "propose",
+            "全新实体必须人工"
+        );
+
+        // 开「自动接受小事实」：小事实连落 propose+accept 并物化；全新实体照旧人工
+        let mut settings = store::load_settings(&root).unwrap();
+        settings.auto_accept_minor_facts = true;
+        store::save_settings(&root, &settings).unwrap();
+        let outcome2 = summarize::SummaryOutcome {
+            codex: vec![
+                summarize::CodexDraft {
+                    kind: "new_fact".into(),
+                    target: "char.小雨".into(),
+                    value: serde_json::json!({ "facet": "schedule", "value": "周五休息" }),
+                    reason: "第 5 轮改口".into(),
+                },
+                summarize::CodexDraft {
+                    kind: "new_entity".into(),
+                    target: "char.豆豆".into(),
+                    value: serde_json::json!({ "type": "char", "name": "豆豆" }),
+                    reason: "第 5 轮即兴发明".into(),
+                },
+            ],
+            ..summarize::SummaryOutcome::default()
+        };
+        let proj = project_session(&log, &root, &meta).unwrap();
+        apply_summary_outcome(
+            &log, &root, &meta, &cx, &proj, outcome2, 4, 5, 1, "21:00", "scene.main",
+        )
+        .unwrap();
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(
+            proj.proposals.get("codex.char.小雨.5.0").unwrap()["status"],
+            "accept",
+            "小事实自动接受"
+        );
+        assert_eq!(
+            proj.proposals.get("codex.char.豆豆.5.1").unwrap()["status"],
+            "propose",
+            "全新实体永远人工"
+        );
+        let cx = load_codex(&root, None, "default");
+        assert_eq!(
+            codex::static_fact(cx.get("char.小雨").unwrap(), "schedule"),
+            Some(&serde_json::json!("周五休息")),
+            "自动接受的小事实已进注入层"
+        );
+        assert!(cx.get("char.豆豆").is_none(), "没确认的新实体不进注入");
+    }
+
+    /// §6.8-4 即兴模式：improv 提案当轮回读进 B2（带「设定·暂定」标记），
+    /// 重建不丢、重放同一行——注入不随模型漂移
+    #[test]
+    fn improv_proposal_reenters_b2_and_survives_rebuild() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "你好呀。");
+
+        // 模拟 maybe_improv 的落流产物（LLM 调用本身不在单测覆盖面）：
+        // 本轮即兴补了一条暂定设定
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: 2,
+                id: "improv.char.小雨.2".into(),
+                op: "propose".into(),
+                kind: "new_fact".into(),
+                origin: "improv".into(),
+                payload: Some(serde_json::json!({
+                    "target": "char.小雨",
+                    "value": { "facet": "facts.日常", "value": "养了一只叫墨墨的猫" },
+                    "text": "她养了一只叫墨墨的猫。",
+                    "provisional": true,
+                    "reason": "第 2 轮即兴补一条暂定设定"
+                })),
+                note: None,
+                ts: 0,
+            }),
+        )
+        .unwrap();
+
+        // 第 2 轮组装：B2 带「设定·暂定」行
+        let meta2 = meta.clone();
+        let dir = first_character(&meta2).unwrap();
+        let cast = Cast { members: vec![CastMember { dir, loaded: loaded.clone() }] };
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let history = proj.messages.clone();
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &cast,
+            &cast.first().dir,
+            &history,
+            &proj,
+            Some("猫最近怎么样？"),
+            2,
+            Some(&log),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let b2 = run
+            .assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B2")
+            .expect("B2 层");
+        assert!(b2.content.contains("设定·暂定"), "{}", b2.content);
+        assert!(b2.content.contains("墨墨"), "{}", b2.content);
+
+        // 编辑重建：improv 提案不是派生产物，保留——重放同一轮，同一行还在
+        let records = log.read(&root, &meta.id).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &records, 1).unwrap();
+        assert!(
+            rebuilt
+                .iter()
+                .any(|r| matches!(&r.body, LogBody::Proposal(p) if p.origin == "improv" && p.op == "propose")),
+            "improv 提案重建不丢"
+        );
+        let _ = history;
     }
 
 }

@@ -804,6 +804,7 @@ DataHub/
     world.json             # 世界元信息（基调、适用风格、世界时钟）
     worldline.lua          # 可选：世界主线（阶段弧，§6.6）
     entities/              # 实体库 *.lua / *.json（草稿与正史同库；史变 versions 事件溯源追加）
+    grown.json             # 可选：收件箱确认提案的正史增量（M3.8 · §6.9；手写实体文件不被机器改写）
     proposals.jsonl        # 设定收件箱（新事实/事实变更等提案流）
   characters/<名字>/
     card.lua               # 角色卡（含 state_tree）

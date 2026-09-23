@@ -71,6 +71,8 @@ pub const CODEX_NEW_FACT: &str = "new_fact";
 pub const CODEX_FACT_CHANGE: &str = "fact_change";
 /// 设定提案类型（§6.8）：新关系。
 pub const CODEX_RELATION: &str = "relation";
+/// 设定提案类型（M3.8 · §6.8-2）：瞬时状态（「现在下雨了」）——宿主直接写黑板。
+pub const CODEX_TRANSIENT: &str = "transient";
 
 /// 输出骨架（写进提示词，也是 parse_outcome 的契约，见模块头注释）。
 ///
@@ -134,7 +136,9 @@ pub const OUTCOME_SCHEMA_HINT: &str = r#"{
       "target": "char.墨墨",
       "value": { "type": "char", "name": "墨墨", "facts": { "look.impression": "一只黑猫" } },
       "reason": "第 14 轮即兴提到她养了一只叫墨墨的猫"
-    }
+    },
+    { "kind": "new_fact", "target": "char.小雨", "value": { "facet": "schedule", "value": "周三休息" }, "reason": "第 15 轮提到" },
+    { "kind": "transient", "target": "", "value": { "key": "天气", "value": "雨渐大" }, "reason": "第 15 轮" }
   ]
 }"#;
 
@@ -358,7 +362,8 @@ pub struct PsycheDraft {
 /// 设定提案（§6.8 收件箱；未经确认不进注入，§6.9）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexDraft {
-    /// new_entity | new_fact | fact_change | relation；见 CODEX_*。
+    /// new_entity | new_fact | fact_change | relation | transient；见 CODEX_*。
+    /// transient（M3.8 · §6.8-2）= 瞬时状态，宿主直接写黑板、不入收件箱。
     pub kind: String,
     /// 目标：既有实体 id（如 char.小雨）或新实体的预分配 id。
     pub target: String,
@@ -455,13 +460,17 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的产物】（设计 §5.3 +
    没有明显评价就给 []；不要为了凑数造情绪，也不要写角色的台词倾向（那是生成时的职责）。
 
 8. codex —— 设定提案（设计 §6.8，进设定收件箱；未经确认不进注入，§6.9）
-   本批消息里即兴发明且值得留下的世界事实（例如「她养了一只叫墨墨的猫」）。kind 四选一：
+   本批消息里即兴发明且值得留下的世界事实（例如「她养了一只叫墨墨的猫」）。kind 五选一：
    - "new_entity"  全新实体（必须人工确认）：{"kind":"new_entity","target":"char.墨墨",
        "value":{"type":"char","name":"墨墨","facts":{"look.impression":"一只黑猫"}},
        "reason":"第 14 轮即兴提到"}；
-   - "new_fact"    给既有实体加一条事实：target = 实体 id，value = 要写入的 facet 内容；
-   - "fact_change" 改写既有事实：value 写新值，reason 说明出自第几轮；
-   - "relation"    新关系：value 形如 {"to":"char.小雨","kind":"宠物","always_with":false}。
+   - "new_fact"    给既有实体加一条事实：target = 实体 id，
+       value = {"facet":"<facts 路径，如 schedule>","value":"<要写入的内容>"}；
+   - "fact_change" 改写既有事实：value 同 new_fact 的形态，reason 说明出自第几轮；
+   - "relation"    新关系：value 形如 {"to":"char.小雨","kind":"宠物","always_with":false}；
+   - "transient"   瞬时状态（M3.8 分级：「现在下雨了」这类转瞬即逝、不构成长期设定）：
+       target 给 ""，value = {"key":"<黑板键，如 天气>","value":"雨"}——宿主直接写黑板。
+   判断标准：一条事实「明天还成立吗？」——成立才写 new_fact / new_entity，不成立就 transient。
    绝不允许改动任何实体的恒定辨识点 anchors（设计 §6.8：anchors 是最高保护级，与之冲突的提案
    会被直接驳回）；只是气氛描写、拿不准的，不要写。最多 6 条，没有就给 []。"#;
 
@@ -1063,7 +1072,8 @@ fn normalize_psyche(p: PsycheDraft) -> Option<PsycheDraft> {
 /// 一条设定提案（空 target 丢弃；kind 归一）。
 fn normalize_codex(c: CodexDraft) -> Option<CodexDraft> {
     let target = c.target.trim().to_string();
-    if target.is_empty() {
+    // 瞬时状态没有实体目标（「现在下雨了」是世界的事）——只有它允许空 target
+    if target.is_empty() && normalize_codex_kind(&c.kind) != CODEX_TRANSIENT {
         return None;
     }
     Some(CodexDraft {
@@ -1154,7 +1164,7 @@ fn normalize_psyche_kind(raw: &str) -> String {
     }
 }
 
-/// 设定提案类型归一：只认 §6.8 的四种；未知 / 空 → new_fact（最普通的形态，仍要过收件箱分级）。
+/// 设定提案类型归一：只认 §6.8 的四种 + transient（M3.8 分级）；未知 / 空 → new_fact（最普通的形态，仍要过收件箱分级）。
 fn normalize_codex_kind(raw: &str) -> String {
     let kind = raw.trim().to_ascii_lowercase();
     for known in [
@@ -1162,6 +1172,7 @@ fn normalize_codex_kind(raw: &str) -> String {
         CODEX_NEW_FACT,
         CODEX_FACT_CHANGE,
         CODEX_RELATION,
+        CODEX_TRANSIENT,
     ] {
         if kind == known {
             return known.to_string();

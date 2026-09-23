@@ -671,17 +671,28 @@ export function setupMock() {
                 status: "canon",
                 oneLiner: "大学图书馆夜班管理员。",
                 anchors: ["左眼角一颗泪痣", "母亲留下的旧胸牌"],
+                missing: ["speech.by_affect", "tells", "motivation"],
               },
             ],
           },
           summary: "第一段：她记住了那个约定。",
           proposals: [
             {
-              id: "codex.char.小雨.2",
+              id: "codex.char.小雨.2.0",
               status: "propose",
               kind: "new_fact",
               turn: 2,
-              payload: { target: "char.小雨", value: { facts: { schedule: "周三休息" } }, reason: "剧情里提到" },
+              origin: "pipeline",
+              payload: { target: "char.小雨", value: { facet: "schedule", value: "周三休息" }, reason: "剧情里提到" },
+              currentValue: { facet: "schedule", value: "夜班", source: "char.小雨（正史）" },
+            },
+            {
+              id: "improv.char.小雨.3",
+              status: "propose",
+              kind: "new_fact",
+              turn: 3,
+              origin: "improv",
+              payload: { target: "char.小雨", value: { facet: "facts.日常", value: "养了一只叫墨墨的猫" }, text: "她养了一只叫墨墨的猫。", provisional: true, reason: "第 3 轮即兴补一条暂定设定" },
             },
           ],
           known: ["char.小雨.secrets.工作牌"],
@@ -690,6 +701,28 @@ export function setupMock() {
         };
       case "decide_proposal":
         return { id: (args as { id?: string }).id ?? "mock", status: (args as { accept?: boolean }).accept ? "accept" : "reject" };
+      // M3.8：批量处理 / 手动补全 / 即兴开关（mock 给形状一致的示意返回）
+      case "decide_all_proposals":
+        return 2;
+      case "codex_complete":
+        return {
+          target: (args as { target?: string }).target ?? "char.小雨",
+          items: [
+            { facet: "motivation", value: "守着夜班是为了替母亲看完她没读完的书。" },
+            { facet: "speech.by_affect", value: { shy: "省略号变多、声音变小", upset: "只剩短句和动作" } },
+            { facet: "tells", value: { "忐忑": "指尖轻敲桌面，视线落在书页上却不翻页", "委屈": "不说话，但耳根泛红" } },
+          ],
+          note: "宁少而精：口癖已并入示例对话的语气。",
+          provider: "mock",
+        };
+      case "codex_complete_apply":
+        return (args as { facets?: Record<string, unknown> }).facets
+          ? Object.keys((args as { facets: Record<string, unknown> }).facets).length
+          : 0;
+      case "set_improv":
+        return (args as { improv?: boolean }).improv ?? false;
+      case "codex_semantic_check":
+        return { id: (args as { id?: string }).id ?? "mock", contradictions: [], provider: "mock" };
       case "summarize_now":
         return "（mock）已总结第 1–2 轮，落 3 条事件";
       // M3.0 ①：手动开/收线（mock 只改内存里的 threads 投影，真命令会落事件流）

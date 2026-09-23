@@ -46,11 +46,58 @@ export function proposalKind(kind: string): string {
     new_fact: "新事实",
     fact_change: "事实变更",
     relation: "关系",
+    transient: "瞬时状态",
     episode: "情景记忆",
     thread: "剧情线",
     psyche: "心理评价",
   };
   return map[kind] ?? (kind || "提案");
+}
+
+/** 提案来源的中文标签（M3.8 起投影带出 origin；缺省视为管线） */
+export function proposalOrigin(origin: string | undefined): string {
+  if (origin === "improv") return "暂定";
+  if (origin === "complete") return "补全";
+  if (origin === "manual") return "手动";
+  return "管线";
+}
+
+/** 提案来源的徽标配色：即兴暂定最显眼（要人确认） */
+export function originClass(origin: string | undefined): string {
+  if (origin === "improv") return "badge-soft badge-warning";
+  if (origin === "complete") return "badge-soft badge-info";
+  return "badge-ghost";
+}
+
+/** 提案 payload 的结构化字段（收件箱 diff 呈现用；形状宽容——给不出就空串） */
+export function payloadFields(payload: unknown): {
+  target: string;
+  facet: string;
+  value: unknown;
+  to: string;
+  relation: string;
+  text: string;
+} {
+  const empty = { target: "", facet: "", value: undefined, to: "", relation: "", text: "" };
+  if (!payload || typeof payload !== "object") return empty;
+  const o = payload as Record<string, unknown>;
+  const target = typeof o.target === "string" ? o.target : "";
+  const text = typeof o.text === "string" ? o.text : "";
+  let facet = "";
+  let value: unknown = o.value;
+  let to = "";
+  let relation = "";
+  if (o.value && typeof o.value === "object") {
+    const v = o.value as Record<string, unknown>;
+    const f = [v.facet, v.path, v.key].find((x) => typeof x === "string" && x);
+    if (f && "value" in v) {
+      facet = f as string;
+      value = v.value;
+    }
+    if (typeof v.to === "string") to = v.to;
+    if (typeof v.kind === "string") relation = v.kind;
+  }
+  return { target, facet, value, to, relation, text };
 }
 
 /** 提案状态 */

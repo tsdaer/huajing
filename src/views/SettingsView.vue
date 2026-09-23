@@ -81,6 +81,21 @@ const proxyDraft = ref("");
 const savingProxy = ref(false);
 const proxySaved = ref(false);
 
+/** 运行期捕获分级的中档开关（M3.8 · 设计 §6.8-2） */
+const savingMinor = ref(false);
+async function setAutoAcceptMinor(on: boolean) {
+  if (!settings.value) return;
+  savingMinor.value = true;
+  try {
+    settings.value = await api.saveSettings({ ...settings.value, auto_accept_minor_facts: on });
+    error.value = "";
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    savingMinor.value = false;
+  }
+}
+
 async function saveProxy() {
   if (!settings.value) return;
   savingProxy.value = true;
@@ -568,6 +583,23 @@ async function confirmRemove() {
             <li class="list-row items-center rounded-box bg-base-200 px-4 py-3">
               <span class="text-sm text-base-content/55">会话风格</span>
               <span class="text-right text-sm font-medium">{{ settings.theme }}</span>
+            </li>
+            <li class="list-row items-center rounded-box bg-base-200 px-4 py-3">
+              <div class="flex flex-col gap-0.5">
+                <span class="text-sm text-base-content/55">自动接受设定小事实</span>
+                <span class="text-xs text-base-content/45">
+                  总结管线给既有实体补充的小事实直接写正史（M3.8 · 设计 §6.8-2 分级捕获的中档）；
+                  关闭 = 一律进收件箱人工确认。瞬时状态写黑板与全新实体不受此开关影响。
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                class="toggle toggle-sm"
+                :checked="settings.auto_accept_minor_facts ?? false"
+                aria-label="自动接受设定小事实"
+                :disabled="savingMinor"
+                @change="setAutoAcceptMinor(($event.target as HTMLInputElement).checked)"
+              />
             </li>
           </ul>
         </div>

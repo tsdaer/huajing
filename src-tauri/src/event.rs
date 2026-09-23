@@ -933,6 +933,11 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
             if !pr.kind.is_empty() {
                 obj.insert("kind".into(), serde_json::json!(pr.kind));
             }
+            // 来源（M3.8）：pipeline / complete / improv / manual——收件箱的来源徽标与
+            // 「设定·暂定」注入回读（B2 improv 行）都靠它
+            if !pr.origin.is_empty() {
+                obj.insert("origin".into(), serde_json::json!(pr.origin));
+            }
             obj.insert("turn".into(), serde_json::json!(pr.turn));
             if let Some(payload) = &pr.payload {
                 obj.insert("payload".into(), payload.clone());
