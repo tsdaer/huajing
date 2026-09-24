@@ -11,6 +11,10 @@ import type {
   DiagRecord,
   ImportReport,
   CompletionResult,
+  IngestCommitReport,
+  IngestPack,
+  IngestPrep,
+  IngestSection,
   InspectorData,
   InspectorProposal,
   MemRecord,
@@ -28,6 +32,7 @@ import type {
   StreamEvent,
   TheaterView,
   TimelineEntry,
+  WorldbookReport,
   WorldlineView,
 } from "./types";
 
@@ -209,6 +214,49 @@ export const api = {
   /** 导入 ST 卡：生成 characters/<名字>/card.lua（同名自动 -2；overwrite 时覆盖） */
   importStCard: (path: string, overwrite = false) =>
     invoke<ImportReport>("import_st_card", { path, overwrite }),
+
+  // ---------- 素材规格化管线（M3.9 · 设计 §6.7：wiki 页十分钟成卡） ----------
+  /** P0–P11 提示词套件全文（手动模式的文本源；双用途） */
+  ingestPrompts: () => invoke<string>("ingest_prompts"),
+  /** ①② 粘贴素材 → 清洗分段（确定性）+ 剧透候选 */
+  ingestPrepare: (world: string, text: string) =>
+    invoke<IngestPrep>("ingest_prepare", { world, text }),
+  /** ③ 分节分类（LLM P1） */
+  ingestClassify: (sections: IngestSection[]) =>
+    invoke<Array<{ id: string; tag: string }>>("ingest_classify", { sections }),
+  /** ④⑤ 机械映射 + 语义归纳（LLM P3–P8）→ 完整草稿包（较慢：约 6 次调用） */
+  ingestExtract: (
+    world: string,
+    nameHint: string | null,
+    sections: IngestSection[],
+    tags: Array<{ id: string; tag: string }>,
+    spoilers: string[],
+  ) =>
+    invoke<IngestPack>("ingest_extract", {
+      world,
+      nameHint,
+      sections,
+      tags,
+      spoilers,
+    }),
+  /** ⑥⑦⑧ 审阅后的落盘：查重冲突 + 切入点切面 + 卡/正史增量/世界线三路产物 */
+  ingestCommit: (
+    world: string,
+    pack: IngestPack,
+    day: number,
+    overwriteWorldline = false,
+    setWorldDay = false,
+  ) =>
+    invoke<IngestCommitReport>("ingest_commit", {
+      world,
+      pack,
+      day,
+      overwriteWorldline,
+      setWorldDay,
+    }),
+  /** ST 世界书导入（M2.2 欠账补课）：JSON → note 实体（粘贴或文件路径） */
+  importWorldbook: (world: string, jsonText: string | null, path: string | null, bookName?: string | null) =>
+    invoke<WorldbookReport>("import_worldbook", { world, jsonText, path, bookName: bookName ?? null }),
 
   /** 启动 DataHub 热加载监听（M1.7；幂等） */
   watchCards: () => invoke<void>("watch_cards"),

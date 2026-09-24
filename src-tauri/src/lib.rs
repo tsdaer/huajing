@@ -8,6 +8,7 @@ mod complete; // 设定补全：模板补全、一致性校验、即兴模式（
 mod diag;     // 运行时诊断环形缓冲
 mod director; // 导演调度：发言权打分与发言计划（M3.4 · 设计 §10.5）
 mod event;    // 事件日志：类型化事件流与投影（M2.0 · 设计 §7.3）
+mod ingest;   // 素材规格化管线：清洗分段、机械映射、草稿包、切入点向导（M3.9 · 设计 §6.7）
 mod llm;      // OpenAI 兼容 SSE 客户端（设计 §11）
 mod palace;   // 记忆宫殿：记忆对象、召回与视图（M2.1 · 设计 §5）
 mod prompt;   // Prompt Builder 双槽位组装（设计 §4）
@@ -86,6 +87,12 @@ pub fn run() {
             commands::worldline_view,
             commands::world_set_clock,
             commands::codex_resolve_preview,
+            commands::ingest_prompts,
+            commands::ingest_prepare,
+            commands::ingest_classify,
+            commands::ingest_extract,
+            commands::ingest_commit,
+            commands::import_worldbook,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,

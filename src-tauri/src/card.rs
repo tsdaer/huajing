@@ -116,15 +116,15 @@ impl HookRun {
 
 // ---------- 静态卡片结构（serde 兼容层）----------
 
-/// 示例对话中的一行（role: user | char）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 示例对话中的一行（role: user | char）。PartialEq 供素材管线草稿包（M3.9）整包比较。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExampleLine {
     pub role: String,
     pub content: String,
 }
 
 /// 按情绪/场景分组的示例对话（状态化 few-shot，设计 §3）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExampleTurn {
     #[serde(default)]
     pub tag: Option<String>,

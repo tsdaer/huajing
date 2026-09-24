@@ -563,7 +563,7 @@ pub fn render_card_lua(draft: &CardDraft) -> String {
 }
 
 /// Rust 字符串 → Lua 双引号字符串字面量（bytes 转义，对任意 UTF-8 安全）
-fn lua_str(s: &str) -> String {
+pub(crate) fn lua_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for &b in s.as_bytes() {
@@ -662,6 +662,221 @@ pub fn import_file_to(root: &Path, path: &Path, overwrite: bool) -> Result<Impor
     let draft = parse_st_card(&bytes, fallback)?;
     save_card_draft(root, &draft, overwrite)
 }
+
+// ---------- ST 世界书导入（M3.9 补 M2.2 欠账 · 设计 §6.10）----------
+
+/// 世界书导入结果报告（前端展示）
+#[derive(Debug, Clone, Serialize)]
+pub struct WorldbookReport {
+    pub world: String,
+    /// 新写入的 note 实体数
+    pub imported: usize,
+    /// 禁用条目数（status=draft 导入，不进注入）
+    pub disabled: usize,
+    /// 已存在而跳过的条目数（同 id = 同书重导）
+    pub skipped: usize,
+    /// 写入的文件名清单
+    pub files: Vec<String>,
+    /// 解析期的提醒（无法识别的形态、被丢弃的字段）
+    pub warnings: Vec<String>,
+}
+
+/// SillyTavern 世界书 JSON → `codex/<世界>/entities/note.*.json`（设计 §6.10）。
+///
+/// 映射：comment(标题)→name、key→aliases（提及激活）、content→one_liner（note 的注入
+/// 就是这一段）、constant→constant、status=canon；disable 条目 → status=draft（不进
+/// 注入但留档可见）。order/sticky/cooldown/keysecondary 等本引擎没有对应语义的字段
+/// 原样保留在 `facts.st` 里作参考——**不静默丢数据，也不假装支持**。
+///
+/// id 形态 `note.<书名>.<uid>`：同一本书重复导入产出同一批 id → 逐条跳过（幂等）。
+pub fn import_worldbook_to(
+    root: &Path,
+    world: &str,
+    json: &str,
+    book_name: Option<&str>,
+) -> Result<WorldbookReport, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("世界书 JSON 解析失败：{e}"))?;
+    let entries = collect_worldbook_entries(&v)?;
+    let mut report = WorldbookReport {
+        world: world.to_string(),
+        imported: 0,
+        disabled: 0,
+        skipped: 0,
+        files: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let book_slug = sanitize_slug(
+        book_name
+            .or_else(|| v.get("name").and_then(|n| n.as_str()))
+            .unwrap_or("book"),
+    );
+    let dir = root.join("codex").join(world).join("entities");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败：{}", dir.display(), e))?;
+
+    for (idx, entry) in entries {
+        let Some(entity) = worldbook_entry_entity(&entry, &book_slug, idx, &mut report.warnings)
+        else {
+            report.skipped += 1;
+            continue;
+        };
+        let file_name = format!("note.{}.{idx}.json", book_slug);
+        let path = dir.join(&file_name);
+        if path.exists() {
+            report.skipped += 1;
+            continue;
+        }
+        let body = serde_json::to_string_pretty(&entity).map_err(|e| e.to_string())?;
+        std::fs::write(&path, body + "\n").map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+        // 生成物必须能被自家解析器读回（与 save_card_draft 同一条纪律）
+        if let Err(e) = crate::codex::CodexEntity::from_value(&entity) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("生成的 note 实体无法解析（已回滚 {file_name}）：{e}"));
+        }
+        report.files.push(file_name);
+        if entity.get("status").and_then(|s| s.as_str()) == Some("draft") {
+            report.disabled += 1;
+        } else {
+            report.imported += 1;
+        }
+    }
+    crate::diag::record(
+        "import",
+        format!(
+            "世界书导入：{} → {}（新增 {}，禁用 {}，跳过 {}）",
+            book_slug,
+            world,
+            report.imported,
+            report.disabled,
+            report.skipped
+        ),
+    );
+    Ok(report)
+}
+
+/// 世界书 JSON 的条目收集：`{entries: {…}}` 对象形态 / `{entries: […]}` 数组形态 /
+/// 裸数组三种都认（不同导出工具形态不一）。
+fn collect_worldbook_entries(v: &serde_json::Value) -> Result<Vec<(usize, serde_json::Value)>, String> {
+    let entries = v.get("entries").unwrap_or(v);
+    let mut out: Vec<(usize, serde_json::Value)> = Vec::new();
+    match entries {
+        serde_json::Value::Object(m) => {
+            let mut object_entries = 0usize;
+            for (idx, (key, entry)) in m.iter().enumerate() {
+                if !entry.is_object() {
+                    continue;
+                }
+                object_entries += 1;
+                let uid = key.parse::<usize>().unwrap_or(idx);
+                out.push((uid, entry.clone()));
+            }
+            if object_entries == 0 {
+                return Err("找不到 entries——不像 SillyTavern 世界书 JSON".into());
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for (idx, entry) in a.iter().enumerate() {
+                let uid = entry.get("uid").and_then(|u| u.as_u64()).map(|u| u as usize).unwrap_or(idx);
+                out.push((uid, entry.clone()));
+            }
+        }
+        _ => return Err("找不到 entries——不像 SillyTavern 世界书 JSON".into()),
+    }
+    out.sort_by_key(|(uid, _)| *uid);
+    Ok(out)
+}
+
+/// 单条世界书条目 → note 实体 JSON；content 为空的条目返回 None（跳过并计数）。
+fn worldbook_entry_entity(
+    entry: &serde_json::Value,
+    book_slug: &str,
+    idx: usize,
+    warnings: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    let content = entry.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
+    if content.is_empty() {
+        return None;
+    }
+    let keys: Vec<String> = entry
+        .get("key")
+        .and_then(|k| k.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::trim))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let name = entry
+        .get("comment")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| keys.first().cloned())
+        .unwrap_or_else(|| format!("条目 {idx}"));
+    let disabled = entry.get("disable").and_then(|d| d.as_bool()).unwrap_or(false);
+    let constant = entry.get("constant").and_then(|c| c.as_bool()).unwrap_or(false);
+
+    // 本引擎没有对应语义的字段（order/sticky/cooldown/secondary keys…）进 facts.st 留档
+    let mut st = serde_json::Map::new();
+    for field in ["order", "position", "sticky", "cooldown", "delay", "probability", "selective"] {
+        if let Some(val) = entry.get(field) {
+            if !val.is_null() {
+                st.insert(field.to_string(), val.clone());
+            }
+        }
+    }
+    let secondary: Vec<String> = entry
+        .get("keysecondary")
+        .and_then(|k| k.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !secondary.is_empty() {
+        st.insert("keysecondary".into(), serde_json::json!(secondary));
+    }
+    if !st.is_empty() {
+        warnings.push(format!(
+            "条目「{name}」的 ST 专属字段（order/sticky/cooldown 等）已保留在 facts.st 作参考，本引擎不执行其语义"
+        ));
+    }
+
+    let mut facts = serde_json::Map::new();
+    facts.insert("content".into(), serde_json::json!(content));
+    if !st.is_empty() {
+        facts.insert("st".into(), serde_json::Value::Object(st));
+    }
+
+    Some(serde_json::json!({
+        "id": format!("note.{book_slug}.{idx}"),
+        "type": "note",
+        "name": name,
+        "aliases": keys,
+        "one_liner": content,
+        "facts": facts,
+        "constant": constant,
+        "status": if disabled { "draft" } else { "canon" },
+    }))
+}
+
+/// 文件名/书名 slug：剥路径与文件系统危险字符。
+fn sanitize_slug(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && !"[]{}\"'`,;|.#/\\".contains(*c))
+        .collect();
+    if cleaned.is_empty() {
+        "book".into()
+    } else {
+        cleaned
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1011,5 +1226,82 @@ mod tests {
             }
         }
         !crc
+    }
+
+    // ---------- ST 世界书导入（M3.9 · 设计 §6.10）----------
+
+    const WORLDBOOK_JSON: &str = r#"{
+      "name": "夜城设定",
+      "entries": {
+        "0": {
+          "uid": 0, "key": ["夜市", "夜街"], "keysecondary": ["晚上"],
+          "content": "夜市在旧运河边开张，摊主的灯全是暖黄色。",
+          "comment": "夜市", "constant": false, "disable": false,
+          "order": 100, "position": 0, "selective": true, "cooldown": 3
+        },
+        "1": {
+          "uid": 1, "key": ["钟楼"], "content": "钟楼每晚整点敲响，敲的是过时的曲子。",
+          "comment": "钟楼", "constant": true, "disable": true, "order": 50
+        },
+        "2": { "uid": 2, "key": [], "content": "", "comment": "空条目" }
+      }
+    }"#;
+
+    #[test]
+    fn worldbook_import_maps_notes_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = import_worldbook_to(dir.path(), "default", WORLDBOOK_JSON, None).unwrap();
+        assert_eq!(report.imported, 1, "启用的条目：{report:?}");
+        assert_eq!(report.disabled, 1, "禁用条目按 draft 收");
+        assert_eq!(report.skipped, 1, "空 content 条目跳过");
+        assert!(report.files.contains(&"note.夜城设定.0.json".to_string()));
+        assert!(report.files.contains(&"note.夜城设定.1.json".to_string()));
+
+        let raw = std::fs::read_to_string(dir.path().join("codex/default/entities/note.夜城设定.0.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v.get("id").and_then(|x| x.as_str()), Some("note.夜城设定.0"));
+        assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("note"));
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("夜市"));
+        let aliases: Vec<String> = v
+            .get("aliases")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap();
+        assert_eq!(aliases, vec!["夜市", "夜街"], "key→aliases（提及激活）");
+        assert!(v.get("one_liner").and_then(|x| x.as_str()).unwrap().contains("夜市"));
+        assert_eq!(v.get("constant").and_then(|x| x.as_bool()), Some(false));
+        // ST 专属字段留档不丢
+        let st = v.pointer("/facts/st").unwrap();
+        assert_eq!(st.get("order").and_then(|x| x.as_i64()), Some(100));
+        assert_eq!(st.get("cooldown").and_then(|x| x.as_i64()), Some(3));
+        assert!(st.get("keysecondary").is_some());
+        // 生成物能被自家解析器读回
+        let entity = crate::codex::CodexEntity::from_value(&v).unwrap();
+        assert!(entity.is_canon());
+
+        // 禁用条目 → draft（不进注入，留档可见）
+        let raw1 = std::fs::read_to_string(dir.path().join("codex/default/entities/note.夜城设定.1.json")).unwrap();
+        let v1: serde_json::Value = serde_json::from_str(&raw1).unwrap();
+        assert_eq!(v1.get("status").and_then(|x| x.as_str()), Some("draft"));
+        assert_eq!(v1.get("constant").and_then(|x| x.as_bool()), Some(true));
+
+        // 重导同一本书：id 相同 → 全部跳过（幂等）
+        let again = import_worldbook_to(dir.path(), "default", WORLDBOOK_JSON, None).unwrap();
+        assert_eq!(again.imported, 0);
+        assert_eq!(again.skipped, 3);
+    }
+
+    #[test]
+    fn worldbook_accepts_array_and_bare_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let array_form = r#"[{"uid": 7, "key": ["灯塔"], "content": "灯塔只在一七天亮。", "comment": "灯塔"}]"#;
+        let report = import_worldbook_to(dir.path(), "default", array_form, Some("海岸")).unwrap();
+        assert_eq!(report.imported, 1);
+        assert!(dir.path().join("codex/default/entities/note.海岸.7.json").is_file());
+
+        let bare = r#"{"0": {"uid": 0, "key": ["渡口"], "content": "渡船午夜后不摆渡。"}}"#;
+        let report = import_worldbook_to(dir.path(), "default", bare, None).unwrap();
+        assert_eq!(report.imported, 1);
+        assert!(import_worldbook_to(dir.path(), "default", "{\"nope\": 1}", None).is_err());
     }
 }

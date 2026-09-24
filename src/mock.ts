@@ -7,6 +7,9 @@ import type {
   CardDetail,
   CardSummary,
   HookReport,
+  IngestPack,
+  IngestPrep,
+  IngestSection,
   InspectorThreads,
   MemRecord,
   Message,
@@ -311,6 +314,88 @@ function streamReply(
 }
 
 const timers = new Map<string, { timer: ReturnType<typeof setInterval>; partial: () => string; done: (cancelled: boolean) => void }>();
+
+/** mock 的素材清洗分段（M3.9）：按空行粗切两节 + 示意剧透候选 */
+function mockIngestPrep(text: string): IngestPrep {
+  const paras = text.split(/\n{2,}/).filter((p) => p.trim());
+  const sections: IngestSection[] = paras.length
+    ? paras.map((p, i) => ({ id: `s${i + 1}`, title: i === 0 ? "开头" : `小节 ${i}`, text: p.trim() }))
+    : [{ id: "s1", title: "全文", text: "（mock）空素材占位一节。" }];
+  return { world: "default", sections, spoilers: ["（mock）实为人之律者"] };
+}
+
+/** mock 的草稿包（M3.9 审阅界面浏览器示意） */
+function mockIngestPack(world: string): IngestPack {
+  return {
+    world,
+    char_id: "char.小雨",
+    card: {
+      first_mes: "（mock）「你来了。今天也一起等雨停吗？」",
+      scenario: "（mock）梅雨季的大学图书馆。",
+      personality: "动机：替母亲读完她没读完的书；需要：被理解",
+      tags: ["素材规格化"],
+      example_dialogue: [
+        {
+          tag: "初见",
+          messages: [
+            { role: "user", content: "这么晚还在？" },
+            { role: "char", content: "……嗯。闭馆前看完这一章就好。" },
+          ],
+        },
+      ],
+      sources: { first_mes: { section: "s2", quote: "「你来了。」" } },
+    },
+    entity: {
+      id: "char.小雨",
+      type: "char",
+      name: "小雨",
+      aliases: ["夜班管理员"],
+      one_liner: "左眼角有泪痣的图书馆夜班管理员。",
+      facts: {
+        look: { impression: "总披着一件旧毛衣", anchors: ["左眼角一颗泪痣"] },
+        speech: { style: "短句、轻声", tics: ["……嗯。"] },
+        tells: { 忐忑: "指尖轻敲桌面" },
+        motivation: "替母亲读完她没读完的书",
+      },
+      relations: [{ to: "place.图书馆", kind: "值班", always_with: true }],
+      sources: { "look.anchors": { section: "s1", quote: "左眼角一颗泪痣" } },
+      include: true,
+      stub: false,
+    },
+    others: [
+      {
+        id: "place.图书馆",
+        type: "place",
+        name: "图书馆",
+        aliases: [],
+        one_liner: "（占位）她值班的地方。",
+        facts: {},
+        relations: [],
+        sources: {},
+        include: true,
+        stub: true,
+      },
+    ],
+    events: [],
+    secrets: [
+      {
+        key: "工作牌",
+        content: "她随身带的旧胸牌是母亲的遗物",
+        revealed_by: null,
+        known_by_advice: ["小雨"],
+        source: { section: "s2", quote: "母亲的遗物" },
+        include: true,
+        origin: "llm",
+      },
+    ],
+    lifecycle: null,
+    versions: [],
+    worldline: null,
+    canon_points: [{ name: "素材开篇", day: 1, stage: null, note: "（mock）从第 1 天开始", after_death: false, premise: null }],
+    pending: [{ title: "开场白", detail: "（mock）素材里没有合适的开场白", source: null }],
+    qc: [{ severity: "info", at: "mannerisms", problem: "描写四法缺「动作」块——可用实体补全接力" }],
+  };
+}
 
 export function setupMock() {
   mockIPC(async (cmd, args) => {
@@ -780,6 +865,40 @@ export function setupMock() {
           { seq: 2, kind: "message", turn: 1, brief: "角色：「我在等雨停。」…" },
           { seq: 1, kind: "message", turn: 1, brief: "我：嗯，截稿日快到了。你还没走？" },
         ];
+      // ---------- 素材规格化管线（M3.9 · 设计 §6.7）：浏览器示意流 ----------
+      case "ingest_prompts":
+        return "（mock）P0–P11 提示词套件全文——浏览器模式不打包文档，真机可见。";
+      case "ingest_prepare": {
+        const text = (args as { text?: string }).text ?? "";
+        return mockIngestPrep(text);
+      }
+      case "ingest_classify":
+        return (args as { sections?: Array<{ id: string }> }).sections?.map((s, i) => ({
+          id: s.id,
+          tag: i === 0 ? "infobox" : "intro",
+        })) ?? [];
+      case "ingest_extract":
+        return mockIngestPack((args as { world?: string }).world ?? "default");
+      case "ingest_commit":
+        return {
+          world: (args as { world?: string }).world ?? "default",
+          cardDir: "小雨（mock）",
+          cardPath: "DataHub（浏览器 mock）/characters/小雨/card.lua",
+          entitiesWritten: ["char.小雨", "place.图书馆"],
+          worldlineWritten: true,
+          canonDay: (args as { day?: number }).day ?? 1,
+          skipped: [],
+          warnings: [],
+        };
+      case "import_worldbook":
+        return {
+          world: (args as { world?: string }).world ?? "default",
+          imported: 3,
+          disabled: 1,
+          skipped: 0,
+          files: ["note.mock书.0.json", "note.mock书.1.json", "note.mock书.2.json", "note.mock书.3.json"],
+          warnings: ["条目的 ST 专属字段（order/sticky/cooldown 等）已保留在 facts.st 作参考"],
+        };
       default:
         throw new Error(`mock 未覆盖命令：${cmd}`);
     }

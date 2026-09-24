@@ -13,6 +13,7 @@ use crate::codex;
 use crate::complete;
 use crate::director;
 use crate::event::{self, LogBody, LogRecord};
+use crate::ingest;
 use crate::palace;
 use crate::psyche;
 use crate::scene;
@@ -3799,6 +3800,556 @@ pub fn world_set_clock(world: String, day: i64) -> Result<i64, String> {
     store::save_world(&root, &name, &w).map_err(|e| e.to_string())?;
     Ok(w.day)
 }
+
+// ---------- 素材规格化管线（M3.9 · 设计 §6.7）----------
+//
+// 八步的命令切分：prepare=①②（确定性清洗分段）、classify=③（LLM P1）、
+// extract=④⑤（机械映射 + LLM P3–P8）、commit=⑥⑦⑧（查重冲突 + 落盘 + 切入点切面）。
+// 草稿包（ingest::IngestPack）在前端整包往返——审阅的 include/剔除都在前端改，
+// commit 只认提交上来的那一份（创建期动作不进会话事件流，落盘的文件就是正史）。
+
+/// P0–P11 提示词套件全文（手动·分步/一键模式的文本源；双用途见套件文档）
+#[tauri::command]
+pub fn ingest_prompts() -> String {
+    ingest::SUITE.to_string()
+}
+
+/// ①② 导入与清洗分段（确定性）：去 wiki 标记、按标题切节、扫剧透候选。
+/// 剧透标记必须在清洗**前**扫（模板壳会被清洗剥掉），所以这里一并返回。
+#[tauri::command]
+pub fn ingest_prepare(world: String, text: String) -> Result<serde_json::Value, String> {
+    let name = if world.trim().is_empty() { "default".into() } else { world };
+    let cleaned = ingest::clean_source(&text);
+    if cleaned.trim().is_empty() {
+        return Err("素材清洗后没有内容——检查粘贴的是不是空白页".into());
+    }
+    let sections = ingest::segment_sections(&cleaned);
+    let spoilers = ingest::extract_spoilers(&text);
+    Ok(serde_json::json!({
+        "world": name,
+        "sections": sections,
+        "spoilers": spoilers,
+    }))
+}
+
+/// ③ 分节分类（LLM P1，util 档）：拿不准的节由前端按 unknown 处理（宁漏勿错）。
+#[tauri::command]
+pub async fn ingest_classify(sections: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let root = root();
+    let sections = parse_sections(&sections)?;
+    let prompt_text = ingest::build_classify_prompt(&sections);
+    let raw = run_ingest_stage(&root, prompt_text, 2048).await?;
+    let tags = ingest::parse_classifications(&raw);
+    Ok(serde_json::json!(tags
+        .into_iter()
+        .map(|(id, tag)| serde_json::json!({ "id": id, "tag": tag }))
+        .collect::<Vec<_>>()))
+}
+
+/// ④⑤ 机械映射 + 语义归纳（LLM P3–P8，util 档）→ 完整草稿包。
+/// mechanics 节在选材层就被排除（④ 的一律过滤）；某步选材为空则跳过该步调用。
+#[tauri::command]
+pub async fn ingest_extract(
+    world: String,
+    name_hint: Option<String>,
+    sections: Vec<serde_json::Value>,
+    tags: Vec<serde_json::Value>,
+    spoilers: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let root = root();
+    let name = if world.trim().is_empty() { "default".into() } else { world };
+    let sections = parse_sections(&sections)?;
+    let mut tag_map: BTreeMap<String, String> = BTreeMap::new();
+    for t in &tags {
+        let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let tag = t.get("tag").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_string();
+        if !id.is_empty() {
+            tag_map.insert(id, tag);
+        }
+    }
+    // 没被分类到的节按 unknown 处理（分类失败/部分失败的兜底，宁漏勿错）
+    for s in &sections {
+        tag_map.entry(s.id.clone()).or_insert_with(|| "unknown".into());
+    }
+
+    let pick = |wanted: &[&str]| ingest::sections_of(&sections, &tag_map, wanted);
+    let any_of = |wanted: &[&str]| {
+        wanted.iter().any(|w| {
+            tag_map.values().any(|t| t == w)
+        })
+    };
+    let _ = &name;
+
+    // ---- ④ 机械映射（确定性）----
+    let infobox_sections = pick(&["infobox"]);
+    let infobox = ingest::parse_infobox(&infobox_sections);
+
+    // ---- ⑤ 语义归纳（LLM，逐步调用）----
+    // P3 秘密与生命周期
+    let mut secrets = Vec::new();
+    let mut lifecycle = None;
+    let mut versions = Vec::new();
+    let mut pending: Vec<ingest::PendingItem> = Vec::new();
+    let events;
+    let four;
+    let psyche;
+    let relations;
+    let examples;
+
+    // 显式名字提示贯穿全程（wiki 页标题常比信息框更可靠）；没有就用信息框名
+    let explicit_hint: Option<String> = name_hint
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let char_name = explicit_hint
+        .clone()
+        .or_else(|| infobox.name.clone())
+        .unwrap_or_else(|| "角色".into());
+
+    // P3 秘密与生命周期
+    if any_of(&["history", "relations", "dialogue_scene"]) {
+        let p3_sections = pick(&["history", "relations", "dialogue_scene"]);
+        let raw = run_ingest_stage(&root, ingest::build_secrets_prompt(&p3_sections, &char_name), 2048).await?;
+        // 阶段天锚来自 P6——但 P6 在 P3 之后跑，先跑 P6 再回填 P3 的时点解析
+        let p6_sections = if any_of(&["history"]) {
+            let raw = run_ingest_stage(&root, ingest::build_events_prompt(&pick(&["history"]), &char_name), 3072).await?;
+            Some(ingest::parse_events(&raw))
+        } else {
+            None
+        };
+        let (p3_secrets, p3_lifecycle, p3_versions, p3_pending) =
+            ingest::parse_secrets(&raw, &stage_day_map_from(p6_sections.as_ref().unwrap_or(&ingest::EventsOut::default())));
+        secrets = p3_secrets;
+        lifecycle = p3_lifecycle;
+        versions = p3_versions;
+        for p in p3_pending {
+            pending.push(ingest::PendingItem { title: "秘密与生命周期".into(), detail: p, source: None });
+        }
+        events = p6_sections.unwrap_or_default();
+    } else {
+        events = ingest::EventsOut::default();
+        pending.push(ingest::PendingItem {
+            title: "经历".into(),
+            detail: "素材里没有分类为「经历」的小节——事件年表与世界线候选为空".into(),
+            source: None,
+        });
+    }
+
+    // P4 描写四法
+    if any_of(&["dialogue_scene", "quote_table", "intro"]) {
+        let raw = run_ingest_stage(
+            &root,
+            ingest::build_four_methods_prompt(&pick(&["dialogue_scene", "quote_table", "intro"]), &char_name),
+            3072,
+        )
+        .await?;
+        four = ingest::parse_four_methods(&raw);
+    } else {
+        four = ingest::FourMethods::default();
+    }
+
+    // P5 倾向性
+    if any_of(&["intro", "history", "relations"]) {
+        let raw = run_ingest_stage(
+            &root,
+            ingest::build_psyche_prompt(&pick(&["intro", "history", "relations"]), &char_name),
+            1536,
+        )
+        .await?;
+        psyche = ingest::parse_psyche(&raw);
+    } else {
+        psyche = ingest::FourMethods::default();
+    }
+
+    // P7 关系网
+    if any_of(&["relations", "history"]) {
+        let raw = run_ingest_stage(
+            &root,
+            ingest::build_relations_prompt(&pick(&["relations", "history"]), &char_name),
+            2048,
+        )
+        .await?;
+        relations = ingest::parse_relations(&raw);
+    } else {
+        relations = ingest::RelationsOut::default();
+    }
+
+    // P8 示例对话
+    if any_of(&["dialogue_scene", "quote_table"]) {
+        let raw = run_ingest_stage(
+            &root,
+            ingest::build_examples_prompt(&pick(&["dialogue_scene", "quote_table"]), &char_name),
+            3072,
+        )
+        .await?;
+        examples = ingest::parse_examples(&raw);
+    } else {
+        examples = ingest::ExamplesOut::default();
+    }
+
+    let mut pack = ingest::assemble_pack(&ingest::AssembleInputs {
+        world: &name,
+        infobox: &infobox,
+        spoilers: &spoilers,
+        secrets,
+        lifecycle,
+        versions,
+        four: &four,
+        psyche: &psyche,
+        events: &events,
+        relations: &relations,
+        examples: &examples,
+        stage_days: &stage_day_map_from(&events),
+    });
+    // 名字提示覆盖装配层取的名字（关系与占位实体指回旧 id 的改名）
+    if let Some(hint) = explicit_hint {
+        let old = pack.entity.name.clone();
+        pack.entity.name = hint;
+        pack.char_id = ingest::entity_id("char", &pack.entity.name);
+        pack.entity.id = pack.char_id.clone();
+        for r in &mut pack.entity.relations {
+            if r.to == ingest::entity_id("char", &old) {
+                r.to = pack.char_id.clone();
+            }
+        }
+    }
+    pack.pending.extend(pending);
+    pack.qc.extend(ingest::qc_pack(&pack));
+    Ok(serde_json::to_value(&pack).map_err(|e| e.to_string())?)
+}
+
+/// P6 产物里的阶段天锚（extract 内部的临时映射；装配层有自己的 stage_day_map）。
+fn stage_day_map_from(events: &ingest::EventsOut) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    for s in &events.stages {
+        out.insert(s.id.clone(), s.day);
+        if !s.name.is_empty() {
+            out.entry(s.name.clone()).or_insert(s.day);
+        }
+    }
+    out
+}
+/// 前端传来的小节数组 → Section（宽容：缺 title/text 的项跳过）。
+fn parse_sections(items: &[serde_json::Value]) -> Result<Vec<ingest::Section>, String> {
+    let mut out = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("s{}", i + 1));
+        let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push(ingest::Section { id, title, text });
+    }
+    if out.is_empty() {
+        return Err("没有可用的小节".into());
+    }
+    Ok(out)
+}
+
+/// util 档跑一个阶段（与 codex_complete 同一条通道：pick_util_provider + 代理设置）。
+async fn run_ingest_stage(
+    root: &std::path::Path,
+    prompt_text: String,
+    max_tokens: u32,
+) -> Result<String, String> {
+    let provider = pick_util_provider(root)?;
+    let proxy = store::load_settings(root)
+        .ok()
+        .and_then(|s| s.proxy)
+        .filter(|p| !p.trim().is_empty());
+    llm::chat_complete(
+        &provider,
+        &[llm::ChatMessage {
+            role: "user".into(),
+            content: prompt_text,
+        }],
+        max_tokens,
+        0.3,
+        proxy.as_deref(),
+    )
+    .await
+}
+
+/// ⑦⑧ 审阅后的落盘（确定性）：查重冲突 → 切入点切面 → 写卡 + 正史增量 + 世界线。
+#[tauri::command]
+pub fn ingest_commit(
+    world: String,
+    pack: serde_json::Value,
+    day: i64,
+    overwrite_worldline: bool,
+    set_world_day: bool,
+) -> Result<serde_json::Value, String> {
+    let root = root();
+    let name = if world.trim().is_empty() { "default".into() } else { world };
+    let pack: ingest::IngestPack =
+        serde_json::from_value(pack).map_err(|e| format!("草稿包格式不对：{e}"))?;
+    ingest_commit_core(&root, &name, pack, day, overwrite_worldline, set_world_day)
+}
+
+/// [`ingest_commit`] 的可测内核。
+fn ingest_commit_core(
+    root: &std::path::Path,
+    world: &str,
+    pack: ingest::IngestPack,
+    day: i64,
+    overwrite_worldline: bool,
+    set_world_day: bool,
+) -> Result<serde_json::Value, String> {
+    let day = if day > 0 { day } else { 1 };
+    let cx = load_codex(root, None, world);
+    let mut warnings: Vec<String> = Vec::new();
+    let mut written: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    // ---- ⑥ 查重与冲突（确定性先行；anchors 最高保护级）----
+    let check_new = |cx: &codex::Codex, id: &str, name: &str| -> Option<String> {
+        if cx.get(id).is_some() {
+            return Some(format!("实体 {id} 已存在——同名提案被跳过（如需更新请走实体编辑/收件箱）"));
+        }
+        // id 不同但同名的疑似重复：警告不阻断（可能是不同世界的同名者）
+        if cx
+            .entities()
+            .iter()
+            .any(|e| e.name.trim().to_lowercase() == name.trim().to_lowercase())
+        {
+            return Some(format!("__WARN__已有同名实体「{name}」——请确认不是重复导入"));
+        }
+        None
+    };
+    let ensure_ok = |cx: &codex::Codex, id: &str, name: &str, skipped: &mut Vec<String>, warnings: &mut Vec<String>| -> bool {
+        match check_new(cx, id, name) {
+            Some(msg) if msg.starts_with("__WARN__") => {
+                warnings.push(msg.trim_start_matches("__WARN__").to_string());
+                true
+            }
+            Some(msg) => {
+                skipped.push(msg);
+                false
+            }
+            None => true,
+        }
+    };
+
+    let mut to_write: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut planned_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // ---- ⑧ 切入点切面（secrets known_by / lifecycle / 史变告警）----
+    let applied = ingest::apply_canon_point(&pack, day);
+    for w in &applied.warnings {
+        warnings.push(w.problem.clone());
+    }
+    if let Some(point) = pack.canon_points.iter().find(|p| p.day == day) {
+        if let Some(premise) = &point.premise {
+            warnings.push(format!("切入点「{}」：{}", point.name, premise));
+        }
+    }
+
+    // 角色实体（含 secrets / lifecycle / versions）
+    if ensure_ok(&cx, &pack.entity.id, &pack.entity.name, &mut skipped, &mut warnings) {
+        let mut entity = applied.char_entity;
+        if let Some(obj) = entity.as_object_mut() {
+            if let Some(lc) = &applied.lifecycle {
+                obj.insert("lifecycle".into(), lc.clone());
+            }
+            let versions: Vec<serde_json::Value> = pack
+                .versions
+                .iter()
+                .filter(|v| v.include && v.day > 0)
+                .map(|v| {
+                    serde_json::json!({
+                        "from_day": v.day, "facet": v.facet, "value": v.value,
+                        "note": v.note.clone().unwrap_or_default(),
+                    })
+                })
+                .collect();
+            if !versions.is_empty() {
+                obj.insert("versions".into(), serde_json::json!(versions));
+            }
+            // 引源留档（审阅补看；不参与注入）
+            if !pack.entity.sources.is_empty() {
+                obj.insert(
+                    "sources".into(),
+                    serde_json::json!(pack.entity.sources
+                        .iter()
+                        .map(|(k, s)| serde_json::json!({
+                            "facet": k, "section": s.section, "quote": s.quote,
+                        }))
+                        .collect::<Vec<_>>()),
+                );
+            }
+        }
+        planned_ids.insert(pack.entity.id.clone());
+        to_write.push((pack.entity.id.clone(), entity));
+    }
+    // 占位与其他实体
+    for other in pack.others.iter().filter(|o| o.include) {
+        if ensure_ok(&cx, &other.id, &other.name, &mut skipped, &mut warnings) {
+            planned_ids.insert(other.id.clone());
+            to_write.push((other.id.clone(), ingest::entity_value(other, BTreeMap::new())));
+        }
+    }
+    // 事件实体
+    for ev in pack.events.iter().filter(|e| e.include) {
+        if ensure_ok(&cx, &ev.id, &ev.name, &mut skipped, &mut warnings) {
+            planned_ids.insert(ev.id.clone());
+            to_write.push((ev.id.clone(), ingest::entity_value(ev, BTreeMap::new())));
+        }
+    }
+    // 悬空关系：to 指向既不在 codex 也不在本次写入名单的实体 → 警告（人工裁决线索）
+    for r in &pack.entity.relations {
+        if cx.get(&r.to).is_none() && !planned_ids.contains(&r.to) {
+            warnings.push(format!("悬空关系：{} → {} 不在设定集也不在本次写入名单", pack.char_id, r.to));
+        }
+    }
+    if to_write.is_empty() {
+        // 全部提案与既有设定冲突：不报错——返回空写入的结构化报告（重复导入的正常形态），
+        // 卡照走复用逻辑（同内容卡 reused，不堆积）
+        warnings.push("没有可写入的实体——全部提案与既有设定冲突".into());
+    }
+
+    // ---- 落盘：grown.json（正史增量，加载时应用进注入）----
+    let mut grown = store::load_grown(root, world);
+    for (id, entity) in &to_write {
+        grown.entities.insert(id.clone(), entity.clone());
+    }
+    store::save_grown(root, world, &grown).map_err(|e| e.to_string())?;
+    for (id, _) in &to_write {
+        written.push(id.clone());
+    }
+
+    // ---- 落盘：card.lua（与 ST 导入同一条路：清洗/查重/可解析性验证都在里面）----
+    let chosen = pack.canon_points.iter().find(|p| p.day == day);
+    let mut scenario = pack.card.scenario.clone();
+    if let Some(premise) = chosen.and_then(|p| p.premise.clone()) {
+        // 「与已死者对话」的第二种处理：记忆体前提写进剧本 premise
+        if scenario.trim().is_empty() {
+            scenario = format!("【开场前提】{premise}");
+        } else {
+            scenario = format!("{scenario}\n\n【开场前提】{premise}");
+        }
+    }
+    let notes = if pack.pending.is_empty() {
+        "由素材规格化管线生成。".to_string()
+    } else {
+        format!(
+            "由素材规格化管线生成。待定 {} 项：{}",
+            pack.pending.len(),
+            pack.pending
+                .iter()
+                .map(|p| p.title.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        )
+    };
+    let card_draft = crate::stimport::CardDraft {
+        name: pack.entity.name.clone(),
+        creator: None,
+        tags: pack.card.tags.clone(),
+        world: Some(world.to_string()),
+        scenario,
+        personality: pack.card.personality.clone(),
+        first_mes: pack.card.first_mes.clone(),
+        example_dialogue: pack.card.example_dialogue.clone(),
+        notes,
+        source_spec: "素材规格化（wiki/剧情记录）".into(),
+        warnings: Vec::new(),
+        content_hash: String::new(),
+    };
+    let card_report = crate::stimport::save_card_draft(root, &card_draft, true)?;
+
+    // ---- 落盘：worldline.lua（可选层；已有主线默认不覆盖）----
+    let mut worldline_written = false;
+    if let Some(wl) = &pack.worldline {
+        if wl.stages.iter().any(|s| s.include) {
+            let wl_path = store::world_path(root, world)
+                .parent()
+                .map(|p| p.join("worldline.lua"))
+                .unwrap_or_else(|| std::path::PathBuf::from("worldline.lua"));
+            if wl_path.exists() && !overwrite_worldline {
+                warnings.push(format!(
+                    "{} 已有世界主线声明，未覆盖（勾选覆盖后重试才会写入新主线）",
+                    wl_path.display()
+                ));
+            } else {
+                let stages: Vec<ingest::StageDraft> = wl
+                    .stages
+                    .iter()
+                    .filter(|s| s.include)
+                    .cloned()
+                    .collect();
+                let source = ingest::render_worldline_lua(&ingest::WorldlineDraft {
+                    id: wl.id.clone(),
+                    premise: wl.premise.clone(),
+                    stages,
+                });
+                // 生成物必须能被归一化适配器读回（与 card.lua 落盘同一条纪律）
+                if let Err(e) = card::worldline_shape(&source) {
+                    warnings.push(format!("世界线声明解析失败，未写入：{e}"));
+                } else {
+                    std::fs::write(&wl_path, source)
+                        .map_err(|e| format!("写入 {} 失败：{e}", wl_path.display()))?;
+                    worldline_written = true;
+                }
+            }
+        }
+    }
+
+    // ---- 世界时钟拨到切入点（可选；多线并行时拨钟影响其他会话的开局基准）----
+    if set_world_day {
+        let mut w = store::load_world(root, world);
+        if day > w.day {
+            w.day = day;
+            store::save_world(root, world, &w).map_err(|e| e.to_string())?;
+        }
+    }
+
+    crate::diag::record(
+        "ingest",
+        format!(
+            "素材落盘：{} → 卡「{}」+ 实体 {} 条 + 世界线（{}）",
+            world,
+            card_report.dir_name,
+            written.len(),
+            if worldline_written { "已写" } else { "未写" }
+        ),
+    );
+    Ok(serde_json::json!({
+        "world": world,
+        "cardDir": card_report.dir_name,
+        "cardPath": card_report.card_path,
+        "entitiesWritten": written,
+        "worldlineWritten": worldline_written,
+        "canonDay": day,
+        "skipped": skipped,
+        "warnings": warnings,
+    }))
+}
+
+/// ST 世界书导入（M3.9 补 M2.2 欠账 · 设计 §6.10）：JSON → note 实体。
+/// `json_text` 与 `path` 二选一（粘贴导入 / 文件导入）。
+#[tauri::command]
+pub fn import_worldbook(
+    world: String,
+    json_text: Option<String>,
+    path: Option<String>,
+    book_name: Option<String>,
+) -> Result<crate::stimport::WorldbookReport, String> {
+    let root = root();
+    let name = if world.trim().is_empty() { "default".into() } else { world };
+    let text = match (json_text, path) {
+        (Some(text), _) => text,
+        (None, Some(path)) => {
+            std::fs::read_to_string(&path).map_err(|e| format!("读取 {path} 失败：{e}"))?
+        }
+        (None, None) => return Err("没有可导入的内容——粘贴 JSON 或给一个文件路径".into()),
+    };
+    crate::stimport::import_worldbook_to(&root, &name, &text, book_name.as_deref())
+}
+
 
 // ---------- 设定史变的解析预览（M3.7 · 设计 §6.5）----------
 
@@ -10468,6 +11019,179 @@ return { state_tree = {
             "improv 提案重建不丢"
         );
         let _ = history;
+    }
+
+    // M3.9 验收（commands 层）：草稿包落盘——卡、正史增量、世界线三路产物；
+    // 重复导入被查重拦住；切入点切面烘焙秘密知情集。设计 §6.7。
+
+    /// 一份可直接 commit 的最小草稿包（爱莉希雅 wiki 样例的浓缩形态）
+    fn sample_pack(world: &str) -> ingest::IngestPack {
+        let secrets = vec![ingest::SecretDraft {
+            key: "律者".into(),
+            content: "实为人之律者".into(),
+            revealed_by: Some("finale".into()),
+            known_by_advice: vec!["爱莉希雅".into()],
+            source: None,
+            include: true,
+            origin: "llm".into(),
+        }];
+        let mut pack = ingest::IngestPack {
+            world: world.into(),
+            char_id: "char.爱莉希雅".into(),
+            card: ingest::CardSide {
+                first_mes: "你好呀，我是爱莉希雅♪".into(),
+                scenario: "前文明纪，终焉倒计时".into(),
+                personality: "动机：让所有人被温柔以待".into(),
+                tags: vec!["素材规格化".into()],
+                example_dialogue: vec![card::ExampleTurn {
+                    tag: Some("初见".into()),
+                    messages: vec![card::ExampleLine {
+                        role: "char".into(),
+                        content: "要像花一样绽放哦♪".into(),
+                    }],
+                }],
+                sources: BTreeMap::new(),
+            },
+            entity: ingest::EntityDraft {
+                id: "char.爱莉希雅".into(),
+                ty: "char".into(),
+                name: "爱莉希雅".into(),
+                aliases: vec!["人之律者".into()],
+                one_liner: "笑起来像花的逐火战士。".into(),
+                facts: BTreeMap::from([
+                    (
+                        "look".into(),
+                        serde_json::json!({ "anchors": ["发间的花"], "impression": "粉色长发" }),
+                    ),
+                    ("motivation".into(), serde_json::json!("让所有人被温柔以待")),
+                ]),
+                relations: vec![codex::Relation {
+                    to: "org.逐火十三英桀".into(),
+                    kind: "所属".into(),
+                    always_with: true,
+                }],
+                sources: BTreeMap::new(),
+                include: true,
+                stub: false,
+            },
+            others: vec![ingest::EntityDraft {
+                id: "org.逐火十三英桀".into(),
+                ty: "org".into(),
+                name: "逐火十三英桀".into(),
+                aliases: vec![],
+                one_liner: String::new(),
+                facts: BTreeMap::new(),
+                relations: vec![],
+                sources: BTreeMap::new(),
+                include: true,
+                stub: true,
+            }],
+            events: vec![],
+            secrets,
+            lifecycle: Some(ingest::LifecycleDraft {
+                status: "dead".into(),
+                at_day: 30,
+                note: Some("终焉之战".into()),
+                source: None,
+            }),
+            versions: vec![],
+            worldline: Some(ingest::WorldlineDraft {
+                id: "main".into(),
+                premise: "前文明纪，终焉倒计时".into(),
+                stages: vec![
+                    ingest::StageDraft { id: "opening".into(), name: String::new(), day: 1, directive: "日常的延续".into(), include: true },
+                    ingest::StageDraft { id: "finale".into(), name: String::new(), day: 30, directive: "最后的战斗".into(), include: true },
+                ],
+            }),
+            canon_points: vec![
+                ingest::CanonPoint { name: "opening".into(), day: 1, stage: Some("opening".into()), note: String::new(), after_death: false, premise: None },
+                ingest::CanonPoint { name: "finale".into(), day: 30, stage: Some("finale".into()), note: String::new(), after_death: true, premise: Some("记忆体框架：她已不在人世——按此前提扮演".into()) },
+            ],
+            pending: vec![],
+            qc: vec![],
+        };
+        pack.canon_points = ingest::build_canon_points(&pack);
+        pack
+    }
+
+    #[test]
+    fn ingest_commit_writes_card_grown_and_worldline_with_canon_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("codex/testworld/entities")).unwrap();
+
+        // 切入点 1（死亡前）：秘密只有本人知道；世界线落盘
+        let report = ingest_commit_core(root, "testworld", sample_pack("testworld"), 1, false, false).unwrap();
+        assert_eq!(report["entitiesWritten"].as_array().unwrap().len(), 2, "{report}");
+        assert_eq!(report["worldlineWritten"].as_bool(), Some(true));
+
+        let card_dir = root.join("characters").join(report["cardDir"].as_str().unwrap());
+        let card_name = report["cardDir"].as_str().unwrap().to_string();
+        assert!(card_dir.join("card.lua").is_file());
+        let loaded = card::load_card(root, "爱莉希雅").unwrap();
+        assert_eq!(loaded.card.name, "爱莉希雅");
+        assert_eq!(loaded.card.first_mes, "你好呀，我是爱莉希雅♪");
+        let _ = card_name;
+
+        // 正史增量：秘密知情集 = 本人（第 1 天「finale@30」未揭示）；lifecycle dead@30
+        let grown = store::load_grown(root, "testworld");
+        let char_e = grown.entities.get("char.爱莉希雅").expect("角色实体应写入 grown");
+        let known_by = char_e
+            .pointer("/secrets/律者/known_by/0")
+            .expect("秘密进正史");
+        assert_eq!(known_by, "爱莉希雅");
+        assert_eq!(
+            char_e.pointer("/lifecycle/at_day").and_then(|d| d.as_i64()),
+            Some(30)
+        );
+        // 世界线声明可被归一化读回（M3.7 引擎吃这份）
+        let wl_source = std::fs::read_to_string(root.join("codex/testworld/worldline.lua")).unwrap();
+        let shape = card::worldline_shape(&wl_source).unwrap();
+        assert_eq!(shape["id"], "main");
+        assert_eq!(shape["state_tree"]["root"], "opening");
+
+        // load_codex 指纹包含 grown.json：立刻能读到新实体（确认即进注入）
+        let cx = load_codex(root, None, "testworld");
+        assert!(cx.get("char.爱莉希雅").is_some());
+        assert!(cx.get("org.逐火十三英桀").is_some());
+        assert!(
+            cx.get("char.爱莉希雅").unwrap().secrets.contains_key("律者"),
+            "秘密进正史"
+        );
+
+        // 重复 commit：角色与组织都被查重拦下（skipped），世界线默认不覆盖
+        let again = ingest_commit_core(root, "testworld", sample_pack("testworld"), 1, false, false).unwrap();
+        let skipped = again["skipped"].as_array().unwrap();
+        assert!(skipped.len() >= 2, "重复实体应被跳过：{skipped:?}");
+        assert_eq!(again["worldlineWritten"].as_bool(), Some(false));
+        assert!(
+            (again["warnings"].as_array().unwrap())
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("世界主线")),
+            "已有主线要提示未覆盖：{:?}",
+            again["warnings"]
+        );
+    }
+
+    #[test]
+    fn ingest_commit_at_late_canon_point_publishes_secrets_and_premise() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("codex/testworld/entities")).unwrap();
+
+        // 切入点 30（死亡后）：秘密公开（known_by=*），记忆体前提写进卡 scenario
+        let report =
+            ingest_commit_core(root, "testworld", sample_pack("testworld"), 30, true, true).unwrap();
+        let grown = store::load_grown(root, "testworld");
+        let char_e = grown.entities.get("char.爱莉希雅").unwrap();
+        let known_by = char_e.pointer("/secrets/律者/known_by/0").unwrap();
+        assert_eq!(known_by, "*");
+        // 卡的 scenario 带记忆体前提（card.lua 是字节转义文本，读解析后的卡来断言）
+        let loaded = card::load_card(root, "爱莉希雅").unwrap();
+        assert!(loaded.card.scenario.contains("开场前提"), "{}", loaded.card.scenario);
+        assert!(loaded.card.scenario.contains("记忆体"));
+        // set_world_day：世界时钟拨到切入点
+        assert_eq!(store::load_world(root, "testworld").day, 30);
     }
 
 }

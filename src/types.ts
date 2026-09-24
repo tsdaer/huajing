@@ -639,3 +639,143 @@ export interface InspectorData {
   activeEntities: string[];
 }
 
+
+// ---------- 素材规格化管线（M3.9 · 设计 §6.7：wiki 页十分钟成卡） ----------
+
+/** 清洗分段后的一个小节（id 是全管线引源跳转的锚点） */
+export interface IngestSection {
+  id: string;
+  title: string;
+  text: string;
+}
+
+/** ①② 导入与清洗分段的产物（确定性） */
+export interface IngestPrep {
+  world: string;
+  sections: IngestSection[];
+  /** 机械剧透候选（秘密的前身，审阅可见） */
+  spoilers: string[];
+}
+
+/** 逐条引源（审阅可跳转：小节 id + 原文关键句） */
+export interface IngestSource {
+  section: string;
+  quote: string;
+}
+
+/** 实体草稿（角色本体 / 占位 / 事件共用） */
+export interface IngestEntityDraft {
+  id: string;
+  type: string;
+  name: string;
+  aliases: string[];
+  one_liner: string;
+  /** facts（嵌套对象） */
+  facts: Record<string, unknown>;
+  relations: Array<{ to: string; kind: string; always_with: boolean }>;
+  sources: Record<string, IngestSource>;
+  include: boolean;
+  /** 占位实体（关系目标/组织）：只有名字，交给补全管线接力 */
+  stub: boolean;
+}
+
+/** 秘密候选（known_by 在 commit 时按切入点解析） */
+export interface IngestSecretDraft {
+  key: string;
+  content: string;
+  revealed_by: string | null;
+  known_by_advice: string[];
+  source: IngestSource | null;
+  include: boolean;
+  /** spoiler（机械剧透）| llm（P3 归纳） */
+  origin: string;
+}
+
+/** 史变候选（素材暗示「同一事实随剧情变化」） */
+export interface IngestVersionDraft {
+  facet: string;
+  value: unknown;
+  day: number;
+  note: string | null;
+  source: IngestSource | null;
+  include: boolean;
+}
+
+/** 世界线阶段候选 */
+export interface IngestStageDraft {
+  id: string;
+  name: string;
+  day: number;
+  directive: string;
+  include: boolean;
+}
+
+/** ⑧ 切入点候选（死亡后的点带记忆体前提） */
+export interface IngestCanonPoint {
+  name: string;
+  day: number;
+  stage: string | null;
+  note: string;
+  after_death: boolean;
+  premise: string | null;
+}
+
+/** 待定项（宁漏勿错的落点） */
+export interface IngestPendingItem {
+  title: string;
+  detail: string;
+  source: IngestSource | null;
+}
+
+/** 确定性质检结论（P10 机械子集；severity: warn | info） */
+export interface IngestQcIssue {
+  severity: string;
+  at: string;
+  problem: string;
+}
+
+/** ⑦ 草稿包（审阅的前后端往返对象；commit 只认提交上来的这一份） */
+export interface IngestPack {
+  world: string;
+  char_id: string;
+  card: {
+    first_mes: string;
+    scenario: string;
+    personality: string;
+    tags: string[];
+    example_dialogue: Array<{ tag: string | null; messages: Array<{ role: string; content: string }> }>;
+    sources: Record<string, IngestSource>;
+  };
+  entity: IngestEntityDraft;
+  others: IngestEntityDraft[];
+  events: IngestEntityDraft[];
+  secrets: IngestSecretDraft[];
+  lifecycle: { status: string; at_day: number; note: string | null; source: IngestSource | null } | null;
+  versions: IngestVersionDraft[];
+  worldline: { id: string; premise: string; stages: IngestStageDraft[] } | null;
+  canon_points: IngestCanonPoint[];
+  pending: IngestPendingItem[];
+  qc: IngestQcIssue[];
+}
+
+/** commit 的落盘报告 */
+export interface IngestCommitReport {
+  world: string;
+  cardDir: string;
+  cardPath: string;
+  entitiesWritten: string[];
+  worldlineWritten: boolean;
+  canonDay: number;
+  skipped: string[];
+  warnings: string[];
+}
+
+/** ST 世界书导入报告（JSON → note 实体） */
+export interface WorldbookReport {
+  world: string;
+  imported: number;
+  disabled: number;
+  skipped: number;
+  files: string[];
+  warnings: string[];
+}

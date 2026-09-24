@@ -29,7 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::prompt::estimate_tokens;
@@ -175,7 +175,8 @@ fn demote_reason(target: Stage) -> &'static str {
 // ---------- 实体 schema（§6.2）----------
 
 /// 秘密（§6.2 secrets）：known_by 是知情者集合，revealed_by 是声明式揭示来源。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+/// Deserialize 供素材管线草稿包（M3.9）前后端往返复用同一结构。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Secret {
     pub content: String,
     /// 知情者集合（§10.4 揭示时按场景见证者加入）；含 "*" 表示不设限
@@ -185,7 +186,8 @@ pub struct Secret {
 }
 
 /// 关系边（§6.2 relations）：always_with 参与"关系牵引"（§6.3 源 4）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Deserialize 供素材管线草稿包（M3.9）前后端往返复用同一结构。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relation {
     pub to: String,
     pub kind: String,

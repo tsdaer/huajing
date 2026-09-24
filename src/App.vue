@@ -8,6 +8,7 @@ import { loadSessions, openNewSession, selectedId, selectSession, sessions } fro
 import type { SessionMeta } from "./types";
 import ImportCardDialog from "./components/ImportCardDialog.vue";
 import HomeView from "./views/HomeView.vue";
+import IngestView from "./views/IngestView.vue";
 import SessionsView from "./views/SessionsView.vue";
 import SettingsView from "./views/SettingsView.vue";
 
@@ -15,19 +16,20 @@ import SettingsView from "./views/SettingsView.vue";
 const ThemeView = defineAsyncComponent(() => import("./views/ThemeView.vue"));
 
 // 应用外壳：自定义标题栏（无边框窗口）+ drawer 侧栏 + navbar 顶栏 + 视图区。
-// 路由细化（单会话地址等）随 M1.5 评估，此处先四页切换；地址片段可直达。
-type ViewId = "home" | "sessions" | "theme" | "settings";
+// 路由细化（单会话地址等）随 M1.5 评估，此处先分页切换；地址片段可直达。
+type ViewId = "home" | "sessions" | "ingest" | "theme" | "settings";
 
-const HASH_VIEWS: ViewId[] = ["home", "sessions", "theme", "settings"];
+const HASH_VIEWS: ViewId[] = ["home", "sessions", "ingest", "theme", "settings"];
 const view = ref<ViewId>(HASH_VIEWS.find((v) => location.hash === `#${v}`) ?? "home");
 watch(view, (v) => {
   location.hash = v;
 });
 
-const NAV: ViewId[] = ["home", "sessions", "theme", "settings"];
+const NAV: ViewId[] = ["home", "sessions", "ingest", "theme", "settings"];
 const PAGES: Record<ViewId, { label: string; icon: string; title: string; desc: string }> = {
   home: { label: "概览", icon: "home", title: "概览", desc: "运行时状态与本机数据一览" },
   sessions: { label: "会话", icon: "chat", title: "会话", desc: "挑一场戏，接着往下演" },
+  ingest: { label: "素材导入", icon: "database", title: "素材导入", desc: "wiki 角色页十分钟成卡（素材规格化）" },
   theme: { label: "主题", icon: "palette", title: "主题", desc: "预设、配色与形状令牌" },
   settings: { label: "设置", icon: "settings", title: "设置", desc: "接入点、人格与全局项" },
 };
@@ -184,6 +186,7 @@ async function startDropWatch() {
         <main class="min-h-0 flex-1">
           <HomeView v-if="view === 'home'" @go="view = $event" />
           <SessionsView v-else-if="view === 'sessions'" />
+          <IngestView v-else-if="view === 'ingest'" />
           <ThemeView v-else-if="view === 'theme'" />
           <SettingsView v-else />
         </main>

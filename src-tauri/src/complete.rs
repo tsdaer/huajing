@@ -253,7 +253,8 @@ pub fn build_improv_prompt(
 }
 
 /// 取回复里第一个 `{` 到最后一个 `}` 的片段（剥围栏与前后杂文；与 summarize 同纪律）。
-fn extract_json_object(raw: &str) -> Option<&str> {
+/// pub(crate)：素材管线（M3.9）的各阶段解析共用同一宽容口径。
+pub(crate) fn extract_json_object(raw: &str) -> Option<&str> {
     let start = raw.find('{')?;
     let end = raw.rfind('}')?;
     if end <= start {
