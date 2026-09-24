@@ -117,6 +117,20 @@ async function saveProxy() {
 const testing = ref("");
 const testResult = ref<{ name: string; result: ProviderTest } | null>(null);
 
+/** 用途档位的中文标签（M3.10 起三档：chat / util / embed） */
+function providerRoleLabel(role: string): string {
+  if (role === "util") return "工具档";
+  if (role === "embed") return "嵌入档";
+  return "主对话";
+}
+
+/** 用途档位的徽标配色：一眼分清谁干什么 */
+function providerBadgeClass(role: string): string {
+  if (role === "util") return "badge-info";
+  if (role === "embed") return "badge-success";
+  return "badge-primary";
+}
+
 /** 真的发一条最小请求：能区分 key 无效 / 地址写错 / 出网被拦三类故障 */
 async function testProvider(p: Provider) {
   testing.value = p.name;
@@ -170,6 +184,18 @@ const PRESETS: Array<{ label: string; hint: string; preset: Provider }> = [
       model: "qwen2.5:7b",
       temperature: 0.8,
       role: "chat",
+    },
+  },
+  {
+    label: "Ollama 嵌入（语义关联）",
+    hint: "qwen3-embedding · 需先 ollama pull",
+    preset: {
+      name: "ollama-embed",
+      base_url: "http://localhost:11434/v1",
+      api_key: "",
+      model: "qwen3-embedding",
+      temperature: 0,
+      role: "embed",
     },
   },
 ];
@@ -337,9 +363,9 @@ async function confirmRemove() {
                   <span class="text-sm font-medium">{{ p.name }}</span>
                   <span
                     class="badge badge-sm badge-soft"
-                    :class="p.role === 'util' ? 'badge-info' : 'badge-primary'"
+                    :class="providerBadgeClass(p.role)"
                   >
-                    {{ p.role === "util" ? "工具档" : "主对话" }}
+                    {{ providerRoleLabel(p.role) }}
                   </span>
                   <span class="badge badge-sm badge-ghost font-mono">T={{ p.temperature }}</span>
                 </div>
@@ -428,7 +454,12 @@ async function confirmRemove() {
                 <select id="p-role" class="select select-sm w-full" v-model="draft.role">
                   <option value="chat">chat · 主对话</option>
                   <option value="util">util · 总结/捕获（便宜档）</option>
+                  <option value="embed">embed · 语义关联（嵌入向量）</option>
                 </select>
+                <p v-if="draft.role === 'embed'" class="mt-1 mb-0 text-[11px] text-base-content/50">
+                  选 Qwen3-Embedding 一类的嵌入模型（如 Ollama 的
+                  <code class="font-mono">qwen3-embedding</code>）；不配置 = 语义关联层关闭。
+                </p>
               </div>
             </div>
             <div class="flex justify-end gap-2">

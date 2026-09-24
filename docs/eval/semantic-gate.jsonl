@@ -1,0 +1,31 @@
+// 语义关联门禁评测语料（M3.10a · 设计 §6.13）
+//
+// 来源：M2 真机压测语料（temp/m2/stress-data/sessions/20260920-*，图书馆/小雨世界，
+// 30 轮 60 消息）。标注口径：**确定性匹配（别名 trie）漏检、但人能看出在指谁**的位置，
+// 三类盲区（§6.13）：pronoun（代词）/ description（描述性指称）/ hearsay（转述）。
+//
+// text 一律取压测语料里的**原句**（评测可直接对着真实语料跑）；expected 是人标注的
+// 语义召回目标实体 id（以 DataHub/codex/default 的实体表为准）。
+//
+// 跑分方式（真机，归 M3.11）：配好 role="embed" 接入点（首选 Ollama 托管
+// qwen3-embedding）后，对每条 text 做查询嵌入 → 实体索引余弦 top-K，
+// 与本文件 expected 对照，产出 semantic::EvalReport（召回率 / 误报率）。
+// 门禁：净收益不显著（召回率低或误报率过高）则语义源不进热路径——默认阈值
+// semantic::DEFAULT_THRESHOLD = 0.45、top-K = 5 可据此调整。
+//
+// 基线：这批用例全部取自 trie 盲区，确定性基线的召回率恒为 0；
+// 评测只回答「嵌入召回能救回多少、误报多少」。
+{"text": "我们对花生过敏——你柜子里那罐花生饼干离我远一点。", "expected": ["place.图书馆"], "kind": "description"}
+{"text": "我最喜欢的作家是汪曾祺，尤其是写吃的那些。", "expected": ["char.小雨"], "kind": "description"}
+{"text": "今天来自习的人很少。", "expected": ["place.图书馆"], "kind": "description"}
+{"text": "你整理书车的速度变快了。", "expected": ["char.小雨"], "kind": "pronoun"}
+{"text": "台灯的光有点偏黄。", "expected": ["place.图书馆"], "kind": "description"}
+{"text": "柜台上的茶凉了吧。", "expected": ["place.图书馆"], "kind": "description"}
+{"text": "夜里的图书馆安静得能听见翻页声，就剩你一个了。", "expected": ["char.小雨", "place.图书馆"], "kind": "pronoun"}
+{"text": "谢谢你今晚又陪我到这么晚。", "expected": ["char.小雨"], "kind": "pronoun"}
+{"text": "闭馆铃还有多久？", "expected": ["place.图书馆"], "kind": "description"}
+{"text": "你在便签上画的那只猫，尾巴翘得很好看。", "expected": ["char.小雨", "item.便签"], "kind": "pronoun"}
+{"text": "说起来，周五还书的事别忘了。", "expected": ["char.小雨"], "kind": "hearsay"}
+{"text": "她站在东侧窗边，看着玻璃上的水痕。", "expected": ["char.小雨", "place.图书馆"], "kind": "pronoun"}
+{"text": "那把折伞放在台面靠外的位置。", "expected": ["char.小雨", "place.图书馆"], "kind": "description"}
+{"text": "她刚来时贴的标签，这批新的还没领。", "expected": ["char.小雨", "place.图书馆"], "kind": "description"}

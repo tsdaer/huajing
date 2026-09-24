@@ -1,6 +1,9 @@
 # LLM 接入点（OpenAI 兼容协议：DeepSeek / GLM / Kimi / Ollama / LM Studio 通吃）
 # 复制本文件为 providers.toml 并填入你的 key；也可在应用「设置」页增删。
-# role = "chat" 主对话；"util" 总结/捕获（走便宜档）
+# role = "chat" 主对话；"util" 总结/捕获（走便宜档）；
+# role = "embed" 语义关联（M3.10 · 可选：嵌入召回补代词/描述性指称的盲区；
+#                首选 Ollama 托管的 qwen3-embedding，`ollama pull qwen3-embedding`。
+#                不配置 = 语义关联层整层关闭，行为与纯确定性版完全一致）
 
 [[providers]]
 name = "deepseek"
@@ -17,3 +20,13 @@ api_key = "sk-替换为我"
 model = "deepseek-chat"
 temperature = 0.2
 role = "util"
+
+# 可选：语义关联（本地嵌入，毫秒级；模型不打进安装包）
+# [[providers]]
+# name = "ollama-embed"
+# base_url = "http://localhost:11434/v1"
+# api_key = ""
+# model = "qwen3-embedding"
+# temperature = 0
+# role = "embed"
+

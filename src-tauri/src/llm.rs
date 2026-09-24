@@ -365,6 +365,91 @@ pub async fn chat_complete(
         })
 }
 
+/// embeddings 地址（自检与真实调用共用，避免两处规则漂移）
+pub fn embeddings_endpoint(provider: &Provider) -> String {
+    format!("{}/embeddings", normalize_base_url(&provider.base_url))
+}
+
+/// 从 `/v1/embeddings` 的响应 JSON 里按 `index` 排序抽出向量（OpenAI 兼容形态，
+/// Ollama 同协议）。条目缺 `embedding` / 索引不齐 / 维度为零都算脏响应，由调用方
+/// 报错——向量对错实体是静默串台，宁可拒绝。
+fn parse_embeddings_response(value: &serde_json::Value) -> Result<Vec<Vec<f32>>, String> {
+    let data = value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| {
+            format!(
+                "embeddings 响应里没有 data 数组：{}",
+                truncate(&value.to_string(), 300)
+            )
+        })?;
+    let mut rows: Vec<(usize, Vec<f32>)> = data
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let embedding = item
+                .get("embedding")
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_f64().map(|f| f as f32))
+                        .collect::<Vec<f32>>()
+                })
+                .ok_or_else(|| format!("embeddings 响应第 {i} 条缺 embedding 数组"))?;
+            if embedding.is_empty() {
+                return Err(format!("embeddings 响应第 {i} 条是空向量"));
+            }
+            let index = item.get("index").and_then(|x| x.as_u64()).unwrap_or(i as u64) as usize;
+            Ok((index, embedding))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    rows.sort_by_key(|(i, _)| *i);
+    // 索引必须恰好是 0..n（缺位/重复意味着向量与输入的对应关系已不可信）
+    if rows.iter().enumerate().any(|(i, (idx, _))| *idx != i) {
+        return Err("embeddings 响应的 index 不连续（部分输入被服务端丢弃？）".to_string());
+    }
+    Ok(rows.into_iter().map(|(_, v)| v).collect())
+}
+
+/// OpenAI 兼容 `/v1/embeddings` 批量嵌入（M3.10 · 设计 §6.13 语义关联层；
+/// 非流式，Ollama 同协议）。返回向量顺序与 `inputs` 一一对应。
+pub async fn embeddings(
+    provider: &Provider,
+    inputs: &[String],
+    extra_proxy: Option<&str>,
+) -> Result<Vec<Vec<f32>>, String> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (client, _proxy) = build_client(extra_proxy).await?;
+    let body = serde_json::json!({
+        "model": provider.model,
+        "input": inputs,
+    });
+    let resp = client
+        .post(embeddings_endpoint(provider))
+        .bearer_auth(&provider.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败（{}）：{}", provider.name, error_chain(&e)))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "{} 返回 {}：{}",
+            provider.name,
+            status,
+            truncate(&detail, 300)
+        ));
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("响应解析失败（{}）：{e}", provider.name))?;
+    parse_embeddings_response(&value)
+}
+
 /// 环境变量里的代理（reqwest 的 system-proxy 也会读它们）
 fn proxy_from_env() -> Option<(String, String)> {
     for key in [
@@ -751,5 +836,54 @@ mod tests {
         let no_delta: StreamChunk =
             serde_json::from_str(r#"{"choices":[{"delta":{}}]}"#).unwrap();
         assert!(no_delta.choices[0].delta.content.is_none());
+    }
+
+    #[test]
+    fn embeddings_response_sorts_by_index() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"data":[{"index":1,"embedding":[3.0,4.0]},{"index":0,"embedding":[1.0,2.0]}]}"#,
+        )
+        .unwrap();
+        let rows = parse_embeddings_response(&value).unwrap();
+        assert_eq!(rows, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+    }
+
+    #[test]
+    fn embeddings_response_rejects_dirty_payloads() {
+        let no_data: serde_json::Value = serde_json::from_str(r#"{"error":"boom"}"#).unwrap();
+        assert!(parse_embeddings_response(&no_data).is_err());
+
+        let missing: serde_json::Value =
+            serde_json::from_str(r#"{"data":[{"index":0}]}"#).unwrap();
+        assert!(parse_embeddings_response(&missing).is_err(), "缺 embedding 报错");
+
+        let empty_vec: serde_json::Value =
+            serde_json::from_str(r#"{"data":[{"index":0,"embedding":[]}]}"#).unwrap();
+        assert!(parse_embeddings_response(&empty_vec).is_err(), "空向量报错");
+
+        let gapped: serde_json::Value = serde_json::from_str(
+            r#"{"data":[{"index":0,"embedding":[1.0]},{"index":2,"embedding":[2.0]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            parse_embeddings_response(&gapped).is_err(),
+            "索引断档 = 对应关系不可信"
+        );
+    }
+
+    #[test]
+    fn embeddings_endpoint_uses_the_same_url_rules() {
+        let p = Provider {
+            name: "t".into(),
+            base_url: "https://api.deepseek.com".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            temperature: 0.0,
+            role: "embed".into(),
+        };
+        assert_eq!(
+            embeddings_endpoint(&p),
+            "https://api.deepseek.com/v1/embeddings"
+        );
     }
 }

@@ -17,6 +17,7 @@ use crate::ingest;
 use crate::palace;
 use crate::psyche;
 use crate::scene;
+use crate::semantic;
 use crate::statetree;
 use crate::summarize;
 use crate::threads;
@@ -1150,6 +1151,152 @@ fn load_codex(
     codex
 }
 
+// ---------- 语义关联层（M3.10 · 设计 §6.13：可选第六激活源）----------
+//
+// 纪律（m3.md 决断 7）：未配 embed 档 = 整层关闭，行为与纯确定性版一字不差；
+// 检索失败也只在诊断里留一笔、当轮退回纯确定性（降级即设计，不挡说话）。
+// 本模块只做两件事：把实体检索文档批量嵌入成索引（挂在设定集指纹缓存旁，
+// 文件没变不重嵌），以及每轮把扫描窗口嵌入一次去索引里取候选 id。
+
+/// 实体嵌入索引缓存（Tauri State）：世界 → (设定集指纹 + 模型名, 索引)。
+/// 指纹混入模型名——换嵌入模型必须重嵌（两套向量空间不可混用）。
+#[derive(Default)]
+pub struct EmbedCache(Mutex<HashMap<String, (u64, Arc<semantic::SemanticIndex>)>>);
+
+/// 嵌入批次大小：一次请求打太多文本，本地 Ollama 会顶到超时，云 API 会撞单请求上限
+const EMBED_BATCH: usize = 16;
+
+/// embed 档接入点（设计 §11 新增用途档；未配置 = 语义层整层关闭，返回 None）
+fn pick_embed_provider(root: &std::path::Path) -> Result<Option<Provider>, String> {
+    let providers = store::load_providers(root).map_err(|e| e.to_string())?;
+    Ok(providers
+        .iter()
+        .find(|p| p.role == "embed")
+        .filter(|p| !p.base_url.trim().is_empty() && !p.model.trim().is_empty())
+        .cloned())
+}
+
+/// 取（或建）某个世界的实体嵌入索引。实体文档用 [`semantic::entity_document`]
+/// 的确定性形态，canon 实体才入索引（draft/retired 反正不参与注入）。
+async fn load_semantic_index(
+    root: &std::path::Path,
+    codex: &codex::Codex,
+    cache: Option<&EmbedCache>,
+    provider: &Provider,
+    extra_proxy: Option<&str>,
+    world: &str,
+) -> Result<Arc<semantic::SemanticIndex>, String> {
+    let dir = codex_entities_dir(root, world);
+    let mut fp = world_fingerprint(&dir);
+    for byte in provider.model.trim().to_ascii_lowercase().bytes() {
+        fp = (fp ^ byte as u64).wrapping_mul(1099511628211);
+    }
+    // grown.json 物化的新实体也要进索引：指纹同款混入（必须在缓存查找前算全）
+    let grown_file = store::grown_path(root, world);
+    if let Ok(md) = std::fs::metadata(&grown_file) {
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        for byte in format!("grown:{}:{}", md.len(), mtime).bytes() {
+            fp = (fp ^ byte as u64).wrapping_mul(1099511628211);
+        }
+    }
+    if let Some(cache) = cache {
+        if let Ok(map) = cache.0.lock() {
+            if let Some((cached, idx)) = map.get(world) {
+                if *cached == fp {
+                    return Ok(idx.clone());
+                }
+            }
+        }
+    }
+    let docs: Vec<String> = codex
+        .entities()
+        .iter()
+        .filter(|e| e.is_canon())
+        .map(semantic::entity_document)
+        .collect();
+    let ids: Vec<String> = codex
+        .entities()
+        .iter()
+        .filter(|e| e.is_canon())
+        .map(|e| e.id.clone())
+        .collect();
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(docs.len());
+    for chunk in docs.chunks(EMBED_BATCH) {
+        vectors.extend(llm::embeddings(provider, chunk, extra_proxy).await?);
+    }
+    let index = Arc::new(semantic::SemanticIndex::from_raw(ids, docs, vectors)?);
+    if let Some(cache) = cache {
+        if let Ok(mut map) = cache.0.lock() {
+            map.insert(world.to_string(), (fp, index.clone()));
+        }
+    }
+    Ok(index)
+}
+
+/// 语义源查询（宿主旁路）：扫描窗口嵌入一次 → 索引余弦 top-K。
+/// 任何失败都降级为空候选（诊断里留原因）——语义层永远不挡说话。
+/// `record`：是否把嵌入模型记进会话元数据（§6.13 版本声明）——正式发送记，
+/// 预览干跑不写盘。
+async fn semantic_hits_for(
+    root: &std::path::Path,
+    codex: &codex::Codex,
+    embed_cache: Option<&EmbedCache>,
+    meta: &store::SessionMeta,
+    world: &str,
+    query_text: &str,
+    record: bool,
+) -> Vec<semantic::SemanticHit> {
+    let provider = match pick_embed_provider(root) {
+        Ok(Some(p)) => p,
+        _ => return Vec::new(),
+    };
+    let proxy = store::load_settings(root)
+        .ok()
+        .and_then(|s| s.proxy)
+        .filter(|p| !p.trim().is_empty());
+    let query_text = query_text.trim();
+    if query_text.is_empty() {
+        return Vec::new();
+    }
+    let query = format!("{}{}", semantic::QUERY_INSTRUCTION, query_text);
+    let index = match load_semantic_index(root, codex, embed_cache, &provider, proxy.as_deref(), world)
+        .await
+    {
+        Ok(i) => i,
+        Err(e) => {
+            crate::diag::record("semantic", format!("嵌入索引构建失败（本轮降级为纯确定性）：{e}"));
+            return Vec::new();
+        }
+    };
+    let vectors = match llm::embeddings(&provider, &[query], proxy.as_deref()).await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::diag::record("semantic", format!("查询嵌入失败（本轮降级为纯确定性）：{e}"));
+            return Vec::new();
+        }
+    };
+    let Some(qv) = vectors.into_iter().next() else {
+        return Vec::new();
+    };
+    // 版本声明（§6.13 可回放语义）：首次真正启用语义召回时把模型记进会话元数据。
+    // 写失败不影响本轮（元数据只是审计锚点，注入不依赖它）。
+    let stamp = format!("{}/{}", provider.name, provider.model);
+    if record && meta.embed_model.as_deref() != Some(stamp.as_str()) {
+        let mut updated = meta.clone();
+        updated.embed_model = Some(stamp);
+        if let Err(e) = store::save_session(root, &updated) {
+            crate::diag::record("semantic", format!("嵌入模型版本记录失败：{e}"));
+        }
+    }
+    index
+        .query(&qv, semantic::DEFAULT_TOP_K, semantic::DEFAULT_THRESHOLD)
+}
+
 /// 会话级跨轮运行时（设定集滞回等需要「上一轮」的记忆；M2.3 起还会放活跃路径）
 #[derive(Default)]
 pub struct SessionRuntime(Mutex<HashMap<String, RuntimeEntry>>);
@@ -1188,6 +1335,24 @@ fn scan_window_text(history: &[Message], card_name: &str) -> String {
         .map(|m| format!("{}：{}", display_role(&m.role, card_name), m.content))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 语义源的查询文本（M3.10c）：扫描窗口的**消息原文**拼接（与 scan_window_text
+/// 同窗口；嵌入吃原文，不带角色名前缀）。`extra` 是尚未落盘的本轮用户输入——
+/// 首位发言人组装时她也还没进历史，查询里不能少了她。只拼 user/char 消息，
+/// OOC 与 system 不该影响「这在说谁」。
+fn semantic_query_text(history: &[Message], extra: Option<&str>) -> String {
+    let start = history.len().saturating_sub(SCAN_WINDOW_MESSAGES);
+    let mut parts: Vec<String> = history[start..]
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "char")
+        .map(|m| m.content.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Some(e) = extra.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(e.to_string());
+    }
+    parts.join("\n")
 }
 
 /// 记忆对象：把事件流里的记忆记录（`api.memory.set` 的键值形态）读成宫殿对象（设计 §5.2）。
@@ -1669,6 +1834,9 @@ fn assemble_prompt_core(
     // 发言所在的场景（M3.2 · 设计 §10.3）：组装只看这个舞台——
     // 该场景的消息流分段、黑板分区、摘要分卷；其他场景是「与此同时」的盲区
     scene: Option<&str>,
+    // 语义源候选（M3.10 · 设计 §6.13）：宿主旁路算好的嵌入召回（未配 embed 档为空切片，
+    // 行为与纯确定性版一字不差）。算好再传进来——本函数保持同步，网络不进组装路径
+    semantic: &[semantic::SemanticHit],
 ) -> Result<PromptRun, String> {
     let settings = store::load_settings(root).map_err(|e| e.to_string())?;
     let persona = match &meta.persona {
@@ -1794,6 +1962,7 @@ fn assemble_prompt_core(
         clock: &blackboard.clock,
         blackboard: &bb_map,
         viewer: &character,
+        semantic_hits: semantic,
     };
     let activated = cx.activate(
         &activation,
@@ -2018,8 +2187,14 @@ fn acquire_flag(flags: &CancelFlags, session_id: &str) -> Result<Arc<AtomicBool>
     Ok(flag)
 }
 
-/// 轮末异步总结（设计 §5.3：不阻塞对话；同一会话并发时跳过）
-fn spawn_summary(root: &std::path::Path, session_id: &str, flags: &SummaryFlags) {
+/// 轮末异步总结（设计 §5.3：不阻塞对话；同一会话并发时跳过）。
+/// `active` = 当轮激活的实体 id（M3.10 关联审计的对照表；空 = 没有记录）。
+fn spawn_summary(
+    root: &std::path::Path,
+    session_id: &str,
+    flags: &SummaryFlags,
+    active: Vec<String>,
+) {
     if !flags.begin(session_id) {
         return; // 上一次总结还在跑
     }
@@ -2029,7 +2204,7 @@ fn spawn_summary(root: &std::path::Path, session_id: &str, flags: &SummaryFlags)
     // 后台任务用自己的 EventLog 实例（读盘 + 追加；主缓存靠字节偏移自动跟上）。
     // 无论成败都要释放标记：不释放的话，第一次失败后这个会话的总结就永远不再触发。
     tauri::async_runtime::spawn(async move {
-        let outcome = run_summary(root, session_id.clone(), false).await;
+        let outcome = run_summary(root, session_id.clone(), false, active).await;
         flags.end(&session_id);
         if let Err(e) = outcome {
             crate::diag::record("summary", format!("总结失败：{e}"));
@@ -2688,9 +2863,17 @@ fn finalize_turn(
         report.logs.push(format!("世界回写失败：{e}"));
     }
 
-    // 轮末异步总结（消息已滑出 L0 窗口时才真的干活；不阻塞本轮返回）
+    // 轮末异步总结（消息已滑出 L0 窗口时才真的干活；不阻塞本轮返回）。
+    // 当轮激活记录一起带走：关联审计要拿它对照「剧情涉及了谁、激活了谁」（M3.10）
     if let Some(flags) = summary_flags {
-        spawn_summary(root, &meta.id, flags);
+        let active = runtime
+            .map(|r| {
+                r.previously_active(&meta.id)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        spawn_summary(root, &meta.id, flags, active);
     }
     Ok(())
 }
@@ -4478,6 +4661,7 @@ pub async fn send_message(
     runtime: State<'_, SessionRuntime>,
     tree_cache: State<'_, TreeCache>,
     summary_flags: State<'_, SummaryFlags>,
+    embed_cache: State<'_, EmbedCache>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -4584,6 +4768,36 @@ pub async fn send_message(
     }
 
     let first = &picks[0];
+    // 语义源候选（M3.10 · 设计 §6.13，可选）：本轮算一次、全轮共用——查询取扫描
+    // 窗口原文 + 尚未落盘的本轮输入；未配 embed 档或失败时空候选（纯确定性路径）。
+    // 群聊后位发言人的重组装沿用同一批候选：语义只是弱信号，不为它多打一次向量
+    let world_name = session_world(&meta);
+    let world_codex = load_codex(&root, Some(&codex_cache), &world_name);
+    let scene_history = scene_messages(&proj.messages, scene.as_deref());
+    let semantic_query = semantic_query_text(&scene_history, Some(&content));
+    let semantic_hits = semantic_hits_for(
+        &root,
+        &world_codex,
+        Some(&embed_cache),
+        &meta,
+        &world_name,
+        &semantic_query,
+        true,
+    )
+    .await;
+    if !semantic_hits.is_empty() {
+        crate::diag::record(
+            "semantic",
+            format!(
+                "语义候选：{}",
+                semantic_hits
+                    .iter()
+                    .map(|h| format!("{}({:.2})", h.id, h.score))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
+        );
+    }
     // 即兴模式（M3.8 · 设计 §6.8-4，默认关）：本轮被提及的实体过薄时，便宜模型
     // 现场补一条「设定·暂定」——提案先落流（origin=improv），组装时经投影回读进 B2。
     // 失败静默跳过：即兴是锦上添花，永远不能挡住说话。
@@ -4625,6 +4839,7 @@ pub async fn send_message(
         Some(&runtime),
         Some(&tree_cache),
         scene.as_deref(),
+        &semantic_hits,
     )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
@@ -4688,6 +4903,7 @@ pub async fn send_message(
                     Some(&runtime),
                     Some(&tree_cache),
                     scene.as_deref(),
+                    &semantic_hits,
                 )?
                 .assembly
             }
@@ -4766,6 +4982,7 @@ pub async fn regenerate(
     runtime: State<'_, SessionRuntime>,
     tree_cache: State<'_, TreeCache>,
     summary_flags: State<'_, SummaryFlags>,
+    embed_cache: State<'_, EmbedCache>,
 ) -> Result<StreamEvent, String> {
     let root = root();
 
@@ -4808,6 +5025,22 @@ pub async fn regenerate(
     // content = Some：历史截掉本轮用户消息（重roll 首位发言人 / 重试失败轮）；
     // content = None：本轮用户消息与先发言者的回复都留在历史里（重roll 群聊的后位发言人）
     let history = &proj.messages[..proj.messages.len().saturating_sub(trim)]; // 组装历史
+    // 语义源候选（M3.10 · 设计 §6.13）：与 send_message 同一入口同一口径——
+    // 查询取本场景窗口原文 +（首位发言人时）本轮用户输入
+    let world_name = session_world(&meta);
+    let world_codex = load_codex(&root, Some(&codex_cache), &world_name);
+    let scene_history = scene_messages(history, scene.as_deref());
+    let semantic_query = semantic_query_text(&scene_history, content.as_deref());
+    let semantic_hits = semantic_hits_for(
+        &root,
+        &world_codex,
+        Some(&embed_cache),
+        &meta,
+        &world_name,
+        &semantic_query,
+        true,
+    )
+    .await;
     let run = assemble_prompt_core(
         &ui_sink(&app),
         &root,
@@ -4823,6 +5056,7 @@ pub async fn regenerate(
         Some(&runtime),
         Some(&tree_cache),
         scene.as_deref(),
+        &semantic_hits,
     )?;
     for event in &run.ui_events {
         let _ = on_event.send(StreamEvent::HookEvent {
@@ -5697,14 +5931,16 @@ fn codex_complete_apply_core(
 /// **干跑不落盘**（M2.0 起）：预览不再记事件、也不再改 state/黑板。
 /// M1 让预览也落盘，是为了避免「预览一次状态变了、正式发送又变一次」的漂移；
 /// 事件化之后正式发送自己会跑一次并留下事件，预览再落盘反而是多算一次。
+/// 语义源候选照算（M3.10）：检查器里「语义」激活原因要能点验，不必真发一轮。
 #[tauri::command]
-pub fn preview_prompt(
+pub async fn preview_prompt(
     app: AppHandle,
     session_id: String,
     log: State<'_, store::EventLog>,
     codex_cache: State<'_, CodexCache>,
     runtime: State<'_, SessionRuntime>,
     tree_cache: State<'_, TreeCache>,
+    embed_cache: State<'_, EmbedCache>,
 ) -> Result<prompt::PromptAssembly, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
@@ -5712,6 +5948,20 @@ pub fn preview_prompt(
     let proj = project_session(&log, &root, &meta)?;
     let scene = scene_ctx(&proj);
     let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0) + 1;
+    let world_name = session_world(&meta);
+    let world_codex = load_codex(&root, Some(&codex_cache), &world_name);
+    let scene_history = scene_messages(&proj.messages, scene.as_deref());
+    let semantic_query = semantic_query_text(&scene_history, None);
+    let semantic_hits = semantic_hits_for(
+        &root,
+        &world_codex,
+        Some(&embed_cache),
+        &meta,
+        &world_name,
+        &semantic_query,
+        false, // 干跑：连元数据也不写
+    )
+    .await;
     let run = assemble_prompt_core(
         &ui_sink(&app),
         &root,
@@ -5727,6 +5977,7 @@ pub fn preview_prompt(
         Some(&runtime),
         Some(&tree_cache),
         scene.as_deref(),
+        &semantic_hits,
     )?;
     Ok(run.assembly)
 }
@@ -6989,6 +7240,49 @@ fn apply_summary_outcome(
         applied += 1;
     }
 
+    // 关联审计（M3.10 · 设计 §6.13）：三类发现两路走——
+    //   missed / facet → 收件箱提示条目（kind="audit"，确认与否决只改状态，不物化）；
+    //   fact → 并入 codex 提案走同一条链路（anchors 驳回 + 分级 + 物化，reason 带标记）。
+    // 审计是 LLM 产物：提案事件化（重放不重调模型），与 §5.3 同构。
+    for (i, a) in outcome.audit.iter().enumerate() {
+        if a.finding == summarize::AUDIT_FACT {
+            continue; // 与 codex 合并处理，见下
+        }
+        commit(
+            log,
+            root,
+            meta,
+            LogBody::Proposal(event::ProposalEvent {
+                turn: to_turn,
+                id: format!("audit.{}.{}.{}", a.target, to_turn, i),
+                op: "propose".into(),
+                kind: "audit".into(),
+                origin: "pipeline".into(),
+                payload: Some(serde_json::json!({
+                    "finding": a.finding,
+                    "target": a.target,
+                    "facet": a.facet,
+                    "evidence": a.evidence,
+                })),
+                note: Some(a.evidence.clone()),
+                ts,
+            }),
+        )?;
+        applied += 1;
+    }
+    let mut codex_drafts: Vec<summarize::CodexDraft> = outcome.codex.clone();
+    for a in &outcome.audit {
+        if a.finding != summarize::AUDIT_FACT {
+            continue;
+        }
+        codex_drafts.push(summarize::CodexDraft {
+            kind: summarize::CODEX_NEW_FACT.into(),
+            target: a.target.clone(),
+            value: serde_json::json!({ "facet": a.facet, "value": a.value }),
+            reason: format!("关联审计：{}", a.evidence),
+        });
+    }
+
     // 设定提案：运行期捕获分级（M3.8 · 设计 §6.8-2）+ anchors 驳回（§6.8 最高保护级）
     //   瞬时状态 → 直接写黑板（不进收件箱）；既有实体小事实 → 按配置自动接受；
     //   全新实体 / 关系 / 改写 → 收件箱人工。
@@ -6996,7 +7290,7 @@ fn apply_summary_outcome(
         .map(|s| s.auto_accept_minor_facts)
         .unwrap_or(false);
     let world = session_world(meta);
-    for (i, draft) in outcome.codex.iter().enumerate() {
+    for (i, draft) in codex_drafts.iter().enumerate() {
         let payload = serde_json::json!({
             "target": draft.target,
             "value": draft.value,
@@ -7184,6 +7478,7 @@ async fn run_summary(
     root: std::path::PathBuf,
     session_id: String,
     force: bool,
+    active_entities: Vec<String>,
 ) -> Result<String, String> {
     let log = store::EventLog::new();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
@@ -7224,6 +7519,13 @@ async fn run_summary(
         .map(|t| format!("{}（{}）", t.id, t.title))
         .collect();
     let needs = codex_needs(&cx, &loaded.card.name);
+    // 关联审计的对照表（M3.10 · §6.13）：设定集实体清单（canon，id + 名 + 一句话）
+    let entity_catalog: Vec<String> = cx
+        .entities()
+        .iter()
+        .filter(|e| e.is_canon())
+        .map(|e| format!("{}（{}）{}", e.id, e.name, e.one_liner))
+        .collect();
     let ctx = summarize::SummaryContext {
         card_name: &loaded.card.name,
         persona_name: meta.persona.as_deref(),
@@ -7233,6 +7535,8 @@ async fn run_summary(
         rolling_summary: &proj.summary_for(Some(scene_id.as_str())).unwrap_or_default(),
         active_threads: &active_threads,
         needs: &needs,
+        entity_catalog: &entity_catalog,
+        active_entities: &active_entities,
     };
     let prompt_text = summarize::build_prompt(&ctx, &batch);
 
@@ -7286,7 +7590,8 @@ async fn run_summary(
 /// 手动触发一次总结（设置页/排查用；正常路径是轮末自动触发）
 #[tauri::command]
 pub async fn summarize_now(session_id: String) -> Result<String, String> {
-    run_summary(root(), session_id, true).await
+    // 手动触发没有「当轮激活记录」（审计对照表里的激活名单给空，提示词里写明）
+    run_summary(root(), session_id, true, Vec::new()).await
 }
 
 // ---------- 卡内状态与长期记忆（M1.6：hooks 的可观测面）----------
@@ -7506,6 +7811,7 @@ return {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
@@ -7695,6 +8001,7 @@ return {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         log.append(root, &meta.id, LogBody::Message(user_msg(turn, content)))
@@ -7874,6 +8181,7 @@ return {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         run_message_hook_core(&root, &meta, &loaded, &speaker, turn, None, &log);
@@ -7988,6 +8296,7 @@ return {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         assert!(!run.assembly.layers.is_empty());
@@ -8206,6 +8515,104 @@ return {
         assert_eq!(
             env.get("char.小雨").and_then(|v| v.get("mood")),
             Some(&serde_json::json!("心情不错"))
+        );
+    }
+
+    /// M3.10c 第六激活源（设计 §6.13）的宿主接线：旁路算好的语义候选经
+    /// assemble_prompt_core 进 B3——窗口里没有任何别名命中也能激活实体，
+    /// 检查器的逐卡激活原因可见「语义」。空切片 = 层关闭（其余测试的既有形态）。
+    #[test]
+    fn semantic_hits_reach_b3_as_activation_reasons() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50 },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let dir = root.join("codex/default/entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 阿雪不在阵容、不在黑板——只有语义源能把她带出来（小雨本人作为发言人
+        // 本就会由在场源激活，做不了「语义有无」的对照面）
+        std::fs::write(
+            dir.join("char.阿雪.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'char.阿雪', type = 'char', name = '阿雪',
+  one_liner = '图书馆的前任管理员。',
+}
+"#,
+        )
+        .unwrap();
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let cast = single_cast(&meta, &loaded);
+        let speaker = cast.first().dir.clone();
+        let history = proj.messages.clone();
+
+        // 窗口只有代词「她」——不命中任何别名；语义候选把阿雪带成 1 行
+        let hits = vec![semantic::SemanticHit {
+            id: "char.阿雪".into(),
+            score: 0.62,
+        }];
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &cast,
+            &speaker,
+            &history,
+            &proj,
+            Some("她今晚也在吗？"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &hits,
+        )
+        .unwrap();
+        let b3 = run
+            .assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "B3")
+            .expect("B3 实体卡层应出现");
+        assert!(b3.content.contains("阿雪"), "语义候选激活实体：{}", b3.content);
+        assert!(
+            b3.sources.iter().any(|s| s.contains("语义")),
+            "激活原因可见「语义」（检查器可点验）：{:?}",
+            b3.sources
+        );
+
+        // 同一输入不给语义候选：纯确定性版不激活（降级即设计的对照面）
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &cast,
+            &speaker,
+            &history,
+            &proj,
+            Some("她今晚也在吗？"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            run.assembly
+                .layers
+                .iter()
+                .all(|l| !l.content.contains("阿雪")),
+            "不给语义候选就不激活（降级即设计）：{:?}",
+            run.assembly.layers.iter().map(|l| &l.content).collect::<Vec<_>>()
         );
     }
 
@@ -8765,6 +9172,7 @@ return {
                 value: serde_json::json!({ "facts": { "schedule": "周三休息" } }),
                 reason: "剧情里提到".into(),
             }],
+            audit: Vec::new(),
         });
         let applied = apply_summary_outcome(
             &log, &root, &meta, &cx, &proj, outcome, 1, to_turn, 1, "20:00", "scene.main",
@@ -8820,6 +9228,124 @@ return {
         assert!(
             summary_batch_scenes(&proj, false).is_none(),
             "批次已被覆盖，不该重复总结"
+        );
+    }
+
+    /// M3.10d 关联审计（设计 §6.13）：missed/facet 是收件箱提示条目（kind="audit"，
+    /// 确认与否决只改状态、不物化）；fact 并入标准 codex 提案链路——
+    /// **anchors 冲突自动驳回**（§6.8 最高保护级）与管线产物同一条路。
+    #[test]
+    fn audit_findings_reach_inbox_and_anchor_conflicts_are_rejected() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let loaded = card::load_card(&root, "小雨").unwrap();
+        let log = store::EventLog::new();
+        simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
+        let proj = project_session(&log, &root, &meta).unwrap();
+        // 测试世界里的 char.小雨 带一条 anchors：动 look.anchors 的提案必须被驳回
+        let entities_dir = root.join("codex/default/entities");
+        std::fs::create_dir_all(&entities_dir).unwrap();
+        std::fs::write(
+            entities_dir.join("char.小雨.json"),
+            r#"{"id":"char.小雨","type":"char","name":"小雨","one_liner":"大学图书馆夜班管理员。","facts":{"look":{"anchors":["左眼角一颗泪痣"]}}}"#,
+        )
+        .unwrap();
+        let cx = load_codex(&root, None, "default");
+
+        let outcome = summarize::sanitize(summarize::SummaryOutcome {
+            audit: vec![
+                summarize::AuditDraft {
+                    finding: summarize::AUDIT_MISSED.into(),
+                    target: "char.小雨".into(),
+                    facet: String::new(),
+                    value: String::new(),
+                    evidence: "第 1 轮「她今晚不在」用代词指小雨，激活记录里没有她".into(),
+                },
+                summarize::AuditDraft {
+                    finding: summarize::AUDIT_FACET.into(),
+                    target: "char.小雨".into(),
+                    facet: "schedule".into(),
+                    value: String::new(),
+                    evidence: "多轮提到夜班但设定里没有作息".into(),
+                },
+                // 与 anchors 冲突的「新事实」：动 look.anchors → 必须被驳回
+                summarize::AuditDraft {
+                    finding: summarize::AUDIT_FACT.into(),
+                    target: "char.小雨".into(),
+                    facet: "look.anchors".into(),
+                    value: "右眼角的泪痣".into(),
+                    evidence: "第 1 轮提到泪痣换了边".into(),
+                },
+                // 不冲突的普通新事实：正常进收件箱待审
+                summarize::AuditDraft {
+                    finding: summarize::AUDIT_FACT.into(),
+                    target: "char.小雨".into(),
+                    facet: "schedule".into(),
+                    value: "周三休息".into(),
+                    evidence: "第 1 轮提到周三不来".into(),
+                },
+                // 缺引源的被丢弃（sanitize 纪律：没有引源的疑心不报）
+                summarize::AuditDraft {
+                    finding: summarize::AUDIT_MISSED.into(),
+                    target: "place.图书馆".into(),
+                    facet: String::new(),
+                    value: String::new(),
+                    evidence: String::new(),
+                },
+            ],
+            ..Default::default()
+        });
+        let applied = apply_summary_outcome(
+            &log, &root, &meta, &cx, &proj, outcome, 1, 1, 1, "20:00", "scene.main",
+        )
+        .unwrap();
+
+        let proj = project_session(&log, &root, &meta).unwrap();
+        // 2 条提示条目 + 1 驳回 + 1 待审提案 = 4 条事件（缺引源的那条没进流）
+        assert_eq!(applied, 4, "审计事件数：missed/facet/驳回/待审");
+        let audit_proposals: Vec<_> = proj
+            .proposals
+            .values()
+            .filter(|p| p.get("kind").and_then(|k| k.as_str()) == Some("audit"))
+            .collect();
+        assert_eq!(
+            audit_proposals.len(),
+            2,
+            "missed + facet 两条提示：{audit_proposals:?}"
+        );
+
+        // anchors 冲突的审计提案已自动驳回，备注写明原因
+        let rejected = proj
+            .proposals
+            .values()
+            .find(|p| p.get("status").and_then(|s| s.as_str()) == Some("reject"))
+            .expect("与 anchors 冲突的审计提案应被驳回");
+        let note = rejected
+            .get("note")
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        assert!(note.contains("辨识点"), "驳回备注应说明原因：{note}");
+        assert!(
+            store::load_grown(&root, "default").entities.is_empty(),
+            "驳回的提案不物化"
+        );
+
+        // 普通新事实待审（接受后才会物化——与管线提案同一条路）
+        let pending = proj
+            .proposals
+            .values()
+            .find(|p| {
+                p.get("status").and_then(|s| s.as_str()) == Some("propose")
+                    && p.get("kind").and_then(|k| k.as_str()) == Some("new_fact")
+            })
+            .expect("不冲突的审计新事实应待审");
+        assert_eq!(
+            pending
+                .get("payload")
+                .and_then(|p| p.get("reason"))
+                .and_then(|r| r.as_str())
+                .unwrap_or(""),
+            "关联审计：第 1 轮提到周三不来",
+            "reason 带关联审计标记（收件箱可溯源）"
         );
     }
 
@@ -9027,6 +9553,7 @@ state_tree = {
             threads: Vec::new(),
             psyche: Vec::new(),
             codex: Vec::new(),
+            audit: Vec::new(),
         });
         // 假装总结发生在很久以后：调用方传来的「当前」黑板已是第 9 天深夜
         let proj_view = project_session(&log, &root, &meta).unwrap();
@@ -10002,6 +10529,7 @@ return {
             None,
             None,
             Some("scene.b"),
+            &[],
         )
         .unwrap();
         let _ = run;
@@ -10451,6 +10979,7 @@ return {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         let b1 = layer_of(&run, "B1");
@@ -10611,6 +11140,7 @@ return {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         assert!(!layer_of(&run, "B1").contains("时代:"), "无主线就没有时代行");
@@ -10998,6 +11528,7 @@ return { state_tree = {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         let b2 = run

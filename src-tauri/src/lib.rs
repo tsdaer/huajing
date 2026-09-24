@@ -14,6 +14,7 @@ mod palace;   // 记忆宫殿：记忆对象、召回与视图（M2.1 · 设计 
 mod prompt;   // Prompt Builder 双槽位组装（设计 §4）
 mod psyche;   // 心理运行时：情绪槽、衰减、意图（M2.5 · 设计 §9）
 mod scene;    // 场景与多线：「与此同时」的隔离顶层单元（M3.2 · 设计 §10.3）
+mod semantic; // 语义关联：嵌入索引、余弦与门禁评测（M3.10 · 设计 §6.13）
 #[cfg(test)]
 mod smoke_datahub; // DataHub 资产冒烟测试：仓库示例卡与设定集的守卫（设计 §12）
 mod threads;  // 剧情线：生命周期与提及时机（M2.4 · 设计 §8）
@@ -32,6 +33,7 @@ pub fn run() {
         .manage(commands::LastAssemblies::default())
         .manage(store::EventLog::new())
         .manage(commands::CodexCache::default())
+        .manage(commands::EmbedCache::default())
         .manage(commands::SessionRuntime::default())
         .manage(commands::TreeCache::default())
         .manage(commands::SummaryFlags::default())

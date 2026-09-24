@@ -50,8 +50,17 @@ export function proposalKind(kind: string): string {
     episode: "情景记忆",
     thread: "剧情线",
     psyche: "心理评价",
+    audit: "关联审计",
   };
   return map[kind] ?? (kind || "提案");
+}
+
+/** 关联审计的发现类型（M3.10 · §6.13）的中文标签 */
+export function auditFindingLabel(finding: string): string {
+  if (finding === "missed") return "疑似漏激活";
+  if (finding === "facet") return "缺失设定";
+  if (finding === "fact") return "该立的新事实";
+  return finding || "审计发现";
 }
 
 /** 提案来源的中文标签（M3.8 起投影带出 origin；缺省视为管线） */
@@ -77,12 +86,25 @@ export function payloadFields(payload: unknown): {
   to: string;
   relation: string;
   text: string;
+  finding: string;
+  evidence: string;
 } {
-  const empty = { target: "", facet: "", value: undefined, to: "", relation: "", text: "" };
+  const empty = {
+    target: "",
+    facet: "",
+    value: undefined,
+    to: "",
+    relation: "",
+    text: "",
+    finding: "",
+    evidence: "",
+  };
   if (!payload || typeof payload !== "object") return empty;
   const o = payload as Record<string, unknown>;
   const target = typeof o.target === "string" ? o.target : "";
   const text = typeof o.text === "string" ? o.text : "";
+  const finding = typeof o.finding === "string" ? o.finding : "";
+  const evidence = typeof o.evidence === "string" ? o.evidence : "";
   let facet = "";
   let value: unknown = o.value;
   let to = "";
@@ -97,7 +119,7 @@ export function payloadFields(payload: unknown): {
     if (typeof v.to === "string") to = v.to;
     if (typeof v.kind === "string") relation = v.kind;
   }
-  return { target, facet, value, to, relation, text };
+  return { target, facet, value, to, relation, text, finding, evidence };
 }
 
 /** 提案状态 */

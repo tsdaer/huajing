@@ -20,6 +20,10 @@
 //                                    threads::ResurfaceWindow::from_value 即可用
 //   5. 心理评价提案  psyche        —— 需要满足/受挫 → 情绪与意图增减（§9.2 评价闭环）
 //   6. 设定提案      codex         —— 新实体/新事实/事实变更/新关系 → 设定收件箱（§6.8）
+//   7. 关联审计      audit         —— 对照「实体清单 + 当轮激活记录」报告疑似漏激活 /
+//                                    缺失 facet / 该立的新事实（M3.10 · §6.13）：
+//                                    漏激活与缺失 facet 是给收件箱的提示条目，新事实
+//                                    经宿主并入 codex 提案走同一条确认链路
 //
 // 分工：宿主做三件事——① 拼批次与上下文交给 build_prompt；② 用便宜档 provider（util 角色，
 // §11 / m2.md M2.6）调模型；③ 把 parse_outcome + sanitize 的结果落成事件（记忆对象 / 线 /
@@ -57,6 +61,15 @@ pub const MAX_HEARSAYS: usize = 6;
 pub const MAX_THREADS: usize = 2;
 /// 单批设定提案条数上限（§6.8；收件箱要人审，给太多等于没给）。
 pub const MAX_CODEX_DRAFTS: usize = 6;
+/// 单批关联审计条数上限（M3.10 · §6.13；审计是提示不是任务清单，宁少勿滥）。
+pub const MAX_AUDIT: usize = 6;
+
+/// 审计发现类型（M3.10 · §6.13）：疑似被涉及但未激活的实体（trie/语义都漏了）。
+pub const AUDIT_MISSED: &str = "missed";
+/// 审计发现类型：既有实体缺了剧情正在用的 facet。
+pub const AUDIT_FACET: &str = "facet";
+/// 审计发现类型：该立的新事实（宿主并入 codex 提案走收件箱确认链路）。
+pub const AUDIT_FACT: &str = "fact";
 
 /// 心理评价类型（§9.2）：情绪事件。
 pub const PSYCHE_FEEL: &str = "feel";
@@ -139,6 +152,11 @@ pub const OUTCOME_SCHEMA_HINT: &str = r#"{
     },
     { "kind": "new_fact", "target": "char.小雨", "value": { "facet": "schedule", "value": "周三休息" }, "reason": "第 15 轮提到" },
     { "kind": "transient", "target": "", "value": { "key": "天气", "value": "雨渐大" }, "reason": "第 15 轮" }
+  ],
+  "audit": [
+    { "finding": "missed", "target": "char.小雨", "evidence": "第 15 轮「她今晚不在」用代词指小雨，但激活记录里没有她" },
+    { "finding": "facet", "target": "char.小雨", "facet": "schedule", "evidence": "多轮提到夜班，设定里没有作息 facet" },
+    { "finding": "fact", "target": "char.小雨", "facet": "look.hair", "value": "齐肩短发", "evidence": "第 16 轮她剪了短发，明天还成立" }
   ]
 }"#;
 
@@ -165,6 +183,12 @@ pub struct SummaryContext<'a> {
     pub active_threads: &'a [String],
     /// 角色的需要清单（§9.2「评价之源」；codex char 的 needs/values）。
     pub needs: &'a [String],
+    /// 设定集实体清单（M3.10 关联审计的对照表）：「id（名）一句话」逐行。
+    /// 空切片 = 世界没有设定集，审计段落整体省略（不逼模型对着空表编）。
+    pub entity_catalog: &'a [String],
+    /// 当轮激活记录（M3.10 关联审计的对照表）：最近一次组装实际激活的实体 id。
+    /// 空切片 = 没有记录（手动触发总结时可能没有），提示词里写明。
+    pub active_entities: &'a [String],
 }
 
 /// 批次里的一条消息（滑出 L0 窗口的那批；字段对齐 store::Message 的读侧子集）。
@@ -193,7 +217,7 @@ impl BatchMessage {
 
 // ---------- 产物对象（宿主直接落事件 / 收件箱）----------
 
-/// 一次总结的全部产物（§5.3 六类）。
+/// 一次总结的全部产物（§5.3 六类 + M3.10 关联审计）。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SummaryOutcome {
     /// L1 滚动摘要增量（编年史体、第三人称；空串 = 本批无进展）。
@@ -213,10 +237,12 @@ pub struct SummaryOutcome {
     pub psyche: Vec<PsycheDraft>,
     /// 设定提案（进收件箱，§6.8）。
     pub codex: Vec<CodexDraft>,
+    /// 关联审计发现（M3.10 · §6.13）：漏激活 / 缺失 facet / 该立的新事实。
+    pub audit: Vec<AuditDraft>,
 }
 
 impl SummaryOutcome {
-    /// 六类产物是否全空（宿主据此跳过落盘与事件；空产物算成功，不算失败）。
+    /// 各类产物是否全空（宿主据此跳过落盘与事件；空产物算成功，不算失败）。
     pub fn is_empty(&self) -> bool {
         self.summary_delta.trim().is_empty()
             && self.chronicle.trim().is_empty()
@@ -226,6 +252,7 @@ impl SummaryOutcome {
             && self.threads.is_empty()
             && self.psyche.is_empty()
             && self.codex.is_empty()
+            && self.audit.is_empty()
     }
 }
 
@@ -374,6 +401,22 @@ pub struct CodexDraft {
     pub reason: String,
 }
 
+/// 关联审计发现（M3.10 · §6.13）：对照实体清单与当轮激活记录复查本批消息后，
+/// 报告检索层（trie/语义）可能漏掉的东西。三类见 AUDIT_*。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditDraft {
+    /// missed | facet | fact；见 AUDIT_*。
+    pub finding: String,
+    /// 涉及的实体 id（missed/facet）或提案目标（fact）。
+    pub target: String,
+    /// fact = 要立的 facts 路径；facet = 缺失的 facet 名；missed 不用。
+    pub facet: String,
+    /// fact = 要写的事实内容；其余不用。
+    pub value: String,
+    /// 引源：本批哪一轮哪句话让你起了疑心（收件箱可点验的依据）。
+    pub evidence: String,
+}
+
 // ---------- 拼提示词（宿主 ① 的入口）----------
 
 /// 角色简介（提示词第一段）：告诉模型它是谁、不许做什么。
@@ -472,7 +515,19 @@ const PRODUCT_SPEC: &str = r#"【必须逐条产出的产物】（设计 §5.3 +
        target 给 ""，value = {"key":"<黑板键，如 天气>","value":"雨"}——宿主直接写黑板。
    判断标准：一条事实「明天还成立吗？」——成立才写 new_fact / new_entity，不成立就 transient。
    绝不允许改动任何实体的恒定辨识点 anchors（设计 §6.8：anchors 是最高保护级，与之冲突的提案
-   会被直接驳回）；只是气氛描写、拿不准的，不要写。最多 6 条，没有就给 []。"#;
+   会被直接驳回）；只是气氛描写、拿不准的，不要写。最多 6 条，没有就给 []。
+
+9. audit —— 关联审计（设计 §6.13：复查检索层有没有漏掉本该在场的世界知识）
+   对照上文的「设定集实体清单」与「当轮激活记录」重读本批消息：剧情明明涉及某个实体、
+   但它不在激活记录里（代词指称、描述性指称、转述都可能漏），或设定里缺了剧情正在用的
+   信息时报告。最多 6 条，没有疑点就给 []；宁可少报，不要对着清单硬凑。每条字段：
+   - finding：三选一——
+       "missed"  疑似被涉及但未被激活的实体：target = 实体 id；
+       "facet"   既有实体缺了剧情正在用的 facet：target = 实体 id，facet = 缺的 facet 名；
+       "fact"    该立的新事实：target = 实体 id，facet = facts 路径，value = 要写的内容
+                 （与 codex 的 new_fact 同一判断标准：「明天还成立吗？」）；
+   - evidence：引源，写清本批哪一轮的哪句话让你起疑（如「第 15 轮『她今晚不在』用代词，
+     结合上下文指 char.小雨」）——没有引源的疑心不要报。"#;
 
 /// 输出格式要求：只输出一个 JSON 对象 + 骨架（骨架由 build_prompt 拼在最后）。
 const OUTPUT_SPEC: &str = "【输出格式】\
@@ -481,7 +536,7 @@ const OUTPUT_SPEC: &str = "【输出格式】\
 
 /// 空批次的说明（§5.3：批次为空时不该编内容出来）。
 const EMPTY_BATCH_NOTE: &str =
-    "（本批没有消息。summary_delta 与 chronicle 给空串，episodes / facts / threads / psyche / codex 全给 []。）";
+    "（本批没有消息。summary_delta 与 chronicle 给空串，episodes / facts / threads / psyche / codex / audit 全给 []。）";
 
 /// 拼一次总结调用的提示词（宿主 ①：批次与上下文进，提示词出）。
 ///
@@ -526,6 +581,27 @@ pub fn build_prompt(ctx: &SummaryContext<'_>, batch: &[BatchMessage]) -> String 
         "角色的需要（needs，第 7 条评价的对照表）",
         ctx.needs,
     );
+    // 关联审计的对照表（M3.10 · §6.13）：实体清单 + 当轮激活记录。
+    // 没有设定集或没有激活记录时明说——不逼模型对着空表编疑点。
+    if ctx.entity_catalog.is_empty() {
+        out.push_str("设定集实体清单：（本世界没有设定集实体——audit 一律给 []）\n");
+    } else {
+        out.push_str("设定集实体清单（第 9 条审计的对照表）：\n");
+        for line in ctx.entity_catalog {
+            if !line.trim().is_empty() {
+                out.push_str("- ");
+                out.push_str(line.trim());
+                out.push('\n');
+            }
+        }
+    }
+    if ctx.active_entities.is_empty() {
+        out.push_str("当轮激活记录：（无记录——audit 只报有引源的 fact，missed 不要猜）\n");
+    } else {
+        out.push_str("当轮激活记录（最近一次组装实际激活的实体，第 9 条审计据此找漏网）：");
+        out.push_str(&ctx.active_entities.join("、"));
+        out.push('\n');
+    }
 
     // ---- 本批消息 ----
     out.push('\n');
@@ -668,6 +744,10 @@ pub fn parse_outcome(raw: &str) -> Result<SummaryOutcome, String> {
             .iter()
             .map(|m| codex_of(m))
             .collect(),
+        audit: objects_of(map.get("audit"))
+            .iter()
+            .map(|m| audit_of(m))
+            .collect(),
     })
 }
 
@@ -779,6 +859,17 @@ fn codex_of(map: &Map<String, Value>) -> CodexDraft {
             .map(trim_value)
             .unwrap_or(Value::Null),
         reason: text_of(map.get("reason")),
+    }
+}
+
+/// 一条关联审计发现（finding 归一在 sanitize：未知值在那里丢弃）。
+fn audit_of(map: &Map<String, Value>) -> AuditDraft {
+    AuditDraft {
+        finding: text_of(map.get("finding")),
+        target: text_of(map.get("target")),
+        facet: text_of(map.get("facet")),
+        value: text_of(map.get("value")),
+        evidence: text_of(map.get("evidence")),
     }
 }
 
@@ -911,7 +1002,7 @@ fn trim_value(v: Value) -> Value {
 ///   窗口」与 §8.4「防反复横跳」相悖，管线不产出无冷却的线）；
 /// - windows 只保留 threads::ResurfaceWindow::from_value 认得的对象（宿主能直接喂进去），
 ///   并按 JSON 文本去重；
-/// - episodes / hearsays / threads / codex 截断到 MAX_*（保留顺序，先到先得）；
+/// - episodes / hearsays / threads / codex / audit 截断到 MAX_*（保留顺序，先到先得）；
 /// - facts / psyche 不设上限——它们没有「一条顶十条」的破坏力，且都要过收件箱分级与情绪
 ///   槽位互斥；未识别的 kind 归一为最普通的形态（psyche → feel、codex → new_fact）。
 pub fn sanitize(outcome: SummaryOutcome) -> SummaryOutcome {
@@ -955,6 +1046,13 @@ pub fn sanitize(outcome: SummaryOutcome) -> SummaryOutcome {
         .collect();
     codex.truncate(MAX_CODEX_DRAFTS);
 
+    let mut audit: Vec<AuditDraft> = outcome
+        .audit
+        .into_iter()
+        .filter_map(normalize_audit)
+        .collect();
+    audit.truncate(MAX_AUDIT);
+
     SummaryOutcome {
         summary_delta: outcome.summary_delta.trim().to_string(),
         chronicle: outcome.chronicle.trim().to_string(),
@@ -964,6 +1062,7 @@ pub fn sanitize(outcome: SummaryOutcome) -> SummaryOutcome {
         threads,
         psyche,
         codex,
+        audit,
     }
 }
 
@@ -1081,6 +1180,38 @@ fn normalize_codex(c: CodexDraft) -> Option<CodexDraft> {
         target,
         value: trim_value(c.value),
         reason: c.reason.trim().to_string(),
+    })
+}
+
+/// 一条关联审计发现（空 target / 缺引源的丢弃；未知 finding 丢弃——审计是
+/// 提示性产物，不猜模型想说什么）。missed 不需要 facet/value，facet 需要名字，
+/// fact 三者（facet/value/target）都要。
+fn normalize_audit(a: AuditDraft) -> Option<AuditDraft> {
+    let finding = match a.finding.trim().to_ascii_lowercase().as_str() {
+        AUDIT_MISSED => AUDIT_MISSED.to_string(),
+        AUDIT_FACET => AUDIT_FACET.to_string(),
+        AUDIT_FACT => AUDIT_FACT.to_string(),
+        _ => return None,
+    };
+    let target = a.target.trim().to_string();
+    let evidence = a.evidence.trim().to_string();
+    if target.is_empty() || evidence.is_empty() {
+        return None;
+    }
+    let facet = a.facet.trim().to_string();
+    let value = a.value.trim().to_string();
+    if finding == AUDIT_FACET && facet.is_empty() {
+        return None;
+    }
+    if finding == AUDIT_FACT && (facet.is_empty() || value.is_empty()) {
+        return None;
+    }
+    Some(AuditDraft {
+        finding,
+        target,
+        facet,
+        value,
+        evidence,
     })
 }
 
@@ -1238,6 +1369,8 @@ mod tests {
             rolling_summary: summary,
             active_threads,
             needs,
+            entity_catalog: &[],
+            active_entities: &[],
         }
     }
 
@@ -1305,6 +1438,16 @@ mod tests {
             target: target.to_string(),
             value: Value::Null,
             reason: String::new(),
+        }
+    }
+
+    fn audit_draft(finding: &str, target: &str) -> AuditDraft {
+        AuditDraft {
+            finding: finding.to_string(),
+            target: target.to_string(),
+            facet: String::new(),
+            value: String::new(),
+            evidence: "第 3 轮提到".to_string(),
         }
     }
 
@@ -1392,6 +1535,7 @@ mod tests {
             "threads",
             "psyche",
             "codex",
+            "audit",
         ] {
             assert!(p.contains(key), "提示词漏了产物 {key}");
         }
@@ -1413,9 +1557,44 @@ mod tests {
             "fact_change",
             "relation",
             "anchors",
+            "关联审计",
+            "missed",
         ] {
             assert!(p.contains(must), "提示词漏了要求 {must}");
         }
+    }
+
+    /// 关联审计的对照表（M3.10 · §6.13）：实体清单与激活记录进提示词；
+    /// 空清单时明说「没有设定集」，不逼模型对着空表编疑点。
+    #[test]
+    fn prompt_embeds_audit_reference_tables() {
+        let ctx = ctx_of("小雨", None, None, "23:40", "", &[], &[]);
+        let batch = vec![BatchMessage {
+            turn: 3,
+            role: "user".into(),
+            content: "她今晚也在吗？".into(),
+        }];
+        let catalog = vec!["char.小雨（小雨）大学图书馆夜班管理员。".to_string()];
+        let empty = Vec::new();
+        let with_catalog = SummaryContext {
+            entity_catalog: &catalog,
+            active_entities: &["char.小雨".to_string(), "place.图书馆".to_string()],
+            ..ctx
+        };
+        let p = build_prompt(&with_catalog, &batch);
+        assert!(p.contains("设定集实体清单（第 9 条审计的对照表）"));
+        assert!(p.contains("char.小雨（小雨）大学图书馆夜班管理员。"));
+        assert!(p.contains("当轮激活记录"));
+        assert!(p.contains("char.小雨、place.图书馆"));
+
+        let without = SummaryContext {
+            entity_catalog: &empty,
+            active_entities: &empty,
+            ..ctx
+        };
+        let p = build_prompt(&without, &batch);
+        assert!(p.contains("本世界没有设定集实体——audit 一律给 []"));
+        assert!(p.contains("（无记录——audit 只报有引源的 fact，missed 不要猜）"));
     }
 
     #[test]
@@ -1775,6 +1954,7 @@ mod tests {
                 codex_draft(CODEX_NEW_FACT, " "),
                 codex_draft(CODEX_NEW_FACT, "char.小雨"),
             ],
+            audit: vec![audit_draft(AUDIT_MISSED, " ")],
         });
         assert_eq!(out.summary_delta, "");
         assert!(!out.is_empty());

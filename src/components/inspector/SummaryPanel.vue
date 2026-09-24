@@ -6,7 +6,7 @@ import { ref } from "vue";
 import Icon from "../Icon.vue";
 import { api } from "../../api";
 import type { InspectorProposal } from "../../types";
-import { payloadBrief, payloadFields, proposalKind, proposalStatus, proposalOrigin, originClass } from "./util";
+import { payloadBrief, payloadFields, proposalKind, proposalStatus, proposalOrigin, originClass, auditFindingLabel } from "./util";
 
 const props = defineProps<{
   sessionId: string;
@@ -158,6 +158,23 @@ function decideWithNote(id: string, accept: boolean) {
           <span class="font-mono text-base-content/70">{{ payloadFields(p.payload).target }}</span>
           <span class="text-base-content/40"> 新增关系：</span>
           <span class="text-success">{{ payloadFields(p.payload).relation }} → {{ payloadFields(p.payload).to }}</span>
+        </p>
+      </template>
+      <!-- 关联审计发现（M3.10 · §6.13）：检索层漏了谁/设定缺了什么，附引源可点验 -->
+      <template v-else-if="p.kind === 'audit' && payloadFields(p.payload).target">
+        <p class="m-0 text-[11px] break-words">
+          <span class="text-warning">{{ auditFindingLabel(payloadFields(p.payload).finding) }}</span>
+          <span class="text-base-content/40"> · </span>
+          <span class="font-mono text-base-content/70">{{ payloadFields(p.payload).target }}</span>
+          <template v-if="payloadFields(p.payload).facet">
+            <span class="text-base-content/40"> · {{ payloadFields(p.payload).facet }}</span>
+          </template>
+        </p>
+        <p class="m-0 text-[11px] break-words text-base-content/60">
+          {{ payloadFields(p.payload).evidence }}
+        </p>
+        <p class="m-0 text-[11px] text-base-content/40">
+          （确认与否决只做记录；给实体补设定请用「设定」页的补全或手动编辑）
         </p>
       </template>
       <template v-else-if="p.origin === 'improv' && payloadFields(p.payload).text">

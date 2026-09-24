@@ -303,6 +303,10 @@ pub struct SessionMeta {
     /// 「设定·暂定」注入当轮生效；提案照落收件箱，确认后才算正史。
     #[serde(default)]
     pub improv: bool,
+    /// 语义源嵌入模型（M3.10 · 设计 §6.13）：首次实际启用语义召回时把
+    /// 「provider 名 + 模型名」记进会话（可回放语义随版本声明）；None = 从未启用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_model: Option<String>,
 }
 
 /// 事件流里的一条消息（M2.0 起 messages.jsonl 是类型化事件流，
@@ -496,6 +500,7 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         max_speakers: None,
         theater: None,
         improv: false,
+        embed_model: None,
     };
     let dir = session_dir(root, &meta.id);
     std::fs::create_dir_all(&dir)?;

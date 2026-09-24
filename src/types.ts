@@ -86,6 +86,8 @@ export interface SessionMeta {
   theater?: TheaterConfig | null;
   /** 即兴模式（M3.8 · §6.8-4：薄实体现场补「设定·暂定」；缺省关） */
   improv?: boolean;
+  /** 语义源嵌入模型（M3.10 · §6.13：首次启用语义召回时记录「provider/模型」） */
+  embed_model?: string | null;
 }
 
 /** 剧场模式配置（M3.6 · 设计 §10.5） */

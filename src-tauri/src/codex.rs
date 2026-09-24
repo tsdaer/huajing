@@ -9,7 +9,8 @@
 //!
 //! 覆盖的设计条款：
 //! - §6.2 实体 schema（char/place/item/event/org/rule/concept/note 与 facts/secrets/live/relations）；
-//! - §6.3 五个激活源（提及/在场/揭示/关系牵引/常驻）+ 三级注入深度 + 滞回
+//! - §6.3 五个激活源（提及/在场/揭示/关系牵引/常驻）+ 可选第六语义源
+//!   （M3.10 · §6.13，宿主旁路算好传入；未传 = 纯确定性版）+ 三级注入深度 + 滞回
 //!   + 恒定辨识点 anchors + 预算降级（anchors 行最后被裁）；
 //! - §6.4 与状态树/黑板的三方联动：live 从黑板取 ▸当前，reveal 决定秘密是否进深卡；
 //! - §6.5 三个时间层：瞬态 live、周期 variants、史变 versions（按故事天解析）；
@@ -55,6 +56,9 @@ pub const W_TRACTION: u8 = 2;
 pub const W_MENTION: u8 = 1;
 /// 滞回（上一轮激活的保底），最弱：新证据优先于旧余温
 pub const W_HYSTERESIS: u8 = 0;
+/// 语义源（M3.10 · §6.13 可选第六源）：与「提及」同档最弱——它是补盲区的弱信号，
+/// 混合计分由 bump 的 max 语义实现：确定性命中（提及/在场…）总是压得过纯语义分。
+pub const W_SEMANTIC: u8 = 1;
 
 /// 实体级 when 门控（§6.10）在 facts 里的承载键（见模块头注释取舍 2）
 pub const WHEN_FACT_KEY: &str = "__when";
@@ -1118,6 +1122,9 @@ pub struct ActivationContext<'a> {
     /// 组装视角（M3.1 · 设计 §10.4）：深卡秘密按「她是否知情」判定——
     /// known_by 名单含她（她自己一直知道）、或她的揭示集里有该路径（经历过 reveal）
     pub viewer: &'a str,
+    /// 语义源候选（M3.10 · §6.13，可选）：宿主旁路算好的嵌入召回（id + 余弦分）。
+    /// 本模块不碰网络；切片为空 = 语义层关闭，行为与纯确定性版一字不差。
+    pub semantic_hits: &'a [crate::semantic::SemanticHit],
 }
 
 /// 一张注入卡（检查器逐层可见：激活原因、深度、token）
@@ -1411,6 +1418,8 @@ fn reason_weight(reason: &str) -> u8 {
         W_TRACTION
     } else if reason.starts_with("提及") {
         W_MENTION
+    } else if reason.starts_with("语义") {
+        W_SEMANTIC
     } else {
         W_HYSTERESIS
     }
@@ -1659,6 +1668,28 @@ impl Codex {
                 h.reasons
                     .push(format!("提及:另{}处", ms.len() - MENTION_REASONS_MAX));
             }
+        }
+
+        // ---- 源 6：语义（M3.10 · §6.13，可选；宿主旁路算好传入）----
+        // 代词/描述性指称/转述这类不命中别名的盲区，由嵌入召回补上候选。权重与提及
+        // 同档、深度 1 行起；门控用 presentable——canon/when 之外还要过生命周期
+        // （离场/故去者不因「语义像她」而进场，§6.5），known_by 只门控深卡而语义
+        // 永远到不了深卡（Line 起步，预算降级只往下走）。语义分作弱信号：同一实体
+        // 若有确定性命中，bump 取 max 后仍是那档强信号，语义原因只是多记一行。
+        for hit in ctx.semantic_hits {
+            let Some(&i) = self.by_id.get(hit.id.trim()) else {
+                continue;
+            };
+            if !presentable(i) {
+                continue;
+            }
+            bump(
+                &mut hits,
+                i,
+                W_SEMANTIC,
+                Depth::Line,
+                format!("语义:{:.2}", hit.score),
+            );
         }
 
         // ---- 源 4：关系牵引（权重 2，只走一跳）----
@@ -2199,6 +2230,7 @@ mod tests {
         hold_rounds: u32,
         bb: BTreeMap<String, Value>,
         viewer: String,
+        semantic: Vec<crate::semantic::SemanticHit>,
     }
 
     impl Cx {
@@ -2215,6 +2247,7 @@ mod tests {
                 hold_rounds: 3,
                 bb: BTreeMap::new(),
                 viewer: "小雨".into(),
+                semantic: Vec::new(),
             }
         }
         /// 切换组装视角（M3.1 视角化用例）
@@ -2258,6 +2291,16 @@ mod tests {
             self.bb.insert(k.into(), v);
             self
         }
+        fn semantic(mut self, hits: &[(&str, f32)]) -> Cx {
+            self.semantic = hits
+                .iter()
+                .map(|(id, score)| crate::semantic::SemanticHit {
+                    id: (*id).into(),
+                    score: *score,
+                })
+                .collect();
+            self
+        }
         fn ctx(&self) -> ActivationContext<'_> {
             ActivationContext {
                 window_text: &self.window,
@@ -2271,6 +2314,7 @@ mod tests {
                 clock: &self.clock,
                 blackboard: &self.bb,
                 viewer: &self.viewer,
+                semantic_hits: &self.semantic,
             }
         }
     }
@@ -2737,6 +2781,78 @@ mod tests {
     }
 
     // ---------- 生命周期 / 门控 / 草稿 ----------
+
+    // ---------- 语义源（M3.10 · §6.13，可选第六激活源）----------
+
+    #[test]
+    fn semantic_hits_activate_candidates_at_line_depth() {
+        let codex = sample_codex();
+        // 窗口里没有任何别名命中——纯语义候选把「小雨」带成 1 行（代词盲区补漏）
+        let out = codex.activate(
+            &Cx::new("她把杯子端去了茶水间。")
+                .semantic(&[("char.小雨", 0.62)])
+                .ctx(),
+            &big(),
+        );
+        let xy = find(&out, "char.小雨");
+        assert_eq!(xy.depth, Depth::Line, "语义源 1 行起，不产深卡");
+        assert!(
+            xy.reasons.iter().any(|r| r.starts_with("语义:")),
+            "{:?}",
+            xy.reasons
+        );
+        assert!(!xy.text.contains("秘密"), "语义激活不解锁任何秘密：{}", xy.text);
+
+        // 混合计分：同一实体确定性命中与语义命中并存时，两条原因都在（检查器可见），
+        // 强度/深度取 max——语义只是多一行佐证，不叠加涨权重
+        let out = codex.activate(
+            &Cx::new("管理员在柜台后面。")
+                .semantic(&[("char.小雨", 0.62)])
+                .ctx(),
+            &big(),
+        );
+        let xy = find(&out, "char.小雨");
+        assert!(xy.reasons.iter().any(|r| r.starts_with("提及")), "{:?}", xy.reasons);
+        assert!(xy.reasons.iter().any(|r| r.starts_with("语义")), "{:?}", xy.reasons);
+
+        // 陌生 id / 草稿 / retired 静默跳过（常驻法则照常在列，与语义无关）
+        let out = codex.activate(
+            &Cx::new("与设定无关。")
+                .semantic(&[("char.不存在", 0.9), ("char.旧书商", 0.9), ("place.旧书店", 0.9)])
+                .ctx(),
+            &big(),
+        );
+        assert!(
+            out.iter().all(|a| a.id != "char.不存在"
+                && a.id != "char.旧书商"
+                && a.id != "place.旧书店"),
+            "{:?}",
+            out.iter().map(|a| &a.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn semantic_source_respects_lifecycle_like_presence() {
+        let dead = CodexEntity::from_value(&json!({
+            "id": "char.阿雪", "type": "char", "name": "阿雪",
+            "one_liner": "图书馆的前任管理员。",
+            "lifecycle": { "status": "dead", "at_day": 20, "note": "第20天病故" }
+        }))
+        .unwrap();
+        let codex = Codex::build(vec![dead]);
+        // 生效之后：语义候选不把故去者拉回现场（§6.5 生命周期照常生效）
+        let out = codex.activate(
+            &Cx::new("她说以前也这样。").day(30).semantic(&[("char.阿雪", 0.8)]).ctx(),
+            &big(),
+        );
+        assert!(out.is_empty(), "语义不绕过生命周期门控");
+        // flashback：生效之前照常可激活
+        let out = codex.activate(
+            &Cx::new("她说以前也这样。").day(10).semantic(&[("char.阿雪", 0.8)]).ctx(),
+            &big(),
+        );
+        assert_eq!(out.len(), 1);
+    }
 
     #[test]
     fn lifecycle_blocks_presence_but_not_mention_or_flashback() {
