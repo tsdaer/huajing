@@ -169,6 +169,9 @@ pub struct HookReport {
     pub ui_events: Vec<UiEmit>,
     /// 卡内错误（沙箱错误边界捕获；只在面板里展示，不打断对话）
     pub logs: Vec<String>,
+    /// 增强 C2：本钩子周期收集到的 trigger_event 排队（宿主在轮末统一派发）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<crate::card::TriggerEvent>,
 }
 
 // ---------- SSE 解析 ----------

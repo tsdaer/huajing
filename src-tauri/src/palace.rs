@@ -614,7 +614,7 @@ pub fn render_memory_block(hits: &[RecallHit]) -> String {
 }
 
 /// 单条回忆行（recall 的预算也按它计 token，保证「预算 → 实际注入」口径一致）。
-fn render_memory_line(m: &MemObject) -> String {
+pub fn render_memory_line(m: &MemObject) -> String {
     let salience = sanitize_salience(m.salience);
     let emotion = m.emotion.as_deref().map(str::trim).filter(|e| !e.is_empty());
     let mut meta = match emotion {

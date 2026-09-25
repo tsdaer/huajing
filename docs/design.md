@@ -151,7 +151,7 @@ hooks 与状态树的分工：**hooks 是"反应"**（对单条消息的即时�
 
 生命周期钩子：`on_load`（会话载入/角色入席）、`on_context`（每次请求前）、`on_message`（每条消息后）。
 
-**实现态（增强计划 · 包 A 时点）**：已实现——`api.memory` / `api.blackboard` / `api.schedule_say` / `api.ui.emit` / `api.random` / `api.dice` / `ctx.inject` / `ctx.window`；`api.psyche.feel` / `api.psyche.boost_intent` 的宿主侧心理应用器已落地（模型工具与总结管线共用，包 C 将其注册进沙箱）；`api.palace.recall` / `api.codex.get` / `api.codex.known` / `api.threads.*` / `api.trigger_event` 尚未注册（包 C 清偿）。
+**实现态（增强计划 · 包 C 后全绿）**：已实现——`api.memory` / `api.blackboard` / `api.schedule_say` / `api.ui.emit` / `api.random` / `api.dice` / `ctx.inject` / `ctx.window` / `api.palace.recall` / `api.codex.get` / `api.codex.known` / `api.psyche.feel` / `api.psyche.boost_intent` / `api.trigger_event`。读侧三件走**宿主只读镜像**（视角过滤按当前角色在宿主侧完成，每 hook 每族 ≤8 次调用）；`api.threads.*` 由导演树 api（open_thread/resolve_threads/resurface/merge_scenes）承载其语义，角色卡开线走状态树任务/导演树/收件箱提案——整表无缺口。
 
 ### 3.1b 主演模型的工具白名单（增强 A：工具是结构化自报，不是新特权）
 

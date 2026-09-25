@@ -2,6 +2,30 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [Unreleased] · 增强计划 · 包 C 卡 Lua API 对齐（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+
+### Added · 包 C（设计 §3.1 清偿，API 表实现态全绿）
+
+- **C1 读侧三件（回调式只读）**：`api.palace.recall(filter)`（宿主执行召回引擎，
+  filter = `{topic/place/actor/top_k}`，返回摘要行数组）/ `api.codex.get(id)`（单实体
+  投影）/ `api.codex.known(fact_id)`（揭示状态布尔）。实现形态：宿主组装**只读镜像**
+  （`ReadOnlyMirror`：记忆已按 witnesses 视角过滤、codex 秘密按有效知情集展开、
+  附 B1 召回上下文），沙箱闭包捕获；每 hook 每族 ≤8 次调用（超限报 Lua 错误，
+  错误边界拦截）；卡不用相关 API 时镜像为空、零组装成本（源码扫描判据）
+- **C2 事件广播**：`api.trigger_event(name, data)` 排队到轮末统一派发——`HookReport`
+  增 triggers 收集链（用户周期 + 各发言人周期 → 轮级队列，全成员收集不丢），
+  `finalize_turn` 轮首派发（先于心理 tick 与 on_turn_end，保住「一轮之内 B 槽稳定」
+  红线）；每个事件落一条 `event:<名>` 派发记录（不带触发者私有 state）+ 在场每个
+  角色的状态树求值一次（裸事件名进判据，`when = "event:<名>"` 命中即转移，
+  on_enter/on_exit 钩子随转移收到同一事件）。重放对齐：rebuild_from 在**每轮最后
+  一条 char 消息**的轮末段重派发（队列跨消息累积、换轮清空——与「finalize 只跑
+  一次」同口径），DoD 构造用例钉死「事件驱动转移 + 重放一致 + 私有 state 不随行」
+- **C3 心理 API**：`api.psyche.feel(name, intensity, source)` /
+  `api.psyche.boost_intent(goal, delta)`——只收集不落 state，运行后由宿主经**共用
+  心理应用器**合并（槽位 ≤3、气质衰减、阈值 → M3.5 主动开口链路；与 A3 直写档、
+  总结管线同一份实现，决断 7 兑现）；intensity 夹 0–1、delta 夹 −1–1、空名拒绝
+- 设计文档 §3.1 实现态标注更新为全绿；`cargo test` 481 例全绿（包 A 后 477 + 新增 4）
+
 ## [Unreleased] · 增强计划 · 包 A 工具调用快通道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 > 主演模型能当轮自报持久变化：工具与剧情同报文、轮末确定性应用、效果是消息的

@@ -33,6 +33,7 @@ use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, Std
 use serde::{Deserialize, Serialize};
 
 use crate::director::DirectorAction;
+use crate::palace;
 use crate::psyche;
 use crate::store::Message;
 use crate::worldline::WorldlineAction;
@@ -113,7 +114,42 @@ pub struct HookEnv {
     pub blackboard: std::collections::BTreeMap<String, serde_json::Value>,
     pub memory: std::collections::BTreeMap<String, serde_json::Value>,
     pub turn: u64,
+    /// 增强 C1：宿主组装的只读镜像（api.palace.recall / api.codex.get / known 的
+    /// 数据源）。**视角过滤按当前角色在宿主侧完成**（M3.1 硬约束）——镜像里只有
+    /// 她可召回/可知情的内容，卡私有 state 不在其中。
+    pub mirror: ReadOnlyMirror,
 }
+
+/// 只读镜像（增强 C1）：宿主在跑 hook 前组装，沙箱闭包捕获。卡不用它时为空表，
+/// 组装成本为零；镜像里的 palace 记忆已按 witnesses 视角过滤、codex 投影已按
+/// 有效知情集展开秘密。
+#[derive(Debug, Clone, Default)]
+pub struct ReadOnlyMirror {
+    /// 当前角色可召回的记忆（与 B4 同一数据源）
+    pub memory_objects: Vec<palace::MemObject>,
+    /// 召回上下文（B1 投影：故事天 / 地点 / 在场者 / 活跃线）
+    pub viewer: String,
+    pub day: i64,
+    pub place: Option<String>,
+    pub present: Vec<String>,
+    pub threads: Vec<String>,
+    /// 设定集单实体投影（id → {id,name,type,one_liner,facts,secrets…}，秘密按知情集展开）
+    pub codex_entities: std::collections::BTreeMap<String, serde_json::Value>,
+    /// 当前角色的有效知情集（api.codex.known 的判定源）
+    pub known: std::collections::BTreeSet<String>,
+}
+
+/// api.trigger_event 收集到的一次事件广播（增强 C2）。
+/// data 由卡作者显式构造——触发者的卡私有 state 不随行（「只共享说出口的与做出来的」）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TriggerEvent {
+    pub name: String,
+    pub data: serde_json::Value,
+}
+
+/// 读侧 API 每 hook 运行的调用次数上限（增强 C1：palace.recall / codex.get / known /
+/// psyche / trigger_event 各自独立计数，超限报 Lua 错误——错误边界拦截，不炸轮）
+pub const MIRROR_CALL_LIMIT: u32 = 8;
 
 /// `api.ui.emit` 的实时回调（宿主转推前端）。报告里另留一份，供调用方汇总。
 /// 必须 `Send`：闭包经 mlua 转为 `'static`，持锁的宿主状态不能进。
@@ -131,6 +167,12 @@ pub struct HookRun {
     pub memory: Vec<KvSet>,
     /// `api.schedule_say` 的心里话（M3.5 · 设计 §3.1）：已合并进 state.psyche.scheduled
     pub scheduled: Vec<String>,
+    /// 增强 C3：api.psyche.feel / boost_intent 的收集（已由宿主经共用心理应用器
+    /// 合并进 state；此处留档供报告/面板展示）
+    pub psyche_feels: Vec<(String, f32, String)>,
+    pub psyche_intents: Vec<(String, f32)>,
+    /// 增强 C2：api.trigger_event 的收集（宿主排队到本轮末统一派发）
+    pub triggers: Vec<TriggerEvent>,
 }
 
 impl HookRun {
@@ -629,6 +671,10 @@ pub fn run_hook_full(
     let memory_log = Rc::new(RefCell::new(Vec::new()));
     let blackboard_log = Rc::new(RefCell::new(Vec::new()));
     let schedule_log = Rc::new(RefCell::new(Vec::new()));
+    // 增强 C：psyche 收集（宿主经共用心理应用器合并）与 trigger_event 排队
+    let psyche_feels = Rc::new(RefCell::new(Vec::new()));
+    let psyche_intents = Rc::new(RefCell::new(Vec::new()));
+    let triggers = Rc::new(RefCell::new(Vec::new()));
 
     let state_value = match lua.to_value(&env.state) {
         Ok(v) => v,
@@ -648,6 +694,9 @@ pub fn run_hook_full(
                 &memory_log,
                 &blackboard_log,
                 &schedule_log,
+                &psyche_feels,
+                &psyche_intents,
+                &triggers,
                 on_ui,
             );
             hook.call::<()>((state_value.clone(), api))
@@ -666,6 +715,9 @@ pub fn run_hook_full(
                 &memory_log,
                 &blackboard_log,
                 &schedule_log,
+                &psyche_feels,
+                &psyche_intents,
+                &triggers,
                 on_ui,
             );
             hook.call::<()>((msg_table, state_value.clone(), api))
@@ -703,6 +755,36 @@ pub fn run_hook_full(
             .logs
             .push(format!("心里话入队 {} 条", says.len()));
     }
+
+    // 增强 C3（决断 7）：api.psyche.feel / boost_intent → 共用心理应用器合并进
+    // state（槽位 ≤3、气质衰减、阈值 → M3.5 主动开口链路都在 Psyche 里）；收集
+    // 留档进 HookRun 供报告/面板展示
+    let feels = psyche_feels.borrow().clone();
+    let intents = psyche_intents.borrow().clone();
+    if !feels.is_empty() || !intents.is_empty() {
+        run.psyche_feels = feels.clone();
+        run.psyche_intents = intents.clone();
+        if let Some(mut st) = run.result.state.take() {
+            let mut p = psyche::Psyche::from_state(&st);
+            for (name, intensity, source) in &feels {
+                let outcome = p.feel(name, *intensity, source, env.turn);
+                run.result
+                    .logs
+                    .push(format!("psyche.feel「{name}」：{}", outcome.reason));
+            }
+            for (goal, delta) in &intents {
+                if p.intend(goal, *delta, env.turn).is_some() {
+                    run.result
+                        .logs
+                        .push(format!("psyche.boost_intent「{goal}」已应用"));
+                }
+            }
+            p.write_into(&mut st);
+            run.result.state = Some(st);
+        }
+    }
+    // 增强 C2：trigger_event 的排队原样交出——派发时机在宿主（本轮末统一广播）
+    run.triggers = triggers.borrow().clone();
 
     run.result.injections = injections.borrow().clone();
     run.result.ui_events = ui_events.borrow().clone();
@@ -750,7 +832,50 @@ fn make_ctx(lua: &Lua, window: &[Message], injections: &Rc<RefCell<Vec<InjectedT
     ctx
 }
 
+/// 读侧 API 的调用计数（增强 C1）：每 hook 运行各限 MIRROR_CALL_LIMIT 次，
+/// 超限抛 Lua 错误（错误边界拦截，只进日志不炸轮）
+fn bump_mirror_counter(counter: &Rc<RefCell<u32>>, api: &str) -> Result<(), mlua::Error> {
+    let mut n = counter.borrow_mut();
+    *n += 1;
+    if *n > MIRROR_CALL_LIMIT {
+        return Err(mlua::Error::runtime(format!(
+            "{api} 本 hook 运行内调用超过 {MIRROR_CALL_LIMIT} 次上限"
+        )));
+    }
+    Ok(())
+}
+
+/// filter 表的可选字符串 / 字符串列表字段（容错：非字符串/非数组一律按缺省）
+fn opt_string(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn opt_string_list(v: &serde_json::Value, key: &str) -> Vec<String> {
+    match v.get(key) {
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.to_string()]
+            }
+        }
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// api：memory / blackboard / ui.emit / random / dice / schedule_say（设计 §3.1 白名单）
+/// ＋ 增强 C：palace.recall / codex.get / codex.known（只读镜像）·
+/// psyche.feel / psyche.boost_intent（共用心理应用器）· trigger_event（事件广播排队）。
 ///
 /// memory / blackboard 都是「读快照 + 记增量」：读侧来自 [`HookEnv`]
 /// （memory 读侧 M1 恒空——长期记忆的读由记忆宫殿在 M2 提供），写侧进各自的
@@ -764,6 +889,9 @@ fn make_api(
     memory_log: &Rc<RefCell<Vec<KvSet>>>,
     blackboard_log: &Rc<RefCell<Vec<KvSet>>>,
     schedule_log: &Rc<RefCell<Vec<String>>>,
+    psyche_feels: &Rc<RefCell<Vec<(String, f32, String)>>>,
+    psyche_intents: &Rc<RefCell<Vec<(String, f32)>>>,
+    triggers: &Rc<RefCell<Vec<TriggerEvent>>>,
     on_ui: &UiSink,
 ) -> Table {
     let api = lua.create_table().expect("create api");
@@ -792,6 +920,155 @@ fn make_api(
         })
         .expect("api.schedule_say");
     let _ = api.set("schedule_say", schedule_fn);
+
+    // ---------- 增强 C：读侧三件（回调式只读，非整库快照）＋ 心理 ＋ 事件广播 ----------
+    // 视角过滤在宿主组装镜像时已完成（M3.1 硬约束）：镜像里只有当前角色
+    // 可召回/可知情的内容。各 API 独立计数（每 hook 运行 MIRROR_CALL_LIMIT 次）。
+
+    // api.palace.recall(filter?)：宿主执行召回引擎，返回摘要行数组。
+    // filter = { topic?, place?, actor?, top_k? }——topic 进 mentions、place/actor
+    // 覆盖召回上下文，top_k 缺省 3、钳到 1..=8。
+    let palace_table = lua.create_table().expect("create palace");
+    let recall_counter = Rc::new(RefCell::new(0u32));
+    {
+        let recall_mirror = env.mirror.clone();
+        let recall_counter = Rc::clone(&recall_counter);
+        let recall_fn = lua
+            .create_function(move |lua, filter: Option<Value>| {
+                bump_mirror_counter(&recall_counter, "api.palace.recall")?;
+                let (mentions, mut place, mut present, top_k) = match filter {
+                    Some(v) => {
+                        let f: serde_json::Value = lua.from_value(v)?;
+                        (
+                            opt_string_list(&f, "topic"),
+                            opt_string(&f, "place"),
+                            opt_string_list(&f, "actor"),
+                            f.get("top_k").and_then(|t| t.as_u64()),
+                        )
+                    }
+                    None => (Vec::new(), None, Vec::new(), None),
+                };
+                if place.is_none() {
+                    place = recall_mirror.place.clone();
+                }
+                if present.is_empty() {
+                    present = recall_mirror.present.clone();
+                }
+                let top_k = top_k.unwrap_or(3).clamp(1, 8) as usize;
+                let q = palace::RecallQuery {
+                    viewer: recall_mirror.viewer.clone(),
+                    now_day: recall_mirror.day,
+                    place,
+                    present,
+                    mentions,
+                    hints: Vec::new(),
+                    active_threads: recall_mirror.threads.clone(),
+                    top_k,
+                    budget_tokens: 800,
+                };
+                let hits = palace::recall(&recall_mirror.memory_objects, &q);
+                let lines: Vec<String> =
+                    hits.iter().map(|h| palace::render_memory_line(&h.mem)).collect();
+                Ok(lua.to_value(&lines)?)
+            })
+            .expect("api.palace.recall");
+        let _ = palace_table.set("recall", recall_fn);
+    }
+    let _ = api.set("palace", palace_table);
+
+    // api.codex.get(id)：单实体投影（秘密已按当前角色知情集展开；未知 id 返回 nil）
+    let codex_table = lua.create_table().expect("create codex");
+    let get_counter = Rc::new(RefCell::new(0u32));
+    {
+        let get_mirror = env.mirror.codex_entities.clone();
+        let get_counter = Rc::clone(&get_counter);
+        let get_fn = lua
+            .create_function(move |lua, id: String| {
+                bump_mirror_counter(&get_counter, "api.codex.get")?;
+                Ok(match get_mirror.get(id.trim()) {
+                    Some(v) => lua.to_value(v)?,
+                    None => Value::Nil,
+                })
+            })
+            .expect("api.codex.get");
+        let _ = codex_table.set("get", get_fn);
+    }
+    {
+        let known_mirror = env.mirror.known.clone();
+        let known_counter = Rc::clone(&get_counter);
+        let known_fn = lua
+            .create_function(move |_, fact_id: String| {
+                bump_mirror_counter(&known_counter, "api.codex.known")?;
+                Ok(known_mirror.contains(fact_id.trim()))
+            })
+            .expect("api.codex.known");
+        let _ = codex_table.set("known", known_fn);
+    }
+    let _ = api.set("codex", codex_table);
+
+    // api.psyche.feel / boost_intent（增强 C3 · 决断 7）：只收集不落 state——
+    // 运行结束后由宿主经共用心理应用器合并（槽位 ≤3、气质衰减、阈值链路都在那里）
+    let psyche_table = lua.create_table().expect("create psyche");
+    let feel_log = Rc::clone(psyche_feels);
+    let feel_counter = Rc::new(RefCell::new(0u32));
+    {
+        let feel_counter = Rc::clone(&feel_counter);
+        let feel_fn = lua
+            .create_function(move |_, (name, intensity, source): (String, f32, Option<String>)| {
+                bump_mirror_counter(&feel_counter, "api.psyche.feel")?;
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return Err(mlua::Error::runtime("api.psyche.feel 需要非空的情绪名"));
+                }
+                let intensity = if intensity.is_finite() { intensity.clamp(0.0, 1.0) } else { 0.5 };
+                feel_log.borrow_mut().push((
+                    name,
+                    intensity,
+                    source.unwrap_or_default().trim().to_string(),
+                ));
+                Ok(())
+            })
+            .expect("api.psyche.feel");
+        let _ = psyche_table.set("feel", feel_fn);
+    }
+    {
+        let intent_log = Rc::clone(psyche_intents);
+        let intent_fn = lua
+            .create_function(move |_, (goal, delta): (String, f32)| {
+                bump_mirror_counter(&feel_counter, "api.psyche.boost_intent")?;
+                let goal = goal.trim().to_string();
+                if goal.is_empty() {
+                    return Err(mlua::Error::runtime("api.psyche.boost_intent 需要非空的意图名"));
+                }
+                let delta = if delta.is_finite() { delta.clamp(-1.0, 1.0) } else { 0.0 };
+                intent_log.borrow_mut().push((goal, delta));
+                Ok(())
+            })
+            .expect("api.psyche.boost_intent");
+        let _ = psyche_table.set("boost_intent", intent_fn);
+    }
+    let _ = api.set("psyche", psyche_table);
+
+    // api.trigger_event(name, data?)（增强 C2）：只排队不派发——宿主在轮末统一
+    // 广播给在场所有角色的状态树求值（event:<名> 判据）。data 由卡作者显式构造。
+    let trig_log = Rc::clone(triggers);
+    let trig_counter = Rc::new(RefCell::new(0u32));
+    let trig_fn = lua
+        .create_function(move |lua, (name, data): (String, Option<Value>)| {
+            bump_mirror_counter(&trig_counter, "api.trigger_event")?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err(mlua::Error::runtime("api.trigger_event 需要非空的事件名"));
+            }
+            let data = match data {
+                Some(v) => lua.from_value(v).unwrap_or(serde_json::Value::Null),
+                None => serde_json::Value::Null,
+            };
+            trig_log.borrow_mut().push(TriggerEvent { name, data });
+            Ok(())
+        })
+        .expect("api.trigger_event");
+    let _ = api.set("trigger_event", trig_fn);
 
     // 黑板：白名单 = 世界层四字段 + 实体作用域键（设计 §6.4 的 `char.小雨.status`），
     // 越权键报 Lua 错误。作用域键的规则写在白名单校验里（见 make_kv_ns 的 dotted 分支）。
@@ -1103,6 +1380,8 @@ pub fn run_state_hook_full(
         blackboard: env.blackboard.clone(),
         memory: BTreeMap::new(),
         turn: 0,
+        // 状态钩子暂无 palace/codex 快照（TreeEnv 没带；读侧三件对状态钩子不可用）
+        mirror: ReadOnlyMirror::default(),
     };
     let state_value = match lua.to_value(&hook_env.state) {
         Ok(v) => v,
@@ -1115,6 +1394,9 @@ pub fn run_state_hook_full(
     let memory_log = Rc::new(RefCell::new(Vec::new()));
     let blackboard_log = Rc::new(RefCell::new(Vec::new()));
     let schedule_log = Rc::new(RefCell::new(Vec::new()));
+    let psyche_feels = Rc::new(RefCell::new(Vec::new()));
+    let psyche_intents = Rc::new(RefCell::new(Vec::new()));
+    let triggers = Rc::new(RefCell::new(Vec::new()));
     let api = make_api(
         &lua,
         seed,
@@ -1123,6 +1405,9 @@ pub fn run_state_hook_full(
         &memory_log,
         &blackboard_log,
         &schedule_log,
+        &psyche_feels,
+        &psyche_intents,
+        &triggers,
         on_ui,
     );
     if let Err(e) = hook.call::<()>((api, state_value.clone())) {
@@ -1153,6 +1438,25 @@ pub fn run_state_hook_full(
             .logs
             .push(format!("心里话入队 {} 条", says.len()));
     }
+    // 增强 C3/C2：状态钩子的 psyche 收集同语义合并；trigger_event 照常排队
+    let feels = psyche_feels.borrow().clone();
+    let intents = psyche_intents.borrow().clone();
+    if !feels.is_empty() || !intents.is_empty() {
+        run.psyche_feels = feels.clone();
+        run.psyche_intents = intents.clone();
+        if let Some(mut st) = run.result.state.take() {
+            let mut p = psyche::Psyche::from_state(&st);
+            for (name, intensity, source) in &feels {
+                p.feel(name, *intensity, source, hook_env.turn);
+            }
+            for (goal, delta) in &intents {
+                p.intend(goal, *delta, hook_env.turn);
+            }
+            p.write_into(&mut st);
+            run.result.state = Some(st);
+        }
+    }
+    run.triggers = triggers.borrow().clone();
     run.result.ui_events = ui_events.borrow().clone();
     run.result.memory = memory_log.borrow().clone();
     run.result.blackboard = blackboard_log.borrow().clone();
@@ -1892,6 +2196,172 @@ return {
             state,
             ..HookEnv::default()
         }
+    }
+
+    fn mem(id: &str, content: &str, witnesses: &[&str]) -> palace::MemObject {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "kind": "episode", "content": content, "turn": 1,
+            "story_day": 1, "story_clock": "第1天 20:00", "place": "图书馆",
+            "actors": witnesses, "witnesses": witnesses, "salience": 0.7,
+            "links": ["topic:猫"], "source": "test", "ts": 1, "rehearsals": 0,
+        }))
+        .unwrap()
+    }
+
+    /// 增强 C3（决断 7）：api.psyche.feel / boost_intent 走共用心理应用器——
+    /// 收集进 HookRun 留档、state.psyche 同步合并（槽位封顶/气质衰减都在应用器里）
+    #[test]
+    fn api_psyche_feel_and_boost_intent_share_host_applier() {
+        let source = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = 's', personality = 'p', first_mes = 'f',
+  hooks = {
+    on_message = function(msg, state, api)
+      api.psyche.feel('开心', 1.7, '被夸奖')
+      api.psyche.boost_intent('想道谢', 0.6)
+      api.psyche.boost_intent('想道谢', 0.2)
+    end,
+  },
+}
+"#;
+        let mut hook_env = env(serde_json::json!({}));
+        hook_env.turn = 4;
+        let result = run_hook_full(
+            source,
+            HookCall::OnMessage {
+                msg: &Message {
+                    turn: 4,
+                    role: "user".into(),
+                    content: "你真棒".into(),
+                    ts: 1,
+                    scene_id: None,
+                    name: None,
+                    tool_calls: None,
+                },
+            },
+            &hook_env,
+            7,
+            &sink(),
+        );
+        assert_eq!(result.state.as_ref().unwrap()["psyche"]["affects"][0]["name"], "开心");
+        // intensity 被夹到 0–1（1.7 → 1.0）
+        assert_eq!(
+            result.state.as_ref().unwrap()["psyche"]["affects"][0]["intensity"],
+            1.0
+        );
+        let intents = result.state.as_ref().unwrap()["psyche"]["intents"]
+            .as_array()
+            .unwrap();
+        assert_eq!(intents[0]["name"], "想道谢");
+        assert!(
+            (intents[0]["strength"].as_f64().unwrap() - 0.8).abs() < 1e-6,
+            "0.6 + 0.2 增量叠加 = 0.8（f32 精度内）"
+        );
+        assert_eq!(result.psyche_feels.len(), 1);
+        assert_eq!(result.psyche_intents.len(), 2);
+    }
+
+    /// 增强 C1：读侧三件走宿主镜像——recall 按视角过滤（witnesses）、
+    /// codex.get 投影、known 查知情集；超限调用报错不炸轮
+    #[test]
+    fn api_read_side_uses_host_mirror_and_view_filtering() {
+        let source = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = 's', personality = 'p', first_mes = 'f',
+  hooks = {
+    on_message = function(msg, state, api)
+      local lines = api.palace.recall({ topic = '猫' })
+      state.recall_lines = #lines
+      local e = api.codex.get('char.小雨')
+      state.codex_name = e and e.name or 'missing'
+      state.known = api.codex.known('char.小雨.secrets.工作牌') and 1 or 0
+      state.unknown = api.codex.known('char.小雨.secrets.别的') and 1 or 0
+    end,
+  },
+}
+"#;
+        let mirror = ReadOnlyMirror {
+            memory_objects: vec![
+                mem("m1", "小雨捡到一只猫", &["小雨"]),
+                mem("m2", "阿澈偷偷喂猫", &["阿澈"]),
+            ],
+            viewer: "小雨".into(),
+            day: 2,
+            place: Some("图书馆".into()),
+            present: vec!["小雨".into()],
+            threads: vec![],
+            codex_entities: [(
+                "char.小雨".to_string(),
+                serde_json::json!({"id": "char.小雨", "name": "小雨", "type": "char"}),
+            )]
+            .into_iter()
+            .collect(),
+            known: ["char.小雨.secrets.工作牌".to_string()].into_iter().collect(),
+        };
+        let mut hook_env = env(serde_json::json!({}));
+        hook_env.mirror = mirror;
+        let result = run_hook_full(
+            source,
+            HookCall::OnMessage {
+                msg: &Message {
+                    turn: 1,
+                    role: "user".into(),
+                    content: "在吗".into(),
+                    ts: 1,
+                    scene_id: None,
+                    name: None,
+                    tool_calls: None,
+                },
+            },
+            &hook_env,
+            7,
+            &sink(),
+        );
+        let st = result.state.unwrap();
+        // 视角过滤是硬约束：viewer=小雨 只召回她 witnesses 含她的记忆
+        assert_eq!(st["recall_lines"], 1, "阿澈的记忆不可召回：{st}");
+        assert_eq!(st["codex_name"], "小雨");
+        assert_eq!(st["known"], 1);
+        assert_eq!(st["unknown"], 0);
+    }
+
+    /// 增强 C2：api.trigger_event 只排队不派发；超限调用进错误边界
+    #[test]
+    fn api_trigger_event_queues_and_caps_calls() {
+        let source = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = 's', personality = 'p', first_mes = 'f',
+  hooks = {
+    on_message = function(msg, state, api)
+      api.trigger_event('敲门', { who = '墨墨' })
+      api.trigger_event('敲门')
+    end,
+  },
+}
+"#;
+        let result = run_hook_full(
+            source,
+            HookCall::OnMessage {
+                msg: &Message {
+                    turn: 1,
+                    role: "user".into(),
+                    content: "hi".into(),
+                    ts: 1,
+                    scene_id: None,
+                    name: None,
+                    tool_calls: None,
+                },
+            },
+            &env(serde_json::json!({})),
+            7,
+            &sink(),
+        );
+        assert_eq!(result.triggers.len(), 2);
+        assert_eq!(result.triggers[0].name, "敲门");
+        assert_eq!(result.triggers[0].data["who"], "墨墨");
+        assert!(result.triggers[1].data.is_null());
+        // 派发不在沙箱内发生：state 没有被写入任何事件痕迹
+        assert!(result.state.as_ref().unwrap().get("psyche").is_none());
     }
 
     fn sink() -> UiSink {
