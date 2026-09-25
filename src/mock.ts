@@ -36,6 +36,7 @@ const providers: Provider[] = [
     model: "deepseek-chat",
     temperature: 0.8,
     role: "chat",
+    tools: "off",
   },
 ];
 

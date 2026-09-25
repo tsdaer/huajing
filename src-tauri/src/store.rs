@@ -211,6 +211,9 @@ pub struct Settings {
     /// false = 进收件箱人工确认（缺省）；瞬时状态写黑板与全新实体必人工不受它影响。
     #[serde(default)]
     pub auto_accept_minor_facts: bool,
+    /// 每轮工具调用上限（增强 A5，缺省 6）：超出的调用全部弃置并记一条汇总诊断
+    #[serde(default)]
+    pub tool_calls_per_turn: Option<usize>,
 }
 
 impl Settings {
@@ -246,6 +249,7 @@ impl Default for Settings {
             proxy: None,
             context_window: None,
             auto_accept_minor_facts: false,
+            tool_calls_per_turn: None,
         }
     }
 }
@@ -358,6 +362,10 @@ pub struct Message {
     /// 这条消息是谁说的（M3.1 群聊：char 消息的角色署名；缺省 = 会话首个角色）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 与正文同报文的原始工具调用（增强 A·决断 3）：只存档不落效果，
+    /// 效果由「tool_calls + 确定性校验器」在重放时投影推导——编辑/重roll 后自动正确
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<crate::llm::ToolCall>>,
 }
 
 /// 黑板 v0（设计 §4.1 B1 的数据源；UI 可手动编辑，每轮时钟步进）
@@ -1104,6 +1112,7 @@ mod tests {
             model: "deepseek-chat".into(),
             temperature: 0.8,
             role: role.into(),
+            tools: "off".into(),
         }
     }
 
@@ -1289,7 +1298,7 @@ mod tests {
             log.append(
                 &root,
                 &meta.id,
-                &Message { turn, role: "user".into(), content: text.into(), ts: 0, scene_id: None, name: None },
+                &Message { turn, role: "user".into(), content: text.into(), ts: 0, scene_id: None, name: None, tool_calls: None },
             )
             .unwrap();
             let msgs = read_messages(&root, &meta.id).unwrap();
@@ -1372,7 +1381,9 @@ mod tests {
                 content: "今天好冷。".into(),
                 ts: 1_758_000_000,
                 scene_id: None,
-            },
+            tool_calls: None,
+            }
+                ,
         )
         .unwrap();
         log.append(
@@ -1385,7 +1396,9 @@ mod tests {
                 content: "……嗯。".into(),
                 ts: 1_758_000_020,
                 scene_id: None,
-            },
+            tool_calls: None,
+            }
+                ,
         )
         .unwrap();
         let msgs = read_messages(root.path(), &meta.id).unwrap();
@@ -1512,7 +1525,9 @@ mod tests {
                 content: "你好".into(),
                 ts: 1,
                 scene_id: None,
-            },
+            tool_calls: None,
+            }
+                ,
         )
         .unwrap();
         let a = log.read(root.path(), &meta.id).unwrap();
@@ -1531,7 +1546,9 @@ mod tests {
                 content: "……嗯。".into(),
                 ts: 2,
                 scene_id: None,
-            },
+            tool_calls: None,
+            }
+                ,
         )
         .unwrap();
         let c = log.read(root.path(), &meta.id).unwrap();
@@ -1572,7 +1589,9 @@ mod tests {
                 content: "第一条".into(),
                 ts: 1,
                 scene_id: None,
-            },
+            tool_calls: None,
+            }
+                ,
         )
         .unwrap();
 
@@ -1619,7 +1638,9 @@ mod tests {
                     content: format!("m{i}"),
                     ts: i as u64,
                     scene_id: None,
-                },
+                tool_calls: None,
+                }
+                    ,
             )
             .unwrap();
         }
@@ -1665,7 +1686,9 @@ mod tests {
                     content: format!("原文{i}"),
                     ts: i as u64,
                     scene_id: None,
-                },
+                tool_calls: None,
+                }
+                    ,
             )
             .unwrap();
         }
@@ -1718,7 +1741,9 @@ mod tests {
                 content: "新回复".into(),
                 ts: 9,
                 scene_id: None,
-            },
+            tool_calls: None,
+            }
+                ,
         )
         .unwrap();
         let final_msgs = read_messages(root.path(), &meta.id).unwrap();
@@ -1758,7 +1783,9 @@ mod tests {
                     content: format!("消息正文 {:064}", i), // ~100B/行
                     ts: i as u64,
                     scene_id: None,
-                },
+                tool_calls: None,
+                }
+                    ,
             )
             .unwrap();
         }
@@ -1780,7 +1807,9 @@ mod tests {
             content: content.into(),
             ts: 0,
             scene_id: None,
+        tool_calls: None,
         }
+            
     }
 
     #[test]

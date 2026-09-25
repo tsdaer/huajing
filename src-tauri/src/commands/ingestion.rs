@@ -262,6 +262,7 @@ async fn run_ingest_stage(
         &[llm::ChatMessage {
             role: "user".into(),
             content: prompt_text,
+            tool_calls: None,
         }],
         max_tokens,
         0.3,

@@ -34,6 +34,7 @@ fn append_transition(
         role: "system".into(),
         content: text.to_string(),
         ts: store::unix_now(),
+        tool_calls: None,
         scene_id: Some(scene_id.to_string()),
         name: None,
     };

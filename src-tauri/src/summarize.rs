@@ -2401,7 +2401,9 @@ mod tests {
             content: "她笑了笑。".into(),
             ts: 0,
             scene_id: None,
-        };
+        tool_calls: None,
+        }
+            ;
         let b = BatchMessage::from_message(&m);
         assert_eq!(b.turn, 7);
         assert_eq!(b.role, "char");

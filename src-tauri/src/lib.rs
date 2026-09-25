@@ -22,6 +22,7 @@ mod statetree; // 状态树：剧情状态机的纯数据与算法（M2.3 · 设
 mod stimport; // SillyTavern 角色卡导入（M1.8 · 设计 §13）
 mod store;    // DataHub 明文数据层（设计 §12）
 mod summarize; // 自动总结管线：批次 → 六类产物（M2.6 · 设计 §5.3）
+mod toolcall; // 主演模型的工具调用快通道：schema、校验、直写/提案应用器（增强 · 包 A）
 mod watch;    // DataHub 热加载监听（M1.7）
 mod worldline; // 世界主线与世界时钟：世界作用域的阶段弧（M3.7 · 设计 §6.6）
 

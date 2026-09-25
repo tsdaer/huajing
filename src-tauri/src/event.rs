@@ -1181,7 +1181,9 @@ mod tests {
             content: content.into(),
             ts: 100 + turn,
             scene_id: None,
+        tool_calls: None,
         }
+            
     }
 
     fn effect(turn: u64, key: &str, value: serde_json::Value) -> LogBody {
@@ -1679,6 +1681,7 @@ mod scene_tests {
                 ts: 100 + turn,
                 scene_id: scene_id.map(str::to_string),
                 name: None,
+                tool_calls: None,
             },
         )
     }

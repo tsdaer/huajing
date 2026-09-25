@@ -24,6 +24,11 @@ pub struct Provider {
     /// 用途档位：chat 主对话 / util 总结捕获（设计 §11，util 走便宜档）
     #[serde(default = "default_role")]
     pub role: String,
+    /// 工具调用能力位（增强 A1 · 决断 4）：`"off" | "on"`，缺省 off。
+    /// `"on"` 的接入点发请求带工具 schema；provider 不支持（400 类错误）时
+    /// 本次请求自动去 tools 重试一次并留诊断（仿 C3 空正文棘轮的降级先例）。
+    #[serde(default = "default_tools")]
+    pub tools: String,
 }
 
 fn default_temperature() -> f32 {
@@ -32,6 +37,31 @@ fn default_temperature() -> f32 {
 
 fn default_role() -> String {
     "chat".into()
+}
+
+fn default_tools() -> String {
+    "off".into()
+}
+
+impl Provider {
+    /// 工具调用是否开启（设置页按接入点开关；缺省 off = 全链路与现状一致）
+    pub fn tools_enabled(&self) -> bool {
+        self.tools.trim().eq_ignore_ascii_case("on")
+    }
+}
+
+/// 模型返回的一次工具调用（OpenAI `tool_calls`；增强 A·决断 2/3）。
+/// 原始调用随 assistant 消息存档进事件流（`Message.tool_calls`），
+/// 效果不在落盘时直接写 state，由重放按「tool_calls + 确定性校验器」推导。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    /// 参数对象。流式增量按 index 键串接 arguments 后在收尾解析；
+    /// 解析失败记 Null（应用层按坏调用弃置 + diag）。
+    #[serde(default)]
+    pub arguments: serde_json::Value,
 }
 
 /// 真正会被请求的补全地址（自检与真实发送共用，避免两处规则漂移）
@@ -66,11 +96,26 @@ fn normalize_base_url(raw: &str) -> String {
     trimmed.to_string()
 }
 
-/// 对话消息（OpenAI 格式：system | user | assistant）
+/// 对话消息（OpenAI 格式：system | user | assistant）。
+/// `tool_calls` 两侧共用：请求侧随 assistant 历史序列化（本设计为捆绑式、不回填
+/// tool result，正常不发），响应侧由流式/非流式解析填出。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl ChatMessage {
+    /// 纯文本消息（绝大多数构造点用这个，省得逐处写 tool_calls: None）
+    pub fn text(role: &str, content: impl Into<String>) -> Self {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+        }
+    }
 }
 
 /// `api.ui.emit` 转推给前端的一条界面事件（M1.6：表情/立绘位占位）。
@@ -198,6 +243,75 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// 工具调用增量分片（增强 A1）：同一 `index` 的分片串接成一次完整调用
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct StreamToolDelta {
+    /// 分片序号（OpenAI 约定：arguments 按它追加到对应调用上）
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamToolFn>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct StreamToolFn {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// tool_calls 增量累积器：按 index 键收集、arguments 字符串追加，
+/// finish 时整块交出（arguments 解析失败记 Null，由应用层按坏调用弃置）。
+/// 边界（单独单测）：跨 chunk 的 arguments 分片、UTF-8 多字节截断、部分 JSON。
+#[derive(Default)]
+pub struct ToolCallAccum {
+    calls: std::collections::BTreeMap<usize, PartialToolCall>,
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    args: String,
+}
+
+impl ToolCallAccum {
+    pub fn push(&mut self, deltas: &[StreamToolDelta]) {
+        for d in deltas {
+            let part = self.calls.entry(d.index).or_default();
+            if let Some(id) = d.id.as_deref() {
+                part.id = id.to_string();
+            }
+            if let Some(f) = &d.function {
+                if let Some(name) = f.name.as_deref() {
+                    part.name = name.to_string();
+                }
+                if let Some(args) = f.arguments.as_deref() {
+                    part.args.push_str(args);
+                }
+            }
+        }
+    }
+
+    /// 收尾：按 index 序交出完整调用。arguments 非法 JSON 时记 Null（不 panic、不丢弃
+    /// 整批——坏一个调用不该连坐别的调用）。
+    pub fn finish(self) -> Vec<ToolCall> {
+        self.calls
+            .into_iter()
+            .map(|(_, part)| ToolCall {
+                id: part.id,
+                name: part.name,
+                arguments: serde_json::from_str(&part.args).unwrap_or(serde_json::Value::Null),
+            })
+            .collect()
+    }
 }
 
 /// 流式补全结果
@@ -208,6 +322,10 @@ pub struct StreamOutcome {
     pub cancelled: bool,
     /// 末 chunk 的 finish_reason（C3 空正文棘轮的判据；服务端没带时为 None）
     pub finish_reason: Option<String>,
+    /// 与正文同报文的工具调用（增强 A1 · 决断 2）；无工具轮为空
+    pub tool_calls: Vec<ToolCall>,
+    /// provider 不支持工具（400 类错误）→ 本次已自动去 tools 重试（界面提示用）
+    pub tools_fallback: bool,
 }
 
 /// 流式中途失败：错误信息 + **已生成的部分文本**（加固 C2）。
@@ -216,11 +334,19 @@ pub struct StreamOutcome {
 pub struct StreamFailure {
     pub message: String,
     pub partial: String,
+    /// HTTP 状态码（A1 工具降级棘轮的判据：400 类 = provider 不支持 tools）
+    pub status: Option<u16>,
+}
+
+impl StreamFailure {
+    pub fn from_message(message: String) -> Self {
+        StreamFailure { message, partial: String::new(), status: None }
+    }
 }
 
 impl From<String> for StreamFailure {
     fn from(message: String) -> Self {
-        StreamFailure { message, partial: String::new() }
+        StreamFailure::from_message(message)
     }
 }
 
@@ -252,12 +378,13 @@ pub async fn chat_stream(
     cancel: &AtomicBool,
     extra_proxy: Option<&str>,
 ) -> Result<StreamOutcome, StreamFailure> {
-    chat_stream_bounded(provider, messages, on_delta, cancel, extra_proxy, None, CHUNK_TIMEOUT).await
+    chat_stream_bounded(provider, messages, on_delta, cancel, extra_proxy, None, CHUNK_TIMEOUT, None).await
 }
 
 /// 带请求参数的流式补全（加固 C3 的重试入口）：
 /// - `max_tokens`：Some 时随请求带上（None = 服务端默认，现状行为）；
-/// - `chunk_timeout`：单块最长等待（生产用 [`CHUNK_TIMEOUT`]，测试注入小值）。
+/// - `chunk_timeout`：单块最长等待（生产用 [`CHUNK_TIMEOUT`]，测试注入小值）；
+/// - `tools`：Some 时随请求带工具 schema（增强 A1；空数组等价 None）。
 pub(crate) async fn chat_stream_bounded(
     provider: &Provider,
     messages: &[ChatMessage],
@@ -266,6 +393,7 @@ pub(crate) async fn chat_stream_bounded(
     extra_proxy: Option<&str>,
     max_tokens: Option<u32>,
     chunk_timeout: Duration,
+    tools: Option<&[serde_json::Value]>,
 ) -> Result<StreamOutcome, StreamFailure> {
     let (client, _proxy) = build_client(extra_proxy).await.map_err(StreamFailure::from)?;
     let url = endpoint(provider);
@@ -278,6 +406,9 @@ pub(crate) async fn chat_stream_bounded(
     if let Some(mt) = max_tokens {
         body["max_tokens"] = serde_json::json!(mt);
     }
+    if let Some(list) = tools.filter(|t| !t.is_empty()) {
+        body["tools"] = serde_json::Value::Array(list.to_vec());
+    }
     let resp = client
         .post(&url)
         .bearer_auth(&provider.api_key)
@@ -288,16 +419,21 @@ pub(crate) async fn chat_stream_bounded(
     if !resp.status().is_success() {
         let status = resp.status();
         let detail = resp.text().await.unwrap_or_default();
-        return Err(StreamFailure::from(format!(
-            "{} 返回 {}：{}",
-            provider.name,
-            status,
-            truncate(&detail, 500)
-        )));
+        return Err(StreamFailure {
+            message: format!(
+                "{} 返回 {}：{}",
+                provider.name,
+                status,
+                truncate(&detail, 500)
+            ),
+            partial: String::new(),
+            status: Some(status.as_u16()),
+        });
     }
 
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::new();
+    let mut tool_acc = ToolCallAccum::default();
     let mut full = String::new();
     let mut cancelled = false;
     let mut finish_reason: Option<String> = None;
@@ -312,21 +448,30 @@ pub(crate) async fn chat_stream_bounded(
             .map_err(|_| StreamFailure {
                 message: format!("{} 响应超时（{} 秒无数据）", provider.name, chunk_timeout.as_secs()),
                 partial: full.clone(),
+                status: None,
             })?
             .transpose()
             .map_err(|e| StreamFailure {
                 message: format!("{} 流读取失败：{e}", provider.name),
                 partial: full.clone(),
+                status: None,
             })?;
         let Some(bytes) = chunk else { break };
 
         let events = parser.feed(&bytes).map_err(|e| StreamFailure {
             message: format!("{} {e}", provider.name),
             partial: full.clone(),
+            status: None,
         })?;
         for data in events {
             if data == "[DONE]" {
-                return Ok(StreamOutcome { text: full, cancelled: false, finish_reason });
+                return Ok(StreamOutcome {
+                    text: full,
+                    cancelled: false,
+                    finish_reason,
+                    tool_calls: tool_acc.finish(),
+                    tools_fallback: false,
+                });
             }
             let Ok(parsed) = serde_json::from_str::<StreamChunk>(&data) else {
                 continue; // 非 JSON 负载（心跳等）跳过
@@ -341,11 +486,21 @@ pub(crate) async fn chat_stream_bounded(
                         full.push_str(&delta);
                     }
                 }
+                // 工具分片与正文交错到达（决断 2 的同报文形态）：各自累积，互不挤占
+                if let Some(deltas) = choice.delta.tool_calls {
+                    tool_acc.push(&deltas);
+                }
             }
         }
     }
     // 流结束但未见 [DONE]：按已收内容收尾
-    Ok(StreamOutcome { text: full, cancelled, finish_reason })
+    Ok(StreamOutcome {
+        text: full,
+        cancelled,
+        finish_reason,
+        tool_calls: tool_acc.finish(),
+        tools_fallback: false,
+    })
 }
 
 /// 带空正文棘轮的流式补全（加固 C3）：推理模型在服务端默认预算内把 token 耗在
@@ -359,11 +514,32 @@ pub async fn chat_stream_ratcheted(
     cancel: &AtomicBool,
     extra_proxy: Option<&str>,
 ) -> Result<StreamOutcome, StreamFailure> {
+    chat_stream_ratcheted_inner(provider, messages, &mut on_delta, cancel, extra_proxy, None).await
+}
+
+/// [`chat_stream_ratcheted`] 的工具版内核：`tools` 随每梯重试一起带上
+/// （空正文重试与工具无交集，同一轮的请求形态保持一致）。
+pub(crate) async fn chat_stream_ratcheted_inner(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    mut on_delta: impl FnMut(&str),
+    cancel: &AtomicBool,
+    extra_proxy: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+) -> Result<StreamOutcome, StreamFailure> {
     let mut budget: Option<u32> = None;
     loop {
-        let outcome =
-            chat_stream_bounded(provider, messages, &mut on_delta, cancel, extra_proxy, budget, CHUNK_TIMEOUT)
-                .await?;
+        let outcome = chat_stream_bounded(
+            provider,
+            messages,
+            &mut on_delta,
+            cancel,
+            extra_proxy,
+            budget,
+            CHUNK_TIMEOUT,
+            tools,
+        )
+        .await?;
         let empty = outcome.text.trim().is_empty();
         if !outcome.cancelled && empty && outcome.finish_reason.as_deref() == Some("length") {
             let last = budget.unwrap_or(4096);
@@ -379,11 +555,49 @@ pub async fn chat_stream_ratcheted(
                             provider.name, last
                         ),
                         partial: outcome.text,
+                        status: None,
                     })
                 }
             }
         }
         return Ok(outcome);
+    }
+}
+
+/// 主对话的流式入口（增强 A1）：`tools` 为 Some 且非空时随请求带工具 schema
+/// （工具与剧情同报文，决断 2）。provider 对 tools 回 400 类错误（不支持功能
+/// 调用）→ 本次请求自动去 tools 重试一次，`tools_fallback` 置 true + diag 留痕
+/// （仿 C3 空正文棘轮的降级先例）。400 前不会有任何增量回调，重试不产生重复文本。
+pub async fn chat_stream_auto(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    tools: Option<&[serde_json::Value]>,
+    mut on_delta: impl FnMut(&str),
+    cancel: &AtomicBool,
+    extra_proxy: Option<&str>,
+) -> Result<StreamOutcome, StreamFailure> {
+    let enabled = tools.map(|t| !t.is_empty()).unwrap_or(false);
+    if !enabled {
+        return chat_stream_ratcheted(provider, messages, on_delta, cancel, extra_proxy).await;
+    }
+    match chat_stream_ratcheted_inner(provider, messages, &mut on_delta, cancel, extra_proxy, Some(tools.unwrap()))
+        .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(f) if f.status.is_some_and(|s| (400..500).contains(&s)) => {
+            crate::diag::record(
+                "tools",
+                format!(
+                    "接入点「{}」拒绝了工具请求（{}），本次已自动去工具重试；建议在设置页关闭该接入点的工具开关",
+                    provider.name, f.message
+                ),
+            );
+            let mut outcome =
+                chat_stream_ratcheted_inner(provider, messages, &mut on_delta, cancel, extra_proxy, None).await?;
+            outcome.tools_fallback = true;
+            Ok(outcome)
+        }
+        Err(f) => Err(f),
     }
 }
 
@@ -480,6 +694,222 @@ fn retry_budget(max_tokens: u32) -> Option<u32> {
         None
     } else {
         Some(next)
+    }
+}
+
+/// 非流式补全的完整结果：正文 + 工具调用（增强 A1；工具轮正文可能为空）。
+/// 当前由单测消费；剧场/推理型路径接入时即为生产入口。
+#[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
+pub struct CompleteOutcome {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+    /// provider 不支持工具 → 本次已自动去 tools 重试
+    pub tools_fallback: bool,
+}
+
+/// 通用**非流式**补全（带工具版，增强 A1）：`tools` 为 Some 且非空时随请求带
+/// 工具 schema；provider 回 400 类错误 → 自动去 tools 重试一次 + diag。
+/// 空正文预算棘轮照常生效（工具调用不算正文——纯工具轮仍可能因思考耗预算而空）。
+/// 当前由单测消费；剧场/推理型路径接入时即为生产入口。
+#[allow(dead_code)]
+pub async fn chat_complete_auto(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    temperature: f32,
+    extra_proxy: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+) -> Result<CompleteOutcome, String> {
+    let enabled = tools.map(|t| !t.is_empty()).unwrap_or(false);
+    if !enabled {
+        return chat_complete(provider, messages, max_tokens, temperature, extra_proxy)
+            .await
+            .map(|text| CompleteOutcome { text, ..Default::default() });
+    }
+    let list = tools.unwrap();
+    match complete_with_tools(provider, messages, max_tokens, temperature, extra_proxy, list).await {
+        Ok(outcome) => Ok(outcome),
+        Err(ErrWithStatus { message, status: Some(s), .. }) if (400..500).contains(&s) => {
+            crate::diag::record(
+                "tools",
+                format!(
+                    "接入点「{}」拒绝了工具请求（{message}），本次已自动去工具重试",
+                    provider.name
+                ),
+            );
+            // 去 tools 重试：与流式降级同款，整轮重来一遍
+            let mut outcome = complete_with_tools(provider, messages, max_tokens, temperature, extra_proxy, &[])
+                .await
+                .map_err(|e| e.message)?;
+            outcome.tools_fallback = true;
+            Ok(outcome)
+        }
+        Err(e) => Err(e.message),
+    }
+}
+
+/// 带状态码的错误（工具降级棘轮要分清「400 类 = 不支持」与其它失败）
+struct ErrWithStatus {
+    message: String,
+    status: Option<u16>,
+    /// 400 类错误的响应体摘要（诊断用）
+    partial: Option<String>,
+}
+
+async fn complete_with_tools(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    temperature: f32,
+    extra_proxy: Option<&str>,
+    tools: &[serde_json::Value],
+) -> Result<CompleteOutcome, ErrWithStatus> {
+    // 空正文预算棘轮（C3 同款）：纯工具轮正文为空属正常，棘轮只在
+    // finish=length 且无工具调用时触发，避免给工具轮白烧一遍预算
+    let mut budget = max_tokens;
+    loop {
+        let (outcome, finish_reason) =
+            chat_once_tools_bounded(provider, messages, budget, temperature, extra_proxy, tools).await?;
+        let empty = outcome.text.trim().is_empty();
+        if empty
+            && outcome.tool_calls.is_empty()
+            && finish_reason.as_deref() == Some("length")
+        {
+            match retry_budget(budget) {
+                Some(next) => {
+                    budget = next;
+                    continue;
+                }
+                None => {
+                    return Err(ErrWithStatus {
+                        message: format!(
+                            "{} 的思考耗尽了 max_tokens（{budget}），加大预算后仍无正文",
+                            provider.name
+                        ),
+                        status: None,
+                        partial: None,
+                    })
+                }
+            }
+        }
+        return Ok(outcome);
+    }
+}
+
+/// 一次带工具的非流式请求（整体超时沿用 NON_STREAM_TIMEOUT）
+async fn chat_once_tools_bounded(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    temperature: f32,
+    extra_proxy: Option<&str>,
+    tools: &[serde_json::Value],
+) -> Result<(CompleteOutcome, Option<String>), ErrWithStatus> {
+    let future = async {
+        let (client, _proxy) = build_client(extra_proxy).await.map_err(|e| ErrWithStatus {
+            message: e,
+            status: None,
+            partial: None,
+        })?;
+        let url = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
+        let mut body = serde_json::json!({
+            "model": provider.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": false,
+        });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools.to_vec());
+        }
+        let resp = client
+            .post(&url)
+            .bearer_auth(&provider.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ErrWithStatus {
+                message: format!("请求失败（{}）：{}", provider.name, error_chain(&e)),
+                status: None,
+                partial: None,
+            })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(ErrWithStatus {
+                message: format!("{} 返回 {}：{}", provider.name, status, truncate(&detail, 300)),
+                status: Some(status.as_u16()),
+                partial: Some(truncate(&detail, 300)),
+            });
+        }
+        let value: serde_json::Value = resp.json().await.map_err(|e| ErrWithStatus {
+            message: format!("响应解析失败（{}）：{e}", provider.name),
+            status: None,
+            partial: None,
+        })?;
+        let choice = value.get("choices").and_then(|c| c.get(0));
+        let message = choice.and_then(|c| c.get("message"));
+        let text = message
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| ErrWithStatus {
+                message: format!(
+                    "响应里没有 choices[0].message.content：{}",
+                    truncate(&value.to_string(), 300)
+                ),
+                status: None,
+                partial: None,
+            })?;
+        let tool_calls = message
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let name = c
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())?
+                            .to_string();
+                        let id = c
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let args_raw = c
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("");
+                        Some(ToolCall {
+                            id,
+                            name,
+                            arguments: serde_json::from_str(args_raw)
+                                .unwrap_or(serde_json::Value::Null),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let finish_reason = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        Ok((CompleteOutcome { text, tool_calls, tools_fallback: false }, finish_reason))
+    };
+    match tokio::time::timeout(NON_STREAM_TIMEOUT, future).await {
+        Ok(r) => r,
+        Err(_) => Err(ErrWithStatus {
+            message: format!(
+                "{} 非流式响应超时（{} 秒内无完整响应）",
+                provider.name,
+                NON_STREAM_TIMEOUT.as_secs()
+            ),
+            status: None,
+            partial: None,
+        }),
     }
 }
 
@@ -922,6 +1352,7 @@ mod ratchet_tests {
             model: "m".into(),
             temperature: 0.0,
             role: "chat".into(),
+            tools: "off".into(),
         }
     }
 
@@ -979,7 +1410,7 @@ mod ratchet_tests {
             let provider = test_provider(&format!("http://{addr}"));
             let err = chat_once_full_bounded(
                 &provider,
-                &[ChatMessage { role: "user".into(), content: "hi".into() }],
+                &[ChatMessage::text("user", "hi")],
                 16,
                 0.0,
                 None,
@@ -991,7 +1422,7 @@ mod ratchet_tests {
             // chat_once（自检路径）同样受整体超时保护
             let err = chat_once_bounded(
                 &provider,
-                &[ChatMessage { role: "user".into(), content: "hi".into() }],
+                &[ChatMessage::text("user", "hi")],
                 None,
                 Duration::from_millis(300),
             )
@@ -1020,12 +1451,13 @@ mod ratchet_tests {
             let cancel = AtomicBool::new(false);
             let err = chat_stream_bounded(
                 &provider,
-                &[ChatMessage { role: "user".into(), content: "hi".into() }],
+                &[ChatMessage::text("user", "hi")],
                 |_| {},
                 &cancel,
                 None,
                 None,
                 Duration::from_millis(300),
+                None,
             )
             .await
             .unwrap_err();
@@ -1095,7 +1527,7 @@ mod ratchet_tests {
             let mut seen = String::new();
             let out = chat_stream_ratcheted(
                 &provider,
-                &[ChatMessage { role: "user".into(), content: "hi".into() }],
+                &[ChatMessage::text("user", "hi")],
                 |d| seen.push_str(d),
                 &cancel,
                 None,
@@ -1140,6 +1572,243 @@ mod ratchet_tests {
         assert_eq!(a, b, "整段喂与逐字节喂解析一致");
         assert_eq!(a, vec!["a", "b", "c"]);
     }
+
+    // ---------- 增强 A1 · tool_calls 增量解析与降级棘轮 ----------
+
+    /// 同一 index 的 arguments 分片串接；不同 index 各自成一次调用
+    #[test]
+    fn tool_call_accum_merges_split_arguments_by_index() {
+        let mut acc = ToolCallAccum::default();
+        acc.push(&[StreamToolDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            function: Some(StreamToolFn { name: Some("psyche_feel".into()), arguments: Some("{\"na".into()) }),
+        }]);
+        acc.push(&[StreamToolDelta {
+            index: 0,
+            id: None,
+            function: Some(StreamToolFn { name: None, arguments: Some("me\":\"开心\"}".into()) }),
+        }]);
+        acc.push(&[StreamToolDelta {
+            index: 1,
+            id: Some("call_2".into()),
+            function: Some(StreamToolFn { name: Some("ui_emit".into()), arguments: Some("{}".into()) }),
+        }]);
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 2, "两个 index = 两次调用");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "psyche_feel");
+        assert_eq!(calls[0].arguments["name"], "开心", "跨 chunk 的 arguments 串接成完整 JSON");
+        assert_eq!(calls[1].name, "ui_emit");
+    }
+
+    /// 参数截断（中断/长度截断）：坏 JSON 记 Null，不连坐同批的其它调用
+    #[test]
+    fn tool_call_accum_survives_partial_json() {
+        let mut acc = ToolCallAccum::default();
+        acc.push(&[StreamToolDelta {
+            index: 0,
+            id: Some("a".into()),
+            function: Some(StreamToolFn { name: Some("memory_set".into()), arguments: Some("{\"key\":".into()) }),
+        }]);
+        acc.push(&[StreamToolDelta {
+            index: 1,
+            id: Some("b".into()),
+            function: Some(StreamToolFn { name: Some("ui_emit".into()), arguments: Some("{\"kind\":\"emotion\"}".into()) }),
+        }]);
+        let calls = acc.finish();
+        assert!(calls[0].arguments.is_null(), "截断参数记 Null");
+        assert_eq!(calls[1].arguments["kind"], "emotion", "坏调用不连坐别的调用");
+    }
+
+    #[test]
+    fn stream_chunk_parses_tool_call_deltas_alongside_content() {
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"（她笑）","tool_calls":[{"index":0,"id":"c1","function":{"name":"psyche_feel","arguments":"{\"name\":\"开心\"}"}}]}}]}"#,
+        )
+        .unwrap();
+        let c = &chunk.choices[0];
+        assert_eq!(c.delta.content.as_deref(), Some("（她笑）"), "正文与工具分片同 chunk 交错");
+        let d = c.delta.tool_calls.as_ref().unwrap();
+        assert_eq!(d[0].index, 0);
+        assert_eq!(d[0].function.as_ref().unwrap().name.as_deref(), Some("psyche_feel"));
+        // 旧形态（无 tool_calls 键）照常解析
+        let plain: StreamChunk =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).unwrap();
+        assert!(plain.choices[0].delta.tool_calls.is_none());
+    }
+
+    /// 全链路（字节 → SSE 行 → chunk → 累积器）在**任意字节处**切开都与整段一致：
+    /// 行缓冲保证多字节字符不被撕裂；工具分片与正文交错各自归位
+    #[test]
+    fn tool_stream_end_to_end_identical_at_every_byte_split() {
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"早\"}}]}\n\n".to_string()
+            + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"blackboard_set\",\"arguments\":\"{\\\"place\\\": \\\"天台\\\"}\"}}]}}]}\n\n"
+            + "data: [DONE]\n\n";
+        let drain = |bytes: &[u8]| {
+            let mut p = SseParser::new();
+            let mut acc = ToolCallAccum::default();
+            let mut text = String::new();
+            for data in p.feed(bytes).unwrap() {
+                if data == "[DONE]" {
+                    continue;
+                }
+                if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&data) {
+                    for choice in parsed.choices {
+                        if let Some(d) = choice.delta.content {
+                            text.push_str(&d);
+                        }
+                        if let Some(t) = choice.delta.tool_calls {
+                            acc.push(&t);
+                        }
+                    }
+                }
+            }
+            (text, acc.finish())
+        };
+        let (text, calls) = drain(payload.as_bytes());
+        assert_eq!(text, "早");
+        assert_eq!(calls[0].arguments["place"], "天台");
+        for split in 0..payload.len() {
+            let (a, b) = payload.as_bytes().split_at(split);
+            let (t2, c2) = drain(&[a, b].concat());
+            assert_eq!(t2, text, "切点 {split} 的正文");
+            assert_eq!(format!("{c2:?}"), format!("{calls:?}"), "切点 {split} 的工具调用");
+        }
+    }
+
+    /// A1 降级棘轮：带 tools 的请求被 400 拒 → 自动去 tools 重试一次，
+    /// `tools_fallback` 置位；重试请求里不能再出现 "tools" 键
+    #[test]
+    fn chat_stream_auto_falls_back_when_tools_rejected_with_400() {
+        rt().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let first = read_http_request(&mut sock).await;
+                assert!(first.contains("\"tools\""), "首请求要带工具 schema：{first}");
+                let _ = sock
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{\"error\":\"tools not found\"}")
+                    .await;
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let retry = read_http_request(&mut sock).await;
+                assert!(!retry.contains("\"tools\""), "重试请求已去 tools：{retry}");
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"降级成功\"}}]}\n\ndata: [DONE]\n\n";
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+            let provider = test_provider(&format!("http://{addr}"));
+            let cancel = AtomicBool::new(false);
+            let schemas = vec![serde_json::json!({"type": "function", "function": {"name": "ui_emit"}})];
+            let mut seen = String::new();
+            let out = chat_stream_auto(
+                &provider,
+                &[ChatMessage::text("user", "hi")],
+                Some(&schemas),
+                |d| seen.push_str(d),
+                &cancel,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.text, "降级成功");
+            assert_eq!(seen, "降级成功");
+            assert!(out.tools_fallback, "降级标记要在结果里，供界面提示");
+            assert!(out.tool_calls.is_empty());
+        });
+    }
+
+    /// 工具开关关闭（tools=None）时与 chat_stream_ratcheted 完全同路：请求里没有 tools 键，
+    /// 也没有降级标记——「不支持工具的接入点全链路与现状一致」的钉子
+    #[test]
+    fn chat_stream_auto_without_tools_matches_legacy_path() {
+        rt().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let req = read_http_request(&mut sock).await;
+                assert!(!req.contains("\"tools\""), "关开关的请求不带工具 schema：{req}");
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"照旧\"}}]}\n\ndata: [DONE]\n\n";
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+            let provider = test_provider(&format!("http://{addr}"));
+            let cancel = AtomicBool::new(false);
+            let out = chat_stream_auto(
+                &provider,
+                &[ChatMessage::text("user", "hi")],
+                None,
+                |_| {},
+                &cancel,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.text, "照旧");
+            assert!(!out.tools_fallback);
+        });
+    }
+
+    /// 非流式带工具：message.tool_calls 解析成参数对象（A1「非流式同步支持」的钉子）
+    #[test]
+    fn chat_complete_auto_parses_tool_calls() {
+        rt().block_on(async {
+            use tokio::io::AsyncWriteExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let _req = read_http_request(&mut sock).await;
+                let body = r#"{"choices":[{"finish_reason":"tool_calls","message":{"content":"","tool_calls":[{"id":"c9","type":"function","function":{"name":"ui_emit","arguments":"{\"kind\":\"emotion\",\"value\":\"开心\"}"}}]}}]}"#;
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+            let provider = test_provider(&format!("http://{addr}"));
+            let schemas = vec![serde_json::json!({"type": "function"})];
+            let out = chat_complete_auto(
+                &provider,
+                &[ChatMessage::text("user", "hi")],
+                256,
+                0.0,
+                None,
+                Some(&schemas),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.tool_calls.len(), 1);
+            assert_eq!(out.tool_calls[0].name, "ui_emit");
+            assert_eq!(out.tool_calls[0].arguments["value"], "开心");
+            assert!(!out.tools_fallback);
+        });
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1154,6 +1823,7 @@ mod tests {
             model: "m".into(),
             temperature: 0.0,
             role: "chat".into(),
+            tools: "off".into(),
         };
         // 漏写 /v1 的云服务地址：补上
         assert_eq!(
@@ -1395,6 +2065,7 @@ mod tests {
             model: "m".into(),
             temperature: 0.0,
             role: "embed".into(),
+            tools: "off".into(),
         };
         assert_eq!(
             embeddings_endpoint(&p),

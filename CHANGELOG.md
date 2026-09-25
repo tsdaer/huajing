@@ -2,6 +2,44 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [Unreleased] · 增强计划 · 包 A 工具调用快通道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+
+> 主演模型能当轮自报持久变化：工具与剧情同报文、轮末确定性应用、效果是消息的
+> 衍生事件（编辑/重roll 重放自动正确），一切仍走事件流与收件箱，确定性执行不变。
+
+### Added · 包 A 工具调用快通道
+
+- **A1 底座**：`Provider` 增 `tools` 能力位（`"off"|"on"`，缺省 off）；`ChatMessage`
+  增 `tool_calls`；SSE 解析增 tool_call 增量累积（index 键、arguments 串接，跨 chunk
+  切开逐字节等价的钉子用例）；`StreamOutcome` 增 `tool_calls`；非流式 `chat_complete_auto`
+  同步支持。provider 对 tools 回 400 类错误 → 本次请求自动去 tools 重试一次 +
+  diag + 报告提示（仿 C3 降级棘轮）
+- **A1 工具面**：`toolcall.rs` 新模块——十件工具 schema 常量表（直写六 + 提案四，
+  紧凑中文描述 ≤1200 token）+ A1 契约注入段（纪律句：工具是旁注不是叙事、正文不得
+  描述工具使用）；预算表增 T 行（3%），记忆检查器预算账目可见
+- **A2 轮末应用**：落盘序固定为「消息事件（存原始 tool_calls）→ 工具直写应用
+  （trigger=tool）→ 时钟步进 → 主动心声消费 → on_message → 轮末求值」，生成与重放
+  （rebuild_from ②c）同一份应用器，重放一致性由单测钉死
+- **A3 直写档**：`psyche_feel` / `psyche_intent`（共用心理应用器，槽位 ≤3、气质衰减、
+  阈值接 M3.5 主动开口）/ `blackboard_set`（白名单四键）/ `memory_set` /
+  `schedule_say` / `ui_emit`（随报告转推前端）
+- **A4 提案档**：`propose_fact`（capture_grade 分级 + anchors 自动驳回，auto_minor
+  走 propose+accept 双事件并物化）/ `propose_entity` / `propose_relation`（悬空端点
+  确定性驳回）/ `propose_thread`（resurface 过窗口解析，坏窗口弃窗口保线体）；
+  提案 id 确定性（`<类>.<目标>.<轮>.m<调用序>`），重放撞上已有 id 保留正史不重落
+  （决断 3：人工确认不因改历史蒸发）
+- **A5 校验限额**：每轮上限（settings `tool_calls_per_turn`，缺省 6，超出全弃 +
+  汇总 diag）、单字符串 ≤2KB、嵌套 ≤8、未知工具静默弃 + diag、群聊作用域裁剪
+  （开线提案 actors 必须含自己）；坏参数不炸轮（七个坏调用夹好调用的钉子用例）
+- **A6 总结管线去重**：`apply_summary_outcome_locked` 入口对照本批轮次内 origin=model
+  的同目标同 facet 提案与工具 memory 同键写入，管线对应条目丢弃（diag 记一笔）；
+  反向不去重（安全网照旧全量起草）
+- **A7 外围**：卡可选 `tools = { allow/deny }` 策略字段（缺省全放行，作者只做减法）；
+  请求 schema 按卡策略过滤；检查器事件流显示工具计数标注与 verdict 日志；收件箱
+  来源徽标增「模型」；设置页按接入点工具开关 + 每轮上限输入
+- 设计文档同步：§4.2 预算表增 T 行、§3.1 实现态标注 + §3.1b 工具白名单表；
+  `cargo test` 477 例全绿（基线 428 + 新增 49）、`pnpm build` 双绿
+
 ## [Unreleased] · 全库审查加固清偿（[docs/plan/hardening.md](docs/plan/hardening.md)）
 
 > 2026-09-25 全库审查（4 个并行审查代理分区通读 + 高危项人工复核）的逐包清偿，

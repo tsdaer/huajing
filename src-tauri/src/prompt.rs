@@ -31,12 +31,14 @@ pub const WINDOW_MESSAGES: usize = 40;
 /// §4.2 默认预算分配（全部可配）：层 → 占输入预算的百分比。
 ///
 /// 输入预算 = 模型上下文 × 75%（输出预留另计，见 `Settings::input_budget`）。
-/// 逐层按 `input_tokens × pct / 100` **向下取整**，**C3 取剩余**（表内其余层合计 50%，
-/// 于是 C3 = 50%，正落在设计的 45–50%）。两个「组」的含义：
+/// 逐层按 `input_tokens × pct / 100` **向下取整**，**C3 取剩余**（表内其余层合计 53%，
+/// 于是 C3 = 47%，正落在设计的 45–50%）。三个「组」的含义：
 /// - `A`：A1 契约 + A2 人格 + A3 身份锚共享，按 A1→A2→A3 顺序分配（排最后的 A3 先被截断）；
+/// - `T`：工具旁注（增强 A1）：A1 契约区尾部的工具说明，独立 ≤3% 记账；
 /// - `B5`：内心一行 + hook 注入共享，按此顺序分配。
 pub const BUDGET_TABLE: &[(&str, usize)] = &[
     ("A", 8),
+    ("T", 3),
     ("B1", 2),
     ("B2", 3),
     ("B3", 12),
@@ -281,6 +283,10 @@ pub struct BuildInputs<'a> {
     pub summary: Option<&'a str>,
     /// 隔离模式的「只扮演 X」提示（M3.1 · 设计 §10.2；单角色为 None，A1 不变）
     pub cast_note: Option<&'a str>,
+    /// 工具旁注（增强 A1）：接入点开工具且卡策略放行了至少一件时给
+    /// [`crate::toolcall::contract_text`]，注入在 A1 契约区尾部（独立 T 层记账）；
+    /// None = 本轮不发工具（请求体同样不带 tools）
+    pub tools_contract: Option<&'a str>,
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
@@ -361,6 +367,24 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
             a_limit,
             content,
             cut.map(|t| cut_note("A", a_limit, t)),
+            Vec::new(),
+        );
+    }
+
+    // ---- 工具旁注（增强 A1）：A1 契约区尾部，独立 T 层（预算表 ≤3%）单独记账。
+    // None（接入点关工具或卡策略全禁）时整层省略，请求体也不带 tools。----
+    if let Some(contract) = inputs.tools_contract {
+        let t_limit = budget.limit("T");
+        let (content, cut) = fit_text(contract, t_limit);
+        head_parts.push(content.clone());
+        emit(
+            &mut layers,
+            &mut usage,
+            "T",
+            "工具旁注",
+            t_limit,
+            content,
+            cut.map(|t| cut_note("T", t_limit, t)),
             Vec::new(),
         );
     }
@@ -472,6 +496,7 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     b_messages.push(ChatMessage {
         role: "system".into(),
         content: b1,
+        tool_calls: None,
     });
 
     // B2 指令层（设计 §4.1：状态树 directive 根→叶，子覆盖父；「输出约束」的落点——
@@ -509,6 +534,7 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
             b_messages.push(ChatMessage {
                 role: "system".into(),
                 content: content.clone(),
+                tool_calls: None,
             });
         }
         emit(
@@ -530,6 +556,7 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
             b_messages.push(ChatMessage {
                 role: "system".into(),
                 content: b3.content.clone(),
+                tool_calls: None,
             });
         }
         emit(
@@ -550,6 +577,7 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
             b_messages.push(ChatMessage {
                 role: "system".into(),
                 content: b4.content.clone(),
+                tool_calls: None,
             });
         }
         emit(
@@ -573,6 +601,7 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
             b_messages.push(ChatMessage {
                 role: "system".into(),
                 content: text.clone(),
+                tool_calls: None,
             });
         }
         emit(
@@ -610,6 +639,7 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
             b_messages.push(ChatMessage {
                 role: normalize_role(&inj.role),
                 content: text,
+                tool_calls: None,
             });
         }
         if dropped > 0 {
@@ -640,12 +670,14 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
         messages.push(ChatMessage {
             role: "system".into(),
             content: head,
+            tool_calls: None,
         });
     }
     if !c1.is_empty() {
         messages.push(ChatMessage {
             role: "system".into(),
             content: c1,
+            tool_calls: None,
         });
     }
     messages.extend(window[n - keep..].iter().map(to_openai));
@@ -654,6 +686,7 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
         messages.push(ChatMessage {
             role: "user".into(),
             content: u.to_string(),
+            tool_calls: None,
         });
     }
 
@@ -1099,6 +1132,7 @@ fn to_openai(m: &Message) -> ChatMessage {
     ChatMessage {
         role: normalize_role(&m.role),
         content: m.content.clone(),
+        tool_calls: None,
     }
 }
 
@@ -1287,6 +1321,7 @@ mod tests {
             content: content.into(),
             ts: 0,
             scene_id: None,
+            tool_calls: None,
         }
     }
 
@@ -1302,6 +1337,7 @@ mod tests {
     ) -> BuildInputs<'a> {
         BuildInputs {
         cast_note: None,
+            tools_contract: None,
             settings,
             persona,
             card,
@@ -1351,7 +1387,45 @@ mod tests {
                     }],
                 },
             ],
+            tools: None,
         }
+    }
+
+    /// 增强 A1：工具契约的 T 层——开启时注入在 A1 契约区尾部、独立预算记账；
+    /// 关闭时整层省略（与现状逐字节一致）
+    #[test]
+    fn tools_contract_gets_its_own_budgeted_layer() {
+        let settings = Settings::default();
+        let card = sample_card();
+        let state = serde_json::json!({});
+        let bb = Blackboard::default_board();
+
+        let mut i = inputs(&settings, None, &card, &state, &bb, &[], &[], None);
+        i.tools_contract = Some("工具旁注（测试）");
+        let asm = build(&i);
+        let t = asm
+            .layers
+            .iter()
+            .find(|l| l.id == "T")
+            .expect("开启工具时应有 T 层");
+        assert!(t.content.contains("工具旁注（测试）"), "{}", t.content);
+        // 预算账目里可见（≤3% 一行）
+        let usage = asm
+            .budget
+            .as_ref()
+            .and_then(|b| b.layers.iter().find(|u| u.id == "T"))
+            .expect("T 层要进预算总账");
+        assert!(usage.limit > 0);
+        // 注入位置：head（system 首条）里 T 在契约之后
+        let head = &asm.messages[0];
+        assert_eq!(head.role, "system");
+        assert!(head.content.contains("工具旁注（测试）"));
+
+        let asm2 = build(&inputs(&settings, None, &card, &state, &bb, &[], &[], None));
+        assert!(
+            asm2.layers.iter().all(|l| l.id != "T"),
+            "关工具时 T 层整层省略"
+        );
     }
 
     #[test]
@@ -1623,6 +1697,8 @@ mod tests {
         let b = Budget::from_input(32768);
         assert_eq!(b.input_tokens, 32768);
         assert_eq!(b.limit("A"), 2621); // 8%
+        assert_eq!(b.limit("A"), 2621); // 8%
+        assert_eq!(b.limit("T"), 983); // 3%（增强 A1：工具旁注）
         assert_eq!(b.limit("B1"), 655); // 2%
         assert_eq!(b.limit("B2"), 983); // 3%
         assert_eq!(b.limit("B3"), 3932); // 12%
@@ -1630,7 +1706,7 @@ mod tests {
         assert_eq!(b.limit("B5"), 655); // 2%
         assert_eq!(b.limit("C1"), 3276); // 10%
         assert_eq!(b.limit("C2"), 1638); // 5%
-        assert_eq!(b.limit("C3"), 16387, "C3 取剩余 ≈ 50%");
+        assert_eq!(b.limit("C3"), 15404, "C3 取剩余 ≈ 47%");
         assert_eq!(b.layers.values().sum::<usize>(), 32768, "各层上限可加总");
         assert!(b.limit("C3") * 100 >= b.input_tokens * 45, "C3 ≥ 45%");
         // C3 = 50% 的余量 + 各层向下取整的零头（每层最多丢 1 token）

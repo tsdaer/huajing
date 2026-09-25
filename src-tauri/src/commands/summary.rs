@@ -203,6 +203,41 @@ fn apply_parked_summary(
     Ok(())
 }
 
+/// 模型工具通道在本批轮次范围内的落点（A6 去重对照表）：
+/// (实体目标, facet) 提案集合 + L3 事实键集合。只认 origin=model 的提案与
+/// trigger="tool" 的效果——总结管线自己的产物不会被误认成模型写入。
+fn model_tool_footprint(
+    records: &[LogRecord],
+    from_turn: u64,
+    to_turn: u64,
+) -> (std::collections::HashSet<(String, String)>, std::collections::HashSet<String>) {
+    let mut fact_targets = std::collections::HashSet::new();
+    let mut memory_keys = std::collections::HashSet::new();
+    for r in records {
+        if r.turn() < from_turn || r.turn() > to_turn {
+            continue;
+        }
+        match &r.body {
+            LogBody::Proposal(p) if p.origin == "model" && p.op != "reject" => {
+                let Some(payload) = &p.payload else { continue };
+                let Some(target) = payload.get("target").and_then(|t| t.as_str()) else {
+                    continue;
+                };
+                if let Some(facet) = payload.get("value").and_then(|v| v.get("facet")).and_then(|f| f.as_str()) {
+                    fact_targets.insert((target.to_string(), facet.to_string()));
+                }
+            }
+            LogBody::Effect(e) if e.trigger == "tool" => {
+                for kv in &e.memory {
+                    memory_keys.insert(kv.key.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    (fact_targets, memory_keys)
+}
+
 /// 故事时间前缀表（加固 D8 · M3.0 ⑤）：从事件流一次遍历折出「黑板事件按轮」的
 /// 故事时刻，之后按轮二分查询。批次总结的情景记忆盖**事发时刻**的章——原实现
 /// 每条记忆都全量扫一遍事件流（O(n×k)），一批 10–30 条的长会话是实打实的平方级。
@@ -324,7 +359,13 @@ fn apply_summary_outcome_locked(
     // D1-1：整批产物收拢进一个 batch，末尾一次 commit_batch（一次投影 + 一次派生同步）
     let mut bodies: Vec<LogBody> = Vec::new();
     // D8：故事时间前缀表——一次遍历，之后每条记忆 O(log n) 查询
-    let timeline = StoryTimeline::build(&log.read(root, &meta.id).map_err(|e| e.to_string())?);
+    let records = log.read(root, &meta.id).map_err(|e| e.to_string())?;
+    let timeline = StoryTimeline::build(&records);
+    // A6：与模型工具通道去重（决断 6「管线是安全网，不是被替换者」——只去重模型
+    // 已写的，管线的起草照旧全量跑）。本批轮次范围内已有 origin=model 的同目标
+    // 同 facet 提案 / 工具 memory 同键写入 → 管线对应条目丢弃（diag 记一笔）
+    let (model_fact_targets, model_memory_keys) =
+        model_tool_footprint(&records, from_turn, to_turn);
 
     if !outcome.summary_delta.trim().is_empty() {
         bodies.push(
@@ -474,6 +515,14 @@ fn apply_summary_outcome_locked(
     let fact_base =
         base + outcome.episodes.len() + outcome.hearsays.iter().map(|h| h.listeners.len()).sum::<usize>();
     for (i, fact) in outcome.facts.iter().enumerate() {
+        // A6：模型工具当轮已写同键事实 → 管线条目丢弃
+        if model_memory_keys.contains(&fact.key) {
+            crate::diag::record(
+                "summary",
+                format!("模型工具已写事实「{}」，管线同键条目丢弃（安全网去重）", fact.key),
+            );
+            continue;
+        }
         let mut obj = palace::MemObject {
             id: palace::next_id(fact_base + i + 1),
             kind: palace::KIND_FACT.to_string(),
@@ -550,6 +599,21 @@ fn apply_summary_outcome_locked(
         .unwrap_or(false);
     let world = session_world(meta);
     for (i, draft) in codex_drafts.iter().enumerate() {
+        // A6：模型工具当轮已提案同目标同 facet → 管线条目丢弃（安全网不重复入箱）
+        if draft.kind == summarize::CODEX_NEW_FACT || draft.kind == summarize::CODEX_FACT_CHANGE {
+            if let Some(facet) = draft.value.get("facet").and_then(|f| f.as_str()) {
+                if model_fact_targets.contains(&(draft.target.clone(), facet.to_string())) {
+                    crate::diag::record(
+                        "summary",
+                        format!(
+                            "模型工具已提案 {} 的 {facet}，管线同目标条目丢弃（安全网去重）",
+                            draft.target
+                        ),
+                    );
+                    continue;
+                }
+            }
+        }
         let payload = serde_json::json!({
             "target": draft.target,
             "value": draft.value,
@@ -774,6 +838,7 @@ async fn run_summary(
         &[llm::ChatMessage {
             role: "user".into(),
             content: prompt_text,
+            tool_calls: None,
         }],
         // 推理型模型的思考 token 计入 max_tokens：给太小会「正文为空、全部耗在思考上」
         //（真机压测 2026-09-20：deepseek-flash 在 1600 下稳定返回空正文）。六类产物

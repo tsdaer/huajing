@@ -68,13 +68,15 @@ export function proposalOrigin(origin: string | undefined): string {
   if (origin === "improv") return "暂定";
   if (origin === "complete") return "补全";
   if (origin === "manual") return "手动";
+  if (origin === "model") return "模型";
   return "管线";
 }
 
-/** 提案来源的徽标配色：即兴暂定最显眼（要人确认） */
+/** 提案来源的徽标配色：即兴暂定最显眼（要人确认），模型工具次之 */
 export function originClass(origin: string | undefined): string {
   if (origin === "improv") return "badge-soft badge-warning";
   if (origin === "complete") return "badge-soft badge-info";
+  if (origin === "model") return "badge-soft badge-success";
   return "badge-ghost";
 }
 

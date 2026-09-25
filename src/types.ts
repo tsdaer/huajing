@@ -9,6 +9,8 @@ export interface Provider {
   temperature: number;
   /** chat 主对话 / util 总结捕获（便宜档） */
   role: string;
+  /** 工具调用能力位（增强 A1）："off" | "on"，缺省 off */
+  tools: string;
 }
 
 /** 应用信息（commands.rs · app_info）：buildTs 为编译时刻（unix 秒，界面用它判断构建新旧） */
@@ -63,6 +65,8 @@ export interface Settings {
   proxy?: string | null;
   /** 运行期自动接受既有实体的小事实（M3.8 · §6.8-2 分级；缺省关 = 进收件箱人工） */
   auto_accept_minor_facts?: boolean;
+  /** 每轮工具调用上限（增强 A5，缺省 6） */
+  tool_calls_per_turn?: number | null;
 }
 
 /** 用户人格（personas/*.json） */

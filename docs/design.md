@@ -151,6 +151,28 @@ hooks 与状态树的分工：**hooks 是"反应"**（对单条消息的即时�
 
 生命周期钩子：`on_load`（会话载入/角色入席）、`on_context`（每次请求前）、`on_message`（每条消息后）。
 
+**实现态（增强计划 · 包 A 时点）**：已实现——`api.memory` / `api.blackboard` / `api.schedule_say` / `api.ui.emit` / `api.random` / `api.dice` / `ctx.inject` / `ctx.window`；`api.psyche.feel` / `api.psyche.boost_intent` 的宿主侧心理应用器已落地（模型工具与总结管线共用，包 C 将其注册进沙箱）；`api.palace.recall` / `api.codex.get` / `api.codex.known` / `api.threads.*` / `api.trigger_event` 尚未注册（包 C 清偿）。
+
+### 3.1b 主演模型的工具白名单（增强 A：工具是结构化自报，不是新特权）
+
+直写档全过 hook 增量同款校验（黑板白名单、字符串 ≤2KB、嵌套 ≤8、槽位封顶）；
+提案档复用收件箱链路（分级 + anchors 驳回）。与正文同报文（捆绑式、轮末生效），
+效果是消息的衍生事件（原始调用存档进消息体，编辑/重roll 后重放自动正确）。
+每轮上限可配（缺省 6），卡可声明 `tools = { deny = {…} }` 做减法。
+
+| 工具 | 档位 | 语义 |
+|---|---|---|
+| `psyche_feel(name, intensity, source)` | 直写 | 情绪事件；共用心理应用器（槽位 ≤3、气质衰减、阈值 → 主动开口） |
+| `psyche_intent(goal, delta)` | 直写 | 意图新建/增减 |
+| `blackboard_set(key, value)` | 直写 | 黑板公开字段（key ∈ day/clock/place/actors） |
+| `memory_set(key, value)` | 直写 | L3 事实键值（同 `api.memory.set` 语义） |
+| `schedule_say(text)` | 直写 | 下轮主动开口（心里话队列） |
+| `ui_emit(kind, value)` | 直写 | 界面事件（表情等），轮末生效 |
+| `propose_fact(target, facet, value, reason)` | 提案 | 既有实体事实 → 收件箱（分级 + anchors 驳回） |
+| `propose_entity(type, name, skeleton, reason)` | 提案 | 全新实体 → 收件箱人工 |
+| `propose_relation(from, to, kind, note, reason)` | 提案 | 新关系 → 收件箱（悬空端点确定性驳回） |
+| `propose_thread(title, cause, actors, …)` | 提案 | 开线提案 + 时机起草（坏窗口弃窗口保线体） |
+
 ### 3.2 沙箱安全（卡片是社区内容，必须当不可信代码）
 
 - 运行环境剥离 `os` / `io` / `require` / `ffi` / `debug`（宿主保留 debug.sethook 用于计费）；
@@ -205,6 +227,7 @@ C3 最近消息窗口（占预算大头；裁剪时优先在场景边界断开�
 | 层 | 默认占比 | 硬性规则 |
 |---|---|---|
 | A 契约+人格+身份锚 | ~8% | — |
+| T 工具旁注（增强 A） | ~3% | 接入点开工具且卡策略放行至少一件时注入；关闭整层省略 |
 | B1 现状卡 | ~2% | **无条件保底**，任何裁剪不得动它 |
 | B2 directive | ~3% | — |
 | B3 实体卡 | ~12% | 超限先降级（卡片→1 行）再裁撤 |

@@ -21,6 +21,7 @@ use crate::semantic;
 use crate::statetree;
 use crate::summarize;
 use crate::threads;
+use crate::toolcall;
 use crate::llm::{self, Provider, StreamEvent};
 use crate::prompt;
 use crate::store::{self, Message, NewSessionRequest, Settings};
@@ -200,6 +201,7 @@ pub fn new_session(
                     ts: store::unix_now(),
                     scene_id: Some(scene::DEFAULT_SCENE_ID.into()),
                     name: Some(display_name_of(&loaded)),
+                    tool_calls: None,
                 };
                 let _ = log.append(&root, &meta.id, LogBody::Message(opening));
             }
@@ -819,6 +821,15 @@ fn rebuild_from(
     // 各角色的状态树只解析一次（轮末求值与手动收线的补求值共用）
     let trees: Vec<Option<std::sync::Arc<statetree::StateTree>>> =
         cast.members.iter().map(|m| load_tree(&m.loaded, None)).collect();
+    // 工具提案的幂等集（增强 A·决断 3）：提案事件不是派生事件、重放保留，
+    // 重跑应用器时撞上已有 id 即跳过——「人工确认不因改历史蒸发」由此兑现
+    let tool_proposal_ids: std::collections::BTreeSet<String> = records
+        .iter()
+        .filter_map(|r| match &r.body {
+            LogBody::Proposal(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .collect();
     if !genesis {
         // 老会话补 genesis：初始黑板取当前文件里的那份（M1 没留下更早的黑板）
         let board = blackboard_of(&project(records, root, meta));
@@ -947,6 +958,35 @@ fn rebuild_from(
         // ② 消息本身
         out.push(rec.clone());
         event::fold(&mut proj, rec);
+        // ②c 模型工具调用（增强 A·决断 3）：效果是消息的衍生事件——重放按
+        //    tool_calls + 同一份应用器重推导（与生成路径同一落盘序：工具 → 时钟步进
+        //    → 消费 → on_message）。提案撞上已有 id 不重落（保留物化正史）；
+        //    grown.json 的物化不重跑（accept 事件保留、文件幂等）
+        if msg.role == "char" {
+            if let Some(calls) = msg.tool_calls.as_ref().filter(|c| !c.is_empty()) {
+                if let Ok(member) = cast.resolve(msg.name.as_deref()) {
+                    let state = current_state(&proj, &member.dir, &member.loaded);
+                    let app = apply_model_tools_core(
+                        root,
+                        meta,
+                        &member.loaded,
+                        &member.dir,
+                        &cast.display_name(&member.dir),
+                        msg.turn,
+                        calls,
+                        msg_scene.as_deref(),
+                        state,
+                        cast.is_multi(),
+                        &tool_proposal_ids,
+                    );
+                    for body in app.bodies {
+                        let rec = LogRecord::new(0, body);
+                        event::fold(&mut proj, &rec);
+                        out.push(rec);
+                    }
+                }
+            }
+        }
         // ③ 角色回复：时钟步进（设计 M1：每轮 +10 分钟，跨日进位）——推进的是
         //    这条消息所在场景的局部时钟（世界层镜像由投影折叠同步）
         if msg.role == "char" && genesis {
@@ -2305,6 +2345,9 @@ fn assemble_prompt_core(
     };
 
     let summary_text = proj.summary_for(scene);
+    // 工具旁注（增强 A1）：chat 档接入点开工具、且卡策略放行了至少一件 → 注入契约段
+    //（T 层，A1 契约区尾部）。组装是读路径，这里顺手读 providers.toml（小文件）。
+    let tools_contract = tools_contract_for(root, &loaded.card);
     // B2「设定·暂定」（M3.8 · 设计 §6.8-4）：本轮落流的 improv 提案回读进注入。
     // 注入内容从投影取（不重调模型）——重放/重建时同一提案事件还在，同一行还在，
     // 这正是「重放语义不随模型漂移」的兑现形式。
@@ -2343,6 +2386,7 @@ fn assemble_prompt_core(
         // 摘要分卷（M3.2 · 设计 §10.4）：世界层大事记 + 本场景分卷；别的场景不进这次请求
         summary: summary_text.as_deref(),
         cast_note: cast_note.as_deref(),
+        tools_contract: tools_contract.as_deref(),
         history,
         user_content,
     };
@@ -2380,6 +2424,23 @@ fn pick_chat_provider(root: &std::path::Path) -> Result<Provider, String> {
         .into_iter()
         .find(|p| p.role == "chat")
         .ok_or_else(|| "未配置 chat 档接入点，请先到设置页添加".to_string())
+}
+
+/// 工具旁注的注入判据（增强 A1）：chat 档接入点开工具 && 卡策略放行至少一件。
+/// 关工具的接入点组装结果与现状逐字节一致（T 层整层省略）。
+fn tools_contract_for(root: &std::path::Path, card: &card::Card) -> Option<String> {
+    let provider = store::load_providers(root)
+        .ok()?
+        .into_iter()
+        .find(|p| p.role == "chat")?;
+    if !provider.tools_enabled() {
+        return None;
+    }
+    let permitted = |name: &str| card.tools.as_ref().map(|p| p.permits(name)).unwrap_or(true);
+    toolcall::TOOL_DEFS
+        .iter()
+        .any(|d| permitted(d.name))
+        .then(|| toolcall::contract_text())
 }
 
 /// 取会话的中断标记；同会话已有进行中的生成时返回并发错误事件
@@ -2492,9 +2553,21 @@ async fn stream_reply(
     // 流式补全（取消检查在每个响应块之间）。代理跟随设置页：空则自动探测。
     let proxy = proxy_of(root);
     let chat = assembly.messages.clone();
-    // C3：带空正文棘轮——推理模型把服务端默认预算耗在思考上时（finish=length、
-    // 正文空），自动带翻倍预算重试；C2：失败时已生成的增量在 failure.partial 里
-    let stream = llm::chat_stream_ratcheted(provider, &chat, |delta| {
+    // 增强 A1：接入点开了工具 → 请求带 schema（卡策略只做减法），provider 不支持时
+    // 自动降级去工具重试（棘轮在 llm 层）；关工具的接入点与现状完全同路。
+    // C3 空正文棘轮 / C2 失败保部分文本：chat_stream_auto 内部同路生效
+    let tools: Option<Vec<serde_json::Value>> = if provider.tools_enabled() {
+        let policy = cast.get(speaker).and_then(|m| m.loaded.card.tools.as_ref());
+        let schemas: Vec<serde_json::Value> = toolcall::TOOL_DEFS
+            .iter()
+            .filter(|d| policy.map(|p| p.permits(d.name)).unwrap_or(true))
+            .map(toolcall::schema_of)
+            .collect();
+        (!schemas.is_empty()).then_some(schemas)
+    } else {
+        None
+    };
+    let stream = llm::chat_stream_auto(provider, &chat, tools.as_deref(), |delta| {
         let _ = on_event.send(StreamEvent::Delta {
             text: delta.to_string(),
             name: Some(speaker_name.clone()),
@@ -2513,8 +2586,14 @@ async fn stream_reply(
             // 有用户消息那一步的报告打底：即使本轮没生成回复（失败/中断为空），
             // 前端也能看到卡对用户输入的反应
             let mut report = Some(user_report);
+            if outcome.tools_fallback {
+                // A1 降级已发生（llm 层记过 diag）：界面提示走报告日志
+                if let Some(r) = report.as_mut() {
+                    r.logs.push("该接入点不支持工具调用，本轮已自动降级为纯文本（可在设置页关闭此接入点的工具开关）".to_string());
+                }
+            }
             if !outcome.text.is_empty() {
-                // 回复落定后的收尾与单测共用同一份代码：回复事件 → 时钟步进 → on_message
+                // 回复落定后的收尾与单测共用同一份代码：回复事件 → 工具应用 → 时钟步进 → on_message
                 let committed = if finalize {
                     commit_reply(
                         root,
@@ -2523,6 +2602,7 @@ async fn stream_reply(
                         speaker,
                         turn,
                         &outcome.text,
+                        &outcome.tool_calls,
                         Some(&ui_sink(app)),
                         log,
                         runtime,
@@ -2538,6 +2618,7 @@ async fn stream_reply(
                         speaker,
                         turn,
                         &outcome.text,
+                        &outcome.tool_calls,
                         Some(&ui_sink(app)),
                         log,
                         scene,
@@ -2571,6 +2652,7 @@ async fn stream_reply(
                 message: failure.message,
             });
             let user_report = Some(user_report);
+            // 流中途失败：tool_calls 增量不完整（参数多半解析不出），不随部分文本应用
             let committed = if finalize {
                 commit_reply(
                     root,
@@ -2579,6 +2661,7 @@ async fn stream_reply(
                     speaker,
                     turn,
                     &failure.partial,
+                    &[],
                     Some(&ui_sink(app)),
                     log,
                     runtime,
@@ -2594,6 +2677,7 @@ async fn stream_reply(
                     speaker,
                     turn,
                     &failure.partial,
+                    &[],
                     Some(&ui_sink(app)),
                     log,
                     scene,
@@ -2988,8 +3072,10 @@ fn consume_proactive_say(
 }
 
 /// 回复落定后的收尾（stream_reply 与单测共用同一份代码，避免两处等价逻辑）：
-/// 回复事件（带发言人署名与场景归属）→ 时钟步进事件（发言人所在场景的局部时钟）→
-/// 主动心声消费（M3.5，[consume_proactive_say]）→ on_message 事件（本场景在场成员）。
+/// 回复事件（带发言人署名、场景归属与**原始 tool_calls 存档**）→ 工具直写应用（增强
+/// A2：origin 语义由 trigger="tool" 表达，事件顺序固定在消息之后、时钟步进之前）→
+/// 时钟步进事件（发言人所在场景的局部时钟）→ 主动心声消费（M3.5，[consume_proactive_say]）
+/// → on_message 事件（本场景在场成员）。
 /// 只做「这一条回复」的事；轮末推进（心理/状态树/总结）在 [finalize_turn]，
 /// 群聊一轮多人发言时它只跑一次。`scene` = 本轮所在场景（M3.2）。
 #[allow(clippy::too_many_arguments)]
@@ -3000,6 +3086,7 @@ fn commit_reply_core(
     speaker: &str,
     turn: u64,
     text: &str,
+    tool_calls: &[llm::ToolCall],
     sink: Option<&card::UiSink>,
     log: &store::EventLog,
     scene: Option<&str>,
@@ -3011,14 +3098,66 @@ fn commit_reply_core(
         ts: store::unix_now(),
         scene_id: scene.map(str::to_string),
         name: Some(cast.display_name(speaker)),
+        // 原始调用存档（决断 3）：效果由重放按 tool_calls 重推导
+        tool_calls: (!tool_calls.is_empty()).then(|| tool_calls.to_vec()),
     };
     log.append(root, &meta.id, LogBody::Message(reply))
         .map_err(|e| format!("回复落盘失败：{e}"))?;
 
+    // 工具段的产出先落地（最后并入总报告——发言人不在场时也要回给前端）
+    let mut tool_logs: Vec<String> = Vec::new();
+    let mut tool_ui: Vec<llm::UiEmit> = Vec::new();
+    // 消息已落盘的投影（工具应用与后续时钟步进同用一份现场；
+    // 工具效果折进这份投影——工具改的黑板/心理对同一轮的后续求值立即可见）
+    let mut proj = project_session(log, root, meta)?;
+
+    // 工具直写/提案应用（A2 落盘序：消息事件 → 工具效果 → 时钟步进 → 消费 → on_message）
+    if !tool_calls.is_empty() {
+        if let Some(member) = cast.get(speaker) {
+            let state = current_state(&proj, speaker, &member.loaded);
+            let existing = std::collections::BTreeSet::new();
+            let app = apply_model_tools_core(
+                root,
+                meta,
+                &member.loaded,
+                speaker,
+                &cast.display_name(speaker),
+                turn,
+                tool_calls,
+                scene,
+                state,
+                cast.is_multi(),
+                &existing,
+            );
+            for body in &app.bodies {
+                // 工具效果折进现场投影（make_mut：无共享时零拷贝；本分支只在带工具的
+                // 回复进入——无工具轮沿用缓存 Arc，不多拷一份）
+                let rec = LogRecord::new(0, body.clone());
+                event::fold(std::sync::Arc::make_mut(&mut proj), &rec);
+            }
+            if !app.bodies.is_empty() {
+                if let Err(e) = commit_batch(log, root, meta, app.bodies.clone()) {
+                    tool_logs.push(e);
+                }
+            }
+            // 小事实自动接受（生成路径）：物化与手动确认同一条路
+            if !app.auto_accepts.is_empty() {
+                let world = session_world(meta);
+                for (kind, payload) in &app.auto_accepts {
+                    materialize_accepted(root, &world, kind, payload.clone());
+                }
+            }
+            // 界面事件（ui_emit）转推前端；verdict 进日志（检查器/面板可见）
+            tool_ui.extend(app.ui_events);
+            for v in &app.verdicts {
+                tool_logs.push(format!("工具 {}〔{}〕{}", v.name, v.verdict, v.reason));
+            }
+        }
+    }
+
     // 一轮完成：黑板时钟步进（设计 M1：每轮 +10 分钟，跨日进位）。
     // 多场景会话推进的是**本场景的局部时钟**（场景分区快照 + 世界层镜像由折叠同步）；
     // 单场景/老会话照旧是世界层事件（scene_id = None）。
-    let proj = project_session(log, root, meta)?;
     let scene_id = scoped_scene(&proj, scene);
     let mut board = proj.effective_board(scene);
     let (day, clock) = prompt::advance_clock(board.day, &board.clock);
@@ -3058,9 +3197,12 @@ fn commit_reply_core(
             other_logs.extend(r.logs);
         }
     }
-    // 发言人不在场（场景变动后的边缘）：空报告 = 钩子不跑，不 panic
+    // 发言人不在场（场景变动后的边缘）：空报告 = 钩子不跑，不 panic；
+    // 工具段的日志/界面事件无论钩子跑没跑都要回给前端
     let mut report = report.unwrap_or_default();
     report.logs.extend(other_logs);
+    report.logs.extend(std::mem::take(&mut tool_logs));
+    report.ui_events.extend(std::mem::take(&mut tool_ui));
     Ok(report)
 }
 
@@ -3185,6 +3327,7 @@ fn commit_reply(
     speaker: &str,
     turn: u64,
     text: &str,
+    tool_calls: &[llm::ToolCall],
     sink: Option<&card::UiSink>,
     log: &store::EventLog,
     runtime: Option<&SessionRuntime>,
@@ -3192,7 +3335,9 @@ fn commit_reply(
     summary_flags: Option<&SummaryFlags>,
     scene: Option<&str>,
 ) -> Result<llm::HookReport, String> {
-    let mut report = commit_reply_core(root, meta, cast, speaker, turn, text, sink, log, scene)?;
+    let mut report = commit_reply_core(
+        root, meta, cast, speaker, turn, text, tool_calls, sink, log, scene,
+    )?;
     finalize_turn(
         root,
         meta,
@@ -3206,6 +3351,54 @@ fn commit_reply(
         &mut report,
     )?;
     Ok(report)
+}
+
+/// 工具调用的应用核心（生成与重放共用，增强 A2/A5）：构建现场 → 应用器产出事件。
+/// `existing` = 已在流里的提案 id 集（重放传流内集合实现幂等；生成传空集）。
+#[allow(clippy::too_many_arguments)]
+fn apply_model_tools_core(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    loaded: &card::LoadedCard,
+    speaker: &str,
+    display_name: &str,
+    turn: u64,
+    tool_calls: &[llm::ToolCall],
+    scene: Option<&str>,
+    state: serde_json::Value,
+    multi_cast: bool,
+    existing: &std::collections::BTreeSet<String>,
+) -> toolcall::ToolApplication {
+    let settings = store::load_settings(root).unwrap_or_default();
+    let policy = loaded.card.tools.clone().unwrap_or_default();
+    let cx = load_codex(root, None, &session_world(meta));
+    let limit = settings
+        .tool_calls_per_turn
+        .filter(|n| *n > 0)
+        .unwrap_or(toolcall::DEFAULT_PER_TURN);
+    crate::diag::record(
+        "tools",
+        format!(
+            "第 {turn} 轮 {speaker}：{} 次工具调用（上限 {limit}，卡策略 {}）",
+            tool_calls.len(),
+            if loaded.card.tools.is_some() { "已声明" } else { "缺省全放行" },
+        ),
+    );
+    let ctx = toolcall::ToolCtx {
+        character: speaker,
+        display_name,
+        turn,
+        scene,
+        state,
+        multi_cast,
+        policy: &policy,
+        limit,
+        cx: &cx,
+        auto_minor: settings.auto_accept_minor_facts,
+        existing_proposals: existing,
+        ts: store::unix_now(),
+    };
+    toolcall::apply_tool_calls(tool_calls, &ctx)
 }
 
 /// 把钩子推来的界面事件转推前端（用户消息一步与回复一步共用）
@@ -3591,6 +3784,7 @@ async fn send_message_inner(
         ts: store::unix_now(),
         scene_id: scene.clone(),
         name: None,
+        tool_calls: None,
     };
     log.append(&root, &session_id, LogBody::Message(user_msg))
         .map_err(|e| e.to_string())?;
@@ -4009,6 +4203,7 @@ async fn maybe_improv(
         &[llm::ChatMessage {
             role: "user".into(),
             content: prompt_text,
+            tool_calls: None,
         }],
         1024,
         0.6,
@@ -4116,6 +4311,7 @@ pub async fn codex_complete(
         &[llm::ChatMessage {
             role: "user".into(),
             content: prompt_text,
+            tool_calls: None,
         }],
         4096,
         0.4,
@@ -4199,6 +4395,7 @@ pub async fn codex_semantic_check(
         &[llm::ChatMessage {
             role: "user".into(),
             content: prompt_text,
+            tool_calls: None,
         }],
         1024,
         0.2,
@@ -4657,7 +4854,12 @@ fn timeline_brief(record: &event::LogRecord) -> String {
                 "char" => "角色",
                 _ => m.role.as_str(),
             };
-            format!("{who}：{}", clip(&m.content, 60))
+            // 增强 A7：带工具调用的消息在事件流里可见（数量标注；逐条裁决看 effect/提案行）
+            let tools = match m.tool_calls.as_deref().map(|c| c.len()) {
+                Some(n) if n > 0 => format!("〔工具×{n}〕"),
+                _ => String::new(),
+            };
+            format!("{who}{tools}：{}", clip(&m.content, 60))
         }
         LogBody::Effect(e) => {
             let mut parts: Vec<String> = Vec::new();
@@ -5421,6 +5623,7 @@ return {
                     content: first,
                     ts: store::unix_now(),
                     scene_id: None,
+                    tool_calls: None,
                 }),
             )
             .unwrap();
@@ -5462,7 +5665,9 @@ return {
             content: content.into(),
             ts: store::unix_now(),
             scene_id: None,
+        tool_calls: None,
         }
+            
     }
 
     fn stored_state(root: &std::path::Path, meta: &store::SessionMeta) -> serde_json::Value {
@@ -5513,7 +5718,7 @@ return {
             .unwrap();
         let after_user = run_message_hook_core(root, meta, loaded, &speaker, turn, None, log);
         let after_reply = commit_reply(
-            root, meta, &cast, &speaker, turn, "（回复）", None, log, None, None, None, None,
+            root, meta, &cast, &speaker, turn, "（回复）", &[], None, log, None, None, None, None,
         )
         .unwrap();
 
@@ -5704,10 +5909,96 @@ return {
         let member = cast.get(speaker).unwrap();
         run_message_hook_core(root, meta, &member.loaded, speaker, turn, None, log);
         commit_reply(
-            root, meta, cast, speaker, turn, "（回复）", None, log, None, None, None, None,
+            root, meta, cast, speaker, turn, "（回复）", &[], None, log, None, None, None, None,
         )
         .unwrap();
         run.assembly
+    }
+
+    /// 增强 A DoD：带 tool_calls 的回复——直写当轮生效、提案当轮进收件箱；
+    /// 编辑该消息（内容改写）后重放，投影与首次一致（决断 3：效果是消息的衍生事件），
+    /// 已入箱的提案保留正史、不重复落事件。
+    #[test]
+    fn model_tool_calls_replay_identically_after_edit() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let log = store::EventLog::new();
+        let cast = Cast::load(&root, &meta).unwrap();
+        let speaker = cast.first().dir.clone();
+        let calls = vec![
+            llm::ToolCall {
+                id: "c1".into(),
+                name: "psyche_feel".into(),
+                arguments: serde_json::json!({"name": "欣慰", "intensity": 0.8, "source": "被道谢"}),
+            },
+            llm::ToolCall {
+                id: "c2".into(),
+                name: "propose_fact".into(),
+                arguments: serde_json::json!({"target": "char.小雨", "facet": "habit", "value": "道谢时会低头", "reason": "第 1 轮演出细节"}),
+            },
+        ];
+        // commit_reply = 回复级落盘 + 轮末推进（心理 tick / 状态树）：重放路径的 ⑤
+        // 同样会重推 tick，两端必须同口径，否则重放一致性无从谈起
+        let report = commit_reply(
+            &root, &meta, &cast, &speaker, 1, "（回复）", &calls, None, &log, None, None, None, None,
+        )
+        .unwrap();
+        // 直写档证据：心理槽位与聚合效果
+        assert!(
+            report.logs.iter().any(|l| l.contains("工具 psyche_feel〔applied〕")),
+            "verdict 要进报告：{:?}",
+            report.logs
+        );
+        let records = log.read(&root, &meta.id).unwrap();
+        let before = event::project_over(&records, &event::Base::default());
+        let state1 = before.state_of(&speaker).unwrap();
+        let affects1 = state1["psyche"]["affects"].as_array().unwrap().clone();
+        assert!(
+            affects1.iter().any(|a| a["name"] == "欣慰"),
+            "psyche_feel 当轮生效：{state1}"
+        );
+        // 提案档证据：origin=model 一条，payload 完整
+        let proposals1: Vec<_> = records
+            .iter()
+            .filter_map(|r| match &r.body {
+                LogBody::Proposal(p) if p.origin == "model" => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(proposals1.len(), 1, "propose_fact 落一条提案事件");
+        assert_eq!(proposals1[0].id, "codex.char.小雨.1.m1");
+        // 消息体存档原始 tool_calls
+        let reply = records
+            .iter()
+            .filter_map(|r| r.as_message())
+            .find(|m| m.role == "char" && m.turn == 1)
+            .unwrap();
+        assert_eq!(
+            reply.tool_calls.as_ref().map(|c| c.len()),
+            Some(2),
+            "原始调用随消息存档（决断 3）"
+        );
+
+        // 「编辑」：同一条流重建（rebuild_from 自会丢弃派生事件、重跑工具与钩子）
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &records, 1).unwrap();
+        let after = event::project_over(&rebuilt, &event::Base::default());
+        assert_eq!(
+            before.state_of(&speaker),
+            after.state_of(&speaker),
+            "重放后的 state 与首次一致"
+        );
+        let affects2 = after.state_of(&speaker).unwrap()["psyche"]["affects"]
+            .as_array()
+            .unwrap();
+        assert_eq!(&affects1, affects2);
+        // 提案不重复：仍只有一条 origin=model（撞 id 跳过，保留正史）
+        let proposals2: Vec<_> = rebuilt
+            .iter()
+            .filter_map(|r| match &r.body {
+                LogBody::Proposal(p) if p.origin == "model" => Some(p.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(proposals2, vec!["codex.char.小雨.1.m1".to_string()]);
     }
 
     #[test]
@@ -5881,7 +6172,7 @@ return {
         .unwrap();
         run_message_hook_core(&root, &meta, &loaded, &speaker, turn, None, &log);
         commit_reply(
-            &root, &meta, &cast, &speaker, turn, "（重roll 的回复）", None, &log, None, None, None, None,
+            &root, &meta, &cast, &speaker, turn, "（重roll 的回复）", &[], None, &log, None, None, None, None,
         )
         .unwrap();
 
@@ -6112,7 +6403,9 @@ return {
             content: content.into(),
             ts: 0,
             scene_id: None,
-        };
+        tool_calls: None,
+        }
+            ;
         let ch = |turn, content: &str| Message {
         name: None,
             turn,
@@ -6120,7 +6413,9 @@ return {
             content: content.into(),
             ts: 0,
             scene_id: None,
-        };
+        tool_calls: None,
+        }
+            ;
 
         // 完整一轮：重roll 去掉末尾回复，组装历史不含本轮用户消息（trim=1，content 随请求走）
         let full = vec![ch(0, "开场"), user(1, "你好"), ch(1, "……嗯")];
@@ -7028,7 +7323,9 @@ return {
                     content: format!("回复{turn}"),
                     ts: 0,
                     scene_id: None,
-                }),
+                tool_calls: None,
+                }
+                    ),
             )
             .unwrap();
         }
@@ -8422,6 +8719,7 @@ return {
                 ts: 1,
                 scene_id: Some("scene.b".into()),
                 name: None,
+                tool_calls: None,
             }),
         )
         .unwrap();
@@ -8513,7 +8811,7 @@ return {
         msg.scene_id = scene.clone();
         log.append(root, &meta.id, LogBody::Message(msg)).unwrap();
         let mut report =
-            commit_reply_core(root, meta, cast, &speaker, turn, "（回复）", None, log, scene.as_deref())
+            commit_reply_core(root, meta, cast, &speaker, turn, "（回复）", &[], None, log, scene.as_deref())
                 .unwrap();
         finalize_turn(root, meta, cast, turn, log, None, None, None, scene.as_deref(), &mut report)
             .unwrap();
@@ -9850,7 +10148,9 @@ return { state_tree = {
                 content: "增量的一条".into(),
                 ts: 0,
                 scene_id: None,
-            }),
+            tool_calls: None,
+            }
+                ),
         )
         .unwrap();
         let records2 = log.read(&root, &meta.id).unwrap();

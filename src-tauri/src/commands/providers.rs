@@ -48,10 +48,7 @@ pub async fn test_provider(provider: Provider) -> Result<ProviderTest, String> {
         .await
         .map(|(_, used)| used)
         .unwrap_or(None);
-    let messages = vec![llm::ChatMessage {
-        role: "user".into(),
-        content: "说「好」一个字即可。".into(),
-    }];
+    let messages = vec![llm::ChatMessage::text("user", "说「好」一个字即可。")];
     let started = std::time::Instant::now();
     let outcome = llm::chat_once(&provider, &messages, proxy.as_deref()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;

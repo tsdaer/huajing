@@ -53,7 +53,7 @@ const HOOK_NAMES: [&str; 3] = ["on_load", "on_context", "on_message"];
 
 /// Card 的静态字段名（serde 反序列化只喂这些：mlua 对忽略字段仍会遍历
 /// 到 function 值而报错，hooks/state_tree 不能进入）
-const STATIC_FIELDS: [&str; 10] = [
+const STATIC_FIELDS: [&str; 11] = [
     "spec",
     "name",
     "avatar",
@@ -64,7 +64,33 @@ const STATIC_FIELDS: [&str; 10] = [
     "personality",
     "first_mes",
     "example_dialogue",
+    "tools",
 ];
+
+/// 卡的工具策略（增强 A7）：`tools = { deny = {"propose_thread"} }`。
+/// 缺省全放行直写档；作者只做**减法**——平台审计整个工具面，卡上只能收窄。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ToolPolicy {
+    /// 空列表 = 全放行（缺省）；非空时只放行名单内的工具
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// 名单内的工具被禁用
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl ToolPolicy {
+    /// 某工具是否被这张卡放行（deny 优先于 allow）
+    pub fn permits(&self, name: &str) -> bool {
+        if self.deny.iter().any(|d| d == name) {
+            return false;
+        }
+        if self.allow.is_empty() {
+            return true;
+        }
+        self.allow.iter().any(|a| a == name)
+    }
+}
 
 // ---------- hooks 运行时状态（M1.6：设计 §3「hooks 是反应」）----------
 
@@ -150,6 +176,9 @@ pub struct Card {
     pub first_mes: String,
     #[serde(default)]
     pub example_dialogue: Vec<ExampleTurn>,
+    /// 工具策略（增强 A7）：缺省 None = 全放行直写档
+    #[serde(default)]
+    pub tools: Option<ToolPolicy>,
 }
 
 impl Card {
@@ -166,6 +195,7 @@ impl Card {
             personality: String::new(),
             first_mes: "……（她似乎完全无法回应。）".into(),
             example_dialogue: Vec::new(),
+            tools: None,
         }
     }
 }
@@ -1847,7 +1877,9 @@ return {
             content: content.into(),
             ts: 0,
             scene_id: None,
+        tool_calls: None,
         }
+            
     }
 
     /// 运行 hook 并丢弃界面事件回调（单测不关心实时推送）

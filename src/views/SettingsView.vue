@@ -23,6 +23,7 @@ const blank = (): Provider => ({
   model: "",
   temperature: 0.8,
   role: "chat",
+  tools: "off",
 });
 
 const draft = reactive<Provider>(blank());
@@ -93,6 +94,21 @@ async function setAutoAcceptMinor(on: boolean) {
     error.value = String(e);
   } finally {
     savingMinor.value = false;
+  }
+}
+
+/** 每轮工具调用上限（增强 A5）：空输入 = 回到缺省 6 */
+const toolLimitText = ref(String(6));
+async function saveToolLimit() {
+  if (!settings.value) return;
+  const n = parseInt(toolLimitText.value, 10);
+  const value = Number.isFinite(n) ? Math.max(1, Math.min(20, n)) : null;
+  try {
+    settings.value = await api.saveSettings({ ...settings.value, tool_calls_per_turn: value });
+    toolLimitText.value = String(value ?? 6);
+    error.value = "";
+  } catch (e) {
+    error.value = String(e);
   }
 }
 
@@ -172,6 +188,7 @@ const PRESETS: Array<{ label: string; hint: string; preset: Provider }> = [
       model: "deepseek-chat",
       temperature: 0.8,
       role: "chat",
+      tools: "off",
     },
   },
   {
@@ -184,6 +201,7 @@ const PRESETS: Array<{ label: string; hint: string; preset: Provider }> = [
       model: "qwen2.5:7b",
       temperature: 0.8,
       role: "chat",
+      tools: "on",
     },
   },
   {
@@ -196,6 +214,7 @@ const PRESETS: Array<{ label: string; hint: string; preset: Provider }> = [
       model: "qwen3-embedding",
       temperature: 0,
       role: "embed",
+      tools: "off",
     },
   },
 ];
@@ -461,6 +480,17 @@ async function confirmRemove() {
                   <code class="font-mono">qwen3-embedding</code>）；不配置 = 语义关联层关闭。
                 </p>
               </div>
+              <div v-if="draft.role === 'chat'">
+                <label class="label" for="p-tools">工具调用</label>
+                <select id="p-tools" class="select select-sm w-full" v-model="draft.tools">
+                  <option value="off">off · 关闭（纯文本，最稳）</option>
+                  <option value="on">on · 开启（模型可自报持久变化）</option>
+                </select>
+                <p class="mt-1 mb-0 text-[11px] text-base-content/50">
+                  开启后请求带工具 schema；接入点不支持时自动降级为纯文本。卡上的
+                  <code class="font-mono">tools.deny</code> 可再做减法。
+                </p>
+              </div>
             </div>
             <div class="flex justify-end gap-2">
               <button class="btn btn-primary btn-sm" type="submit">保存</button>
@@ -631,6 +661,26 @@ async function confirmRemove() {
                 :disabled="savingMinor"
                 @change="setAutoAcceptMinor(($event.target as HTMLInputElement).checked)"
               />
+            </li>
+            <li class="list-row items-center rounded-box bg-base-200 px-4 py-3">
+              <div class="flex flex-col gap-0.5">
+                <span class="text-sm text-base-content/55">每轮工具调用上限</span>
+                <span class="text-xs text-base-content/45">
+                  接入点开「工具调用」后，主演模型每轮最多提交的次数；超出的全部弃置并记入诊断
+                  （增强 A5）。缺省 6。
+                </span>
+              </div>
+              <div class="flex items-center gap-2">
+                <input
+                  v-model="toolLimitText"
+                  class="input input-sm w-16 text-right"
+                  type="number"
+                  min="1"
+                  max="20"
+                  aria-label="每轮工具调用上限"
+                />
+                <button class="btn btn-ghost btn-sm" type="button" @click="saveToolLimit">保存</button>
+              </div>
             </li>
           </ul>
         </div>
