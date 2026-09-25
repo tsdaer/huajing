@@ -1066,9 +1066,9 @@ fn rebuild_from(
             }
         }
         // ④ on_message（每条新消息落地后，设计 §3）——本场景在场的成员各跑一次。
-        //    过渡插页（system）不触发钩子：它是场景的叙事接缝，不是任何人说的话
-        //    （live 侧切场只落盘不跑钩子，重放这里保持同一条路径）
-        if msg.role != "system" {
+        //    过渡插页（system）与旁白（narration，增强 E1）不触发钩子：客观叙事
+        //    不是任何人说的话（决断 8；live 侧只落盘不跑钩子，重放同一条路径）
+        if matches!(msg.role.as_str(), "user" | "char") {
             for m in present_members(cast, &proj, msg_scene.as_deref()) {
                 let (run, before) = run_message_hook_at(
                     root,
@@ -3474,6 +3474,8 @@ fn finalize_turn(
     // M3.1：每个角色各求值自己的树（转移事件带 character，路径按角色分道）；
     // M3.2：判据环境与揭示见证者取本场景分区。
     let active_entities = runtime.map(|r| r.previously_active(&meta.id));
+    // 增强 E2：本轮发生的状态树转移（阶段转移旁白的数据源）
+    let mut stage_transitions: Vec<(String, String, String)> = Vec::new();
     if let Ok(proj) = project_session(log, root, meta) {
         let mut tree_bodies: Vec<LogBody> = Vec::new();
         for m in present_members(cast, &proj, scene) {
@@ -3494,6 +3496,16 @@ fn finalize_turn(
             );
             // 转移的界面事件（on_enter 的 ui.emit）与本轮钩子事件一起回给前端
             report.ui_events.extend(emits);
+            // 增强 E2：记下本轮的转移（阶段转移旁白的数据源）
+            for body in &events {
+                if let LogBody::Transition(t) = body {
+                    stage_transitions.push((
+                        t.from.last().cloned().unwrap_or_default(),
+                        t.to.last().cloned().unwrap_or_default(),
+                        t.reason.clone(),
+                    ));
+                }
+            }
             // D1-1：各成员的转移事件先收拢，全成员一批落盘（判据环境取的是同一份
             // proj，与原逐条提交的判据输入一致；事件顺序 = 成员序 × 转移序，不变）
             tree_bodies.extend(events);
@@ -3501,6 +3513,25 @@ fn finalize_turn(
         if !tree_bodies.is_empty() {
             if let Err(e) = commit_batch(log, root, meta, tree_bodies) {
                 report.logs.push(e);
+            }
+        }
+        // 增强 E2：阶段转移旁白（可配开关；转移已落盘，旁白异步生成不阻塞）。
+        // 便宜档（util 档）非流式生成氛围旁白，失败/未配 provider 用模板句兜底；
+        // 写入走会话闸门，被占用则放弃（旁白可有可无，绝不能挤占正文）。
+        if store::load_settings(root)
+            .map(|s| s.stage_narration)
+            .unwrap_or(false)
+        {
+            for (from_leaf, to_leaf, reason) in &stage_transitions {
+                spawn_stage_narration(
+                    root.to_path_buf(),
+                    meta.id.clone(),
+                    turn,
+                    scene.map(str::to_string),
+                    from_leaf.clone(),
+                    to_leaf.clone(),
+                    reason.clone(),
+                );
             }
         }
     }
@@ -3870,6 +3901,91 @@ fn fire_due_timers_core(
         }
     }
     bodies
+}
+
+// ---------- 增强 E2：阶段转移旁白（narration 声道；决断 8：旁白归宿主所有）----------
+
+/// 阶段转移旁白的模板兜底句（纯函数，单测钉死）：provider 失败/未配时用它，
+/// 转移本身永不因旁白失败而受阻。
+fn stage_narration_template(to_leaf: &str, reason: &str) -> String {
+    format!("（故事翻过一页——进入了「{to_leaf}」。{reason}）")
+}
+
+/// 便宜档生成一次阶段旁白；失败/未配/空正文一律 None（调用方落模板句）
+async fn try_stage_narration_llm(
+    root: &std::path::Path,
+    to_leaf: &str,
+    reason: &str,
+) -> Option<String> {
+    let provider = pick_util_provider(root).ok()?;
+    let prompt = format!(
+        "你是小说的旁白（第三人称、客观叙事、两到三句话）。剧情刚转入「{to_leaf}」这个阶段（{reason}）。写一段承接氛围的旁白：不出现任何角色的直接引语，不替角色行动，只描绘环境、气氛与时间的流动。直接输出正文。"
+    );
+    let proxy = proxy_of(root);
+    let raw = llm::chat_complete(
+        &provider,
+        &[llm::ChatMessage::text("user", prompt)],
+        512,
+        0.8,
+        proxy.as_deref(),
+    )
+    .await
+    .ok()?;
+    let text = raw.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// 阶段转移旁白的异步落盘：转移已落盘后才生成（不阻塞转移）；写入走会话闸门，
+/// 被前台占用时放弃（旁白可有可无，绝不挤占正文）。落盘在转移之后、后续消息之前
+/// 的理想位置由闸门的确定性时机近似保证（与总结批次同纪律）。
+fn spawn_stage_narration(
+    root: std::path::PathBuf,
+    session_id: String,
+    turn: u64,
+    scene_id: Option<String>,
+    from_leaf: String,
+    to_leaf: String,
+    reason: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        let text = match try_stage_narration_llm(&root, &to_leaf, &reason).await {
+            Some(t) => t,
+            None => stage_narration_template(&to_leaf, &reason),
+        };
+        let log = store::EventLog::new();
+        if !gate().try_acquire(&session_id) {
+            crate::diag::record("narration", format!("第 {turn} 轮阶段旁白：会话写入中，放弃"));
+            return;
+        }
+        let result = (|| -> Result<(), String> {
+            let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+            commit(
+                &log,
+                &root,
+                &meta,
+                LogBody::Message(Message {
+                    turn,
+                    role: "narration".into(),
+                    content: text,
+                    ts: store::unix_now(),
+                    scene_id,
+                    name: None,
+                    tool_calls: None,
+                }),
+            )?;
+            Ok(())
+        })();
+        gate().release(&session_id);
+        match result {
+            Ok(()) => crate::diag::record("narration", "阶段旁白已落盘"),
+            Err(e) => crate::diag::record("narration", format!("阶段旁白落盘失败：{e}")),
+        }
+    });
+    let _ = from_leaf; // 模板与提示词目前只用到目标阶段；保留来源以备双向旁白
 }
 
 /// [`fire_due_timers_core`] 的落盘包装（finalize 用）
@@ -6529,6 +6645,134 @@ return {
             transitions2,
             "重放后的转移与首次一致"
         );
+    }
+
+    /// 增强 E DoD：旁白（narration）进摘要批次、不触发 on_message 钩子——
+    /// 旁白是客观叙事（决断 8），不是任何角色说的话。
+    #[test]
+    fn narration_enters_summary_batch_but_never_triggers_hooks() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let log = store::EventLog::new();
+        let cast = Cast::load(&root, &meta).unwrap();
+        let loaded = &cast.first().loaded;
+
+        // 第 1 轮：用户消息（「谢谢」触发钩子：好感度 +1）→ 旁白落盘（只归档，不跑任何钩子）
+        log.append(&root, &meta.id, LogBody::Message(user_msg(1, "谢谢你。")))
+            .unwrap();
+        let user_report = run_message_hook_core(&root, &meta, loaded, "小雨", 1, None, &log);
+        assert!(user_report.ran, "用户消息正常触发钩子");
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Message(Message {
+                turn: 1,
+                role: "narration".into(),
+                content: "窗外的雪无声地落了下来。".into(),
+                ts: store::unix_now(),
+                scene_id: None,
+                name: None,
+                tool_calls: None,
+            }),
+        )
+        .unwrap();
+
+        // 钩子不被旁白触发：live 侧手动跑一次钩子内核也拿不到旁白当「最新消息」之外
+        // 的任何豁免——真正的保证在 rebuild 的 user|char 门（下两段断言）。
+        // 旁白进摘要批次（决断 8：旁白是剧情正文）
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let batch = summary::summary_batch_scenes(&proj, true)
+            .map(|(_, batch, _)| batch)
+            .unwrap_or_default();
+        assert!(
+            batch.iter().any(|b| b.role == "narration"),
+            "旁白应进总结批次：{:?}",
+            batch.iter().map(|b| b.role.clone()).collect::<Vec<_>>()
+        );
+
+        // 重放：钩子只为 user/char 重跑，旁白不产生任何钩子效果（好感度只 +1 一次）
+        let cast = Cast::load(&root, &meta).unwrap();
+        let records = log.read(&root, &meta.id).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &records, 1).unwrap();
+        let hook_effects = rebuilt
+            .iter()
+            .filter(|r| {
+                matches!(&r.body, LogBody::Effect(e) if e.trigger == "hook.on_message" && !e.state_set.is_empty())
+            })
+            .count();
+        assert_eq!(hook_effects, 1, "旁白不触发 on_message（好感度只算用户消息一次）");
+    }
+
+    /// 增强 E DoD：阶段转移旁白的模板兜底——未配 util 档 provider 时落模板句，
+    /// 且转移不因旁白失败而受阻（异步生成，绝不阻塞轮末推进）。
+    #[test]
+    fn stage_narration_falls_back_to_template_without_blocking_transition() {
+        // 模板是纯函数：带目标阶段与理由
+        let template = stage_narration_template("夜谈", "clock>=23");
+        assert!(template.contains("夜谈"));
+        assert!(template.contains("clock>=23"));
+
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = 's', personality = 'p', first_mes = 'f',
+  state = { favorability = 60 },
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '日常。',
+        transitions = {
+          { to = '日常.夜谈', priority = 10,
+            when = function(ev, bb, st) return st.favorability >= 60 end },
+        },
+      },
+      ['日常.夜谈'] = { parent = '日常', directive = '夜谈。' },
+    },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let log = store::EventLog::new();
+        let cast = Cast::load(&root, &meta).unwrap();
+        let speaker = cast.first().dir.clone();
+        // 打开阶段旁白开关；临时 DataHub 里没有 util 档 provider → 必走模板兜底
+        store::save_settings(
+            &root,
+            &store::Settings {
+                stage_narration: true,
+                ..store::Settings::default()
+            },
+        )
+        .unwrap();
+
+        log.append(&root, &meta.id, LogBody::Message(user_msg(1, "夜深了")))
+            .unwrap();
+        let _ = run_message_hook_core(&root, &meta, &cast.first().loaded, &speaker, 1, None, &log);
+        commit_reply(
+            &root, &meta, &cast, &speaker, 1, "（夜谈）", &[], None, &log, None, None, None, None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        // 转移不阻塞：转移事件已落盘
+        let records = log.read(&root, &meta.id).unwrap();
+        assert!(records.iter().any(|r| matches!(&r.body, LogBody::Transition(_))));
+
+        // 异步旁白任务最终落一条 narration 消息（模板句；轮询等它，最多 2 秒）
+        let mut narration = false;
+        for _ in 0..40 {
+            if let Ok(records) = log.read(&root, &meta.id) {
+                if records.iter().any(|r| {
+                    r.as_message()
+                        .map(|m| m.role == "narration" && m.content.contains("夜谈"))
+                        .unwrap_or(false)
+                }) {
+                    narration = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(narration, "模板兜底的旁白应最终落盘");
     }
 
     /// 增强 B DoD：「3 天后」构造用例——静态定时器跨轮触发 on_timer 转移；

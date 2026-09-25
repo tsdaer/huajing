@@ -67,6 +67,8 @@ export interface Settings {
   auto_accept_minor_facts?: boolean;
   /** 每轮工具调用上限（增强 A5，缺省 6） */
   tool_calls_per_turn?: number | null;
+  /** 阶段转移旁白（增强 E2）：状态树转移时生成氛围旁白（便宜档+模板兜底） */
+  stage_narration?: boolean;
 }
 
 /** 用户人格（personas/*.json） */

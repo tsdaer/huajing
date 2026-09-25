@@ -19,8 +19,10 @@ fn scene_view(proj: &event::Projection) -> SceneView {
     }
 }
 
-/// 小说式过渡插页（切场/分场/合场的叙事接缝）：system 消息，只归属目标场景。
-/// 重放不重跑它的钩子（见 rebuild_from 的 system 跳过），live 侧同样只落盘不跑钩子。
+/// 小说式过渡插页（切场/分场/合场的叙事接缝）：**narration 旁白声道**（增强 E2 ·
+/// 决断 8：旁白是客观叙事，不由任何角色说出），只归属目标场景。旧会话里的
+/// system 插页照常可读（读侧兼容）。重放不重跑它的钩子（见 rebuild_from 的
+/// user|char 门），live 侧同样只落盘不跑钩子。
 fn append_transition(
     log: &store::EventLog,
     root: &std::path::Path,
@@ -31,7 +33,7 @@ fn append_transition(
 ) -> Result<(), String> {
     let msg = Message {
         turn,
-        role: "system".into(),
+        role: "narration".into(),
         content: text.to_string(),
         ts: store::unix_now(),
         tool_calls: None,

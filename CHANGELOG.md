@@ -2,6 +2,28 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [Unreleased] · 增强计划 · 包 E 旁白声道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+
+### Added · 包 E（narration 一等 voice，决断 8：旁白归宿主与模式所有）
+
+- **E1 数据与渲染**：`Message.role` 增 `"narration"`（serde 缺省读旧值，老会话零
+  迁移）；前端抽 `NarrationLine` 散文组件——旁白与旧 system 插页归入同一散文
+  通道（无气泡、全宽、衬线斜体居中），消息过滤对两者同样永远显示；C3 窗口里
+  旁白以 system 通道进请求（绝不能落进 assistant 被当成角色的话）；摘要批次
+  收录 narration（`summary_batch_scenes` 增分支，决断 8「旁白是剧情正文」）；
+  rebuild 的钩子重跑门收窄为 user|char（L3/钩子不因旁白触发）
+- **E2 宿主生成点**：切场/分场/合场插页（`append_transition`）从 system 迁到
+  narration 通道（读侧兼容旧 system 插页）；阶段转移旁白（新，设置页可配
+  `stage_narration`，缺省关）：状态树转移时异步生成氛围旁白——util 档非流式调用
+  （512 token），失败/未配 provider/空正文一律落模板句
+  `stage_narration_template`，转移永不阻塞；写入走会话闸门，被占用则放弃
+  （旁白可有可无，绝不挤占正文）
+- **E3 契约**：A1 契约新增【旁白边界】段（narration 是客观叙事不是角色言行、
+  钩子与注入不因旁白触发）；主演模型不产旁白，无任何「让模型写旁白」的提示词通道
+- **DoD**：旁白进摘要批次、不触发 on_message（构造用例 + 重放钩子计数钉死）；
+  模板兜底纯函数单测 + 无 provider 时转移照常、旁白最终落盘（轮询断言）；
+  三主题预设下的渲染目检与截图留待 dev 真机走查（M4 前统一回归）
+
 ## [Unreleased] · 增强计划 · 包 B 故事时钟定时器（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 B（on_timer 落地，决断 5：只用故事时钟）

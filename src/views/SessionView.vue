@@ -12,6 +12,7 @@ import type {
 } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import EmptyState from "../components/EmptyState.vue";
+import NarrationLine from "../components/NarrationLine.vue";
 import Icon from "../components/Icon.vue";
 import SceneDialog from "../components/SceneDialog.vue";
 import SceneBar from "../components/SceneBar.vue";
@@ -196,13 +197,15 @@ const page = ref(1);
 // ---------- M3.2 场景与多线（设计 §10.3）：场景条 + 消息按场景分段（状态声明在发送接线之前） ----------
 
 /** 消息的场景视图：只显示聚焦场景的分段（index 保留在**全量**消息流里的下标，
- *  编辑/删除仍按全量下标发给后端）。过渡插页（system）永远显示。 */
+ *  编辑/删除仍按全量下标发给后端）。过渡插页（system）与旁白（narration，增强 E1）
+ *  永远显示——它们是叙事接缝/画外音，不归属任何角色。 */
 const sceneMessagesView = computed(() =>
   messages.value
     .map((m, index) => ({ m, index }))
     .filter(
       ({ m }) =>
         m.role === "system" ||
+        m.role === "narration" ||
         !scenes.value.length ||
         (m.scene_id ?? "scene.main") === (activeScene.value || "scene.main"),
     ),
@@ -678,13 +681,10 @@ watch(cardGeneration, () => {
       <section class="card card-border min-w-0 flex-1 overflow-hidden bg-base-100">
         <ul ref="streamEl" class="m-0 flex min-h-0 flex-1 list-none flex-col gap-5 overflow-y-auto p-5">
           <template v-for="{ m, index: i } in pagedMessages" :key="i">
-            <!-- 过渡插页（切场/分场/合场的叙事接缝）：居中一条，不占气泡 -->
-            <li v-if="m.role === 'system'" class="mx-auto my-1 flex max-w-full list-none items-center gap-3">
-              <span class="h-px flex-1 bg-base-content/15"></span>
-              <span class="flex-none font-serif text-sm italic tracking-wide text-base-content/50">
-                {{ m.content }}
-              </span>
-              <span class="h-px flex-1 bg-base-content/15"></span>
+            <!-- 过渡插页（system）与旁白（narration，增强 E1）：同一散文通道，
+                 居中一条不占气泡——旁白是客观叙事（决断 8），不是任何角色的话 -->
+            <li v-if="m.role === 'system' || m.role === 'narration'" class="list-none">
+              <NarrationLine :content="m.content" />
             </li>
             <li v-else class="chat group msg-in" :class="m.role === 'user' ? 'chat-end' : 'chat-start'">
             <div class="chat-image avatar avatar-placeholder">

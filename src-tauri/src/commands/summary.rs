@@ -68,7 +68,9 @@ pub(crate) fn summary_batch_scenes(
             .iter()
             .copied()
             .filter(|m| m.turn > upto)
-            .filter(|m| m.role == "user" || m.role == "char") // OOC/system 不进剧情记忆（§4.1）
+            // 增强 E1：narration 是剧情正文（决断 8），随批次进总结；
+            // system 插页/OOC 不进剧情记忆（§4.1）
+            .filter(|m| m.role == "user" || m.role == "char" || m.role == "narration")
             .collect();
         // 活跃场景的最近窗口仍在上下文里，不总结；include_window（force）时照常吞掉
         if Some(scene_id) == active.as_ref() && !include_window {

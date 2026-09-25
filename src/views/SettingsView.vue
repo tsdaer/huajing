@@ -97,6 +97,21 @@ async function setAutoAcceptMinor(on: boolean) {
   }
 }
 
+/** 阶段转移旁白开关（增强 E2） */
+const savingNarration = ref(false);
+async function setStageNarration(on: boolean) {
+  if (!settings.value) return;
+  savingNarration.value = true;
+  try {
+    settings.value = await api.saveSettings({ ...settings.value, stage_narration: on });
+    error.value = "";
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    savingNarration.value = false;
+  }
+}
+
 /** 每轮工具调用上限（增强 A5）：空输入 = 回到缺省 6 */
 const toolLimitText = ref(String(6));
 async function saveToolLimit() {
@@ -660,6 +675,23 @@ async function confirmRemove() {
                 aria-label="自动接受设定小事实"
                 :disabled="savingMinor"
                 @change="setAutoAcceptMinor(($event.target as HTMLInputElement).checked)"
+              />
+            </li>
+            <li class="list-row items-center rounded-box bg-base-200 px-4 py-3">
+              <div class="flex flex-col gap-0.5">
+                <span class="text-sm text-base-content/55">阶段转移旁白</span>
+                <span class="text-xs text-base-content/45">
+                  状态树转移时生成一段氛围旁白（narration 声道，不由角色说出）：便宜档
+                  生成、失败或未配 util 档时落一行模板句，转移永不阻塞（增强 E2）。
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                class="toggle toggle-sm"
+                :checked="settings.stage_narration ?? false"
+                aria-label="阶段转移旁白"
+                :disabled="savingNarration"
+                @change="setStageNarration(($event.target as HTMLInputElement).checked)"
               />
             </li>
             <li class="list-row items-center rounded-box bg-base-200 px-4 py-3">

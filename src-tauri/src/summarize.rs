@@ -196,7 +196,7 @@ pub struct SummaryContext<'a> {
 pub struct BatchMessage {
     /// 轮次（与 store::Message.turn 同口径，从 1 起）。
     pub turn: u64,
-    /// user | char | system。
+    /// user | char | narration（增强 E1：旁白是剧情正文，进总结批次）。
     pub role: String,
     pub content: String,
 }
@@ -619,7 +619,11 @@ pub fn build_prompt(ctx: &SummaryContext<'_>, batch: &[BatchMessage]) -> String 
             last
         ));
         for m in batch {
-            out.push_str(&format!("[turn {} · {}] ", m.turn, m.role.trim()));
+            let role_label = match m.role.trim() {
+                "narration" => "narration",
+                other => other,
+            };
+            out.push_str(&format!("[turn {} · {}] ", m.turn, role_label));
             out.push_str(m.content.trim());
             out.push('\n');
         }

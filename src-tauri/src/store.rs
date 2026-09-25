@@ -214,6 +214,10 @@ pub struct Settings {
     /// 每轮工具调用上限（增强 A5，缺省 6）：超出的调用全部弃置并记一条汇总诊断
     #[serde(default)]
     pub tool_calls_per_turn: Option<usize>,
+    /// 阶段转移旁白（增强 E2）：状态树转移时可选生成一段氛围旁白（便宜档非流式，
+    /// 模板兜底）。false = 不生成（缺省）
+    #[serde(default)]
+    pub stage_narration: bool,
 }
 
 impl Settings {
@@ -250,6 +254,7 @@ impl Default for Settings {
             context_window: None,
             auto_accept_minor_facts: false,
             tool_calls_per_turn: None,
+            stage_narration: false,
         }
     }
 }
