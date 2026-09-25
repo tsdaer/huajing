@@ -45,6 +45,18 @@ const ICONS: Record<string, string> = {
   merge:
     '<path d="M3.5 5.5h6.5a4 4 0 0 1 4 4v0a4 4 0 0 0 4 4h2.5"/><path d="M17.5 10.5l3 3-3 3"/><path d="M3.5 18.5h6.5a4 4 0 0 0 3.2-1.6"/>',
   play: '<path d="M7.5 5.2v13.6a.6.6 0 0 0 .9.5l10.8-6.8a.6.6 0 0 0 0-1L8.4 4.7a.6.6 0 0 0-.9.5Z"/>',
+  warning:
+    '<path d="M12 3.8 21 19.6a1 1 0 0 1-.9 1.5H3.9a1 1 0 0 1-.9-1.5L12 3.8z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/>',
+  info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11.2V16"/><circle cx="12" cy="8" r="1" fill="currentColor" stroke="none"/>',
+  skip: '<path d="M6 5.5 13.5 12 6 18.5z"/><path d="M17.5 5.5v13"/>',
+  undo: '<path d="M8.5 13.5 4 9l4.5-4.5"/><path d="M4 9h9.5a6.25 6.25 0 0 1 0 12.5H10"/>',
+  book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+  globe:
+    '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.7 2.3 4 5.1 4 8.5s-1.3 6.2-4 8.5c-2.7-2.3-4-5.1-4-8.5s1.3-6.2 4-8.5z"/>',
+  film: '<rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M7.5 4.5v15M16.5 4.5v15M3 9h4.5M3 15h4.5M16.5 9H21M16.5 15H21"/>',
+  eye: '<path d="M2.5 12S6 5.75 12 5.75 21.5 12 21.5 12 18 18.25 12 18.25 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="2.75"/>',
+  pulse: '<path d="M3 12h3.5L9 6l4.5 12 2.5-6H21"/>',
+  arrow: '<path d="M4 12h15"/><path d="m13.5 6.5 5.5 5.5-5.5 5.5"/>',
 };
 </script>
 

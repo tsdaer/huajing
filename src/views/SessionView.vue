@@ -339,11 +339,16 @@ function avatarClass(m: Message): string {
   return m.role === "user" ? "bg-primary text-primary-content" : "bg-neutral text-neutral-content";
 }
 
-/** 角色气泡的稳定颜色（M3.4 群聊：按署名取色，同一角色恒同色——多人同台一眼可分） */
+/** 角色气泡的稳定颜色（M3.4 群聊：按署名取色，同一角色恒同色——多人同台一眼可分）。
+ *  色相由名字哈希决定，底色/字色与主题令牌 color-mix——明暗与 33 预设下都协调，不裸写白字 */
 function avatarStyle(name: string): string {
   let h = 0;
   for (const ch of name) h = (h * 31 + (ch.codePointAt(0) ?? 0)) % 360;
-  return `background: hsl(${h} 45% 42%); color: white`;
+  const hue = `hsl(${h} 70% 55%)`;
+  return (
+    `background: color-mix(in oklab, ${hue} 26%, var(--color-base-200));` +
+    ` color: color-mix(in oklab, ${hue} 58%, var(--color-base-content))`
+  );
 }
 
 /** 消息时间戳（秒）→ HH:MM；乐观上屏的消息没有时间戳，返回空串 */

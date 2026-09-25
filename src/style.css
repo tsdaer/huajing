@@ -6,7 +6,7 @@
   themes: light --default, dark --prefersdark;
 }
 
-/* 全局层：只保留 daisyUI 覆盖不到的三件必要事——铺满视口、中文栈、动效降级 */
+/* 全局层：只保留 daisyUI 覆盖不到的事——铺满视口、中文栈、主题感知滚动条、动效降级 */
 @layer base {
   html,
   body,
@@ -19,6 +19,34 @@
     -webkit-font-smoothing: antialiased;
   }
 
+  /* 文本选区走主色（低透明度），任何预设下都与主题同调 */
+  ::selection {
+    background: color-mix(in oklab, var(--color-primary) 25%, transparent);
+  }
+
+  /* 主题感知细滚动条：轨道透明，滑块用内容色低透明度、悬停加深 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--color-base-content) 22%, transparent) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 9999px;
+    background: color-mix(in oklab, var(--color-base-content) 22%, transparent);
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in oklab, var(--color-base-content) 40%, transparent);
+    background-clip: padding-box;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     *,
     *::before,
@@ -27,4 +55,50 @@
       transition-duration: 0.01ms !important;
     }
   }
+}
+
+/* 共享过渡动效：各视图的 <Transition name="…"> 直接引用（prefers-reduced-motion 已全局降级） */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.18s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.slide-up-enter-active,
+.slide-up-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.slide-up-enter-from,
+.slide-up-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
+/* 右侧抽屉/侧栏滑入 */
+.slide-left-enter-active,
+.slide-left-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.slide-left-enter-from,
+.slide-left-leave-to {
+  opacity: 0;
+  transform: translateX(16px);
+}
+
+/* 聊天气泡进场：纯 CSS、不动 DOM 时序，不干扰流式滚动跟随（D10） */
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.msg-in {
+  animation: msg-in 0.18s ease-out;
 }
