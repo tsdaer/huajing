@@ -475,8 +475,12 @@
 - [x] E1 余量 · 后端半（独立批次，2026-09-25）：session_ctx 合并 9 处前奏三连 +
       commands.rs 拆出 `commands/{providers,theater,ingestion,scenes,summary}.rs`
       五域（约 2900 行迁出，`pub use` 顶回 commands 根，lib.rs 零改动）；
-      456 例单测原样全绿 + `pnpm build` 双绿。**前端半**（SessionView 五组件/
-      composable 抽取）仍在余量
+      456 例单测原样全绿 + `pnpm build` 双绿
+- [x] E1 余量 · 前端半（独立批次，2026-09-25）：SessionView.vue 1873 → 1045 行，
+      抽 useChatStream / useTheater / SceneBar / InspectorDrawer / CardStatePanel
+      （+共享 tabs.ts/kinds.ts；B5/B6/D10 守卫随迁）；`pnpm build` 双绿 + dev
+      冒烟（发送流式/导演调度/场景/黑板/检查器/剧场断链）全链路点验通过。
+      **E1 余量全部清偿，加固计划至此无未了事项**
 - [x] 收口：CHANGELOG + 双绿 + CDP 真机回归
 
 ## 执行备注（2026-09-25）

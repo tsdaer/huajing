@@ -174,7 +174,16 @@
   闸门的暂存/重放半区）。`tauri::State` 管理的类型与命令经 `pub use` 顶回
   commands 根，lib.rs 注册表零改动；跨域内核（`advance_theater`/`flush_parked_
   summaries` 等）升 `pub(crate)`。纯代码搬移，行为不变：456 例单测原样全绿
-- SessionView.vue 的五组件/composable 抽取（前端半）随后续批次
+- **SessionView.vue 拆分（前端半）**：1873 → 1045 行，抽出
+  `useChatStream`（发送/重roll/流式收尾/钩子报告与卡内数据，B5 世代守卫与
+  D10 合帧滚动随迁）、`useTheater`（剧场自动轮次，B6 断链随迁；与聊天流的
+  双向接环用闭包解）、`SceneBar`（场景条纯展示组件）、`InspectorDrawer`
+  （检查器全部状态与动作：六面板/事件流/世界/收件箱/手动开收线/总结/视角；
+  页签 v-model 外提使关开不丢页签）、`CardStatePanel`（卡内状态/记忆/事件流
+  三页签，数据经 props 进、动作经事件出）+ 共享 `tabs.ts`/`kinds.ts`。
+  已知微差：检查器数据缓存随抽屉卸载失效（关开抽屉重拉一次，数据只新不旧）。
+  `pnpm build` 双绿 + dev（mock 后端）冒烟：发送流式/导演调度/场景切换/黑板
+  保存/检查器页签与视角/剧场自动轮次与切走断链全链路点验通过
 
 ## [0.3.0] - 2026-09-25
 
