@@ -4314,6 +4314,181 @@ fn codex_resolve_preview_of(
     Ok(ResolvePreview { day, entities })
 }
 
+// ---------- 增强 D：OOC 导演通道（/ooc 前缀；不进剧情记忆）----------
+
+/// 一条解析后的 OOC 指令（增强 D · 纯数据便于单测）
+#[derive(Debug, Clone, PartialEq)]
+pub enum OocCommand {
+    /// /ooc goto <状态路径>：状态树手动跳转
+    Goto(String),
+    /// /ooc thread open <标题>/<起因>：手动开线（与面板同一宿主内核）
+    ThreadOpen { title: String, cause: String },
+    /// /ooc thread resolve <线id>/<结果>：手动收线（结果可省，缺省「已完成」）
+    ThreadResolve { id: String, outcome: String },
+}
+
+/// 解析 /ooc 后缀（不含 "/ooc" 前缀本身）。None = 非指令（回显用法，不落剧情）
+pub fn parse_ooc_command(rest: &str) -> Option<OocCommand> {
+    let rest = rest.trim();
+    let (sub, arg) = match rest.split_once(char::is_whitespace) {
+        Some((s, a)) => (s, a.trim()),
+        None => (rest, ""),
+    };
+    match sub {
+        "goto" if !arg.is_empty() => Some(OocCommand::Goto(arg.to_string())),
+        "thread" => {
+            let (action, rest2) = arg.split_once(char::is_whitespace)?;
+            match action {
+                "open" => {
+                    let (title, cause) = rest2.split_once('/')?;
+                    let title = title.trim();
+                    let cause = cause.trim();
+                    if title.is_empty() || cause.is_empty() {
+                        return None;
+                    }
+                    Some(OocCommand::ThreadOpen {
+                        title: title.to_string(),
+                        cause: cause.to_string(),
+                    })
+                }
+                "resolve" => {
+                    let (id, outcome) = rest2.split_once('/').unwrap_or((rest2, ""));
+                    let id = id.trim();
+                    if id.is_empty() {
+                        return None;
+                    }
+                    Some(OocCommand::ThreadResolve {
+                        id: id.to_string(),
+                        outcome: if outcome.trim().is_empty() {
+                            "已完成".to_string()
+                        } else {
+                            outcome.trim().to_string()
+                        },
+                    })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// OOC 指令的用法说明（未识别的子命令回显它，不落入剧情）
+pub fn ooc_usage() -> String {
+    "OOC 导演通道用法：
+     /ooc goto <状态路径>            ——状态树手动跳转（如 /ooc goto 日常.夜谈）
+     /ooc thread open <标题>/<起因>  ——手动开线
+     /ooc thread resolve <线id>/<结果> ——手动收线（结果可省）"
+        .to_string()
+}
+
+/// OOC 指令执行（增强 D）：指令映射到**既有宿主内核**（开线/收线走 M3.0 同一份
+/// open_thread_at / resolve_thread_at；跳转走与状态树转移同一套事件形态），
+/// 事件与面板操作完全一致。OOC 消息本身落为 role="ooc"——不进摘要批次、
+/// 不触发 on_message 钩子、不进宫殿。
+#[allow(clippy::too_many_arguments)]
+fn execute_ooc(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    cast: &Cast,
+    tree_cache: &TreeCache,
+    runtime: &SessionRuntime,
+    content: &str,
+) -> Result<StreamEvent, String> {
+    let Some(cmd) = parse_ooc_command(content.strip_prefix("/ooc").unwrap_or(content)) else {
+        return Ok(StreamEvent::Done {
+            full: ooc_usage(),
+            cancelled: false,
+            report: None,
+        });
+    };
+    // OOC 消息落档（role="ooc"，弱化显示；不进任何记忆通道）
+    let mut proj = project_session(log, root, meta)?;
+    let turn = proj.last_message().map(|m| m.turn).unwrap_or(0) + 1;
+    log.append(
+        root,
+        &meta.id,
+        LogBody::Message(Message {
+            turn,
+            role: "ooc".into(),
+            content: content.to_string(),
+            ts: store::unix_now(),
+            scene_id: scene_ctx(&proj),
+            name: None,
+            tool_calls: None,
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    let result_text = match &cmd {
+        OocCommand::Goto(target) => {
+            let character = cast.first().dir.clone();
+            let loaded = &cast.get(&character).ok_or("角色不在阵容里")?.loaded;
+            let tree = load_tree(loaded, Some(tree_cache))
+                .ok_or_else(|| "这张卡没有状态树，无处可跳".to_string())?;
+            let to_path = tree.active_path(target);
+            if to_path.is_empty() {
+                return Ok(StreamEvent::Done {
+                    full: format!("目标状态「{target}」不在状态树里。
+{}", ooc_usage()),
+                    cancelled: false,
+                    report: None,
+                });
+            }
+            let scene = scene_ctx(&proj);
+            let path = active_path_of(&proj, &tree, &character);
+            let mut out: Vec<LogBody> = Vec::new();
+            // exit 旧叶 → 转移事件 → enter 新叶：与状态树转移同一套事件形态
+            if let Some(leaf) = path.last() {
+                let (body, _) = run_state_hook(
+                    loaded, &proj, &character, leaf, "on_exit", "ooc.goto", turn,
+                    meta.seed, scene.as_deref(), Some(tree_cache),
+                );
+                if let Some(b) = body {
+                    out.push(b);
+                }
+            }
+            out.push(LogBody::Transition(event::TransitionEvent {
+                turn,
+                from: path,
+                to: to_path.clone(),
+                reason: format!("ooc goto {target}"),
+                character: Some(character.clone()),
+                ts: store::unix_now(),
+            }));
+            let to_leaf = to_path.last().cloned().unwrap_or_default();
+            let (body, _) = run_state_hook(
+                loaded, &proj, &character, &to_leaf, "on_enter", "ooc.goto", turn,
+                meta.seed, scene.as_deref(), Some(tree_cache),
+            );
+            if let Some(b) = body {
+                out.push(b);
+            }
+            commit_batch(log, root, meta, out)?;
+            format!("已跳转到「{to_path_join}」", to_path_join = to_path.join(" → "))
+        }
+        OocCommand::ThreadOpen { title, cause } => {
+            let actors: Vec<String> = cast.display_names();
+            let value = open_thread_at(log, root, meta, title, cause, &actors, None, threads::ORIGIN_MANUAL)?;
+            format!("已开线「{}」", value.get("title").and_then(|t| t.as_str()).unwrap_or(title))
+        }
+        OocCommand::ThreadResolve { id, outcome } => {
+            let value = resolve_thread_at(log, root, meta, id, outcome, tree_cache, runtime, threads::ORIGIN_MANUAL)?;
+            format!(
+                "已收线「{}」（{}）",
+                value.get("title").and_then(|t| t.as_str()).unwrap_or(id),
+                outcome
+            )
+        }
+    };
+    crate::diag::record("ooc", format!("OOC 指令执行完成：{result_text}"));
+    Ok(StreamEvent::Done {
+        full: result_text,
+        cancelled: false,
+        report: None,
+    })
+}
+
 /// 发送一条用户消息并流式生成回复（加固 A4/B1 包装）：
 /// 入口获取会话写入闸门并**全程持有**——并发的第二条消息在动事件流之前就被拒掉；
 /// 闸门清位后顺手重放暂存的总结批次。主体见 [`send_message_inner`]。
@@ -4392,6 +4567,19 @@ async fn send_message_inner(
     // 会话与角色阵容（M3.1 隔离模式：每轮发言 = 发言人独立的上下文组装与请求）
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
     let cast = Cast::load(&root, &meta)?;
+
+    // 增强 D：/ooc 导演通道——不进剧情、不触发钩子、不走生成（也不需要 chat 档）
+    if content.trim_start().starts_with("/ooc") {
+        return execute_ooc(
+            &log,
+            &root,
+            &meta,
+            &cast,
+            &tree_cache,
+            &runtime,
+            &content,
+        );
+    }
 
     // 接入点（chat 档；先校验再落盘用户消息，配置错误不产生半截会话）
     let provider = pick_chat_provider(&root)?;
@@ -7013,6 +7201,198 @@ return {
             transitions.iter().map(|t| t.to.clone()).collect::<Vec<_>>(),
             transitions2,
             "重放后的转移与首次一致"
+        );
+    }
+
+    /// 增强 D：/ooc 指令解析（纯函数）——合法指令、缺参回显用法
+    #[test]
+    fn parse_ooc_command_covers_the_three_directives() {
+        assert_eq!(
+            parse_ooc_command("goto 日常.夜谈"),
+            Some(OocCommand::Goto("日常.夜谈".into()))
+        );
+        assert_eq!(
+            parse_ooc_command("thread open 周五还书/借了书没还"),
+            Some(OocCommand::ThreadOpen {
+                title: "周五还书".into(),
+                cause: "借了书没还".into()
+            })
+        );
+        assert_eq!(
+            parse_ooc_command("thread resolve thread.周五还书/如期归还"),
+            Some(OocCommand::ThreadResolve {
+                id: "thread.周五还书".into(),
+                outcome: "如期归还".into()
+            })
+        );
+        // 结果可省 → 缺省「已完成」
+        assert_eq!(
+            parse_ooc_command("thread resolve thread.周五还书"),
+            Some(OocCommand::ThreadResolve {
+                id: "thread.周五还书".into(),
+                outcome: "已完成".into()
+            })
+        );
+        // 缺参/未知子命令 → None（回显用法，不落剧情）
+        assert_eq!(parse_ooc_command("goto"), None);
+        assert_eq!(parse_ooc_command("thread open 只给标题"), None);
+        assert_eq!(parse_ooc_command("变身超级赛亚人"), None);
+    }
+
+    /// 增强 D DoD：OOC 驱动的状态树跳转/收线与面板操作走同一宿主内核
+    /// （事件一致）；/ooc 消息本身不进任何记忆通道（不进摘要批次、不触发钩子）。
+    #[test]
+    fn ooc_commands_drive_host_actions_and_stay_out_of_memory() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = 's', personality = 'p', first_mes = 'f',
+  state = { favorability = 60 },
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = { directive = '日常。' },
+      ['日常.夜谈'] = {
+        parent = '日常',
+        directive = '夜谈。',
+        on_enter = function(api, state)
+          state.in_night = true
+        end,
+      },
+    },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let log = store::EventLog::new();
+        let cast = Cast::load(&root, &meta).unwrap();
+        let speaker = cast.first().dir.clone();
+        let tree_cache = TreeCache::default();
+        let runtime = SessionRuntime::default();
+
+        // /ooc goto：跳转走与状态树转移同一套事件形态（exit → 转移 → enter）
+        let done = execute_ooc(
+            &log,
+            &root,
+            &meta,
+            &cast,
+            &tree_cache,
+            &runtime,
+            "/ooc goto 日常.夜谈",
+        )
+        .unwrap();
+        let StreamEvent::Done { ref full, .. } = done else {
+            panic!("应返回 Done");
+        };
+        assert!(full.contains("夜谈"), "回显跳转结果：{full}");
+        let records = log.read(&root, &meta.id).unwrap();
+        let jumped = records.iter().any(|r| {
+            matches!(&r.body, LogBody::Transition(t)
+                if t.to.last().map(|p| p.contains("夜谈")).unwrap_or(false)
+                && t.reason.contains("ooc goto"))
+        });
+        assert!(jumped, "goto 应产生转移事件");
+        // on_enter 钩子随跳转运行（与轮末转移同一套宿主内核）
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert_eq!(
+            proj.state_of(&speaker).unwrap()["in_night"],
+            serde_json::json!(true),
+            "跳转触发了 on_enter"
+        );
+
+        // /ooc thread open + resolve：与手动开收线同一宿主内核（origin=manual）
+        let done = execute_ooc(
+            &log,
+            &root,
+            &meta,
+            &cast,
+            &tree_cache,
+            &runtime,
+            "/ooc thread open 周五还书/借了书没还",
+        )
+        .unwrap();
+        let StreamEvent::Done { ref full, .. } = done else {
+            panic!("应返回 Done");
+        };
+        assert!(full.contains("周五还书"), "{full}");
+        execute_ooc(
+            &log,
+            &root,
+            &meta,
+            &cast,
+            &tree_cache,
+            &runtime,
+            "/ooc thread resolve thread.周五还书/如期归还",
+        )
+        .unwrap();
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let thread = proj.threads.get("thread.周五还书").expect("线已开");
+        assert_eq!(thread["state"], "resolved", "OOC 收线生效");
+        let resolve_origin = proj
+            .thread_log
+            .iter()
+            .filter(|t| t.thread_id == "thread.周五还书" && t.op == "resolve")
+            .map(|t| t.origin.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(resolve_origin, vec!["manual".to_string()], "与面板手动收线同源");
+
+        // /ooc 消息不进任何记忆通道：摘要批次排除 + 钩子不触发 + 不进宫殿
+        let proj = project_session(&log, &root, &meta).unwrap();
+        assert!(
+            summary::summary_batch_scenes(&proj, true)
+                .map(|(_, batch, _)| batch.iter().all(|b| b.role != "ooc"))
+                .unwrap_or(true),
+            "OOC 消息不进摘要批次"
+        );
+        // 重放（user|char 门）不为 ooc 消息跑钩子/写宫殿：
+        // 断言范围 = ooc 消息所在轮（goto 转移发生在同一轮，但那是元层动作；
+        // 收线的记忆写入是面板同款宿主动作，不在 ooc 消息自己的轮次断言之列）
+        let records = log.read(&root, &meta.id).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &records, 1).unwrap();
+        let ooc_turn = records
+            .iter()
+            .find(|r| r.as_message().map(|m| m.role == "ooc").unwrap_or(false))
+            .map(|r| r.turn());
+        assert!(ooc_turn.is_some(), "ooc 消息已落档");
+        let ooc_effects = rebuilt
+            .iter()
+            .filter(|r| {
+                r.turn() == ooc_turn.unwrap()
+                    && matches!(&r.body, LogBody::Effect(e) if e.trigger == "hook.on_message")
+            })
+            .count();
+        assert_eq!(ooc_effects, 0, "ooc 消息不触发 on_message");
+        let ooc_memory = rebuilt
+            .iter()
+            .filter(|r| r.turn() == ooc_turn.unwrap() && matches!(&r.body, LogBody::Memory(_)))
+            .count();
+        assert_eq!(ooc_memory, 0, "ooc 消息不进宫殿");
+    }
+
+    /// 未识别的 /ooc 子命令回显用法，且**不落入剧情**（不落任何消息）
+    #[test]
+    fn unknown_ooc_subcommand_echoes_usage_without_storing() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let log = store::EventLog::new();
+        let cast = Cast::load(&root, &meta).unwrap();
+        let records_before = log.read(&root, &meta.id).unwrap().len();
+        let done = execute_ooc(
+            &log,
+            &root,
+            &meta,
+            &cast,
+            &TreeCache::default(),
+            &SessionRuntime::default(),
+            "/ooc 变身超级赛亚人",
+        )
+        .unwrap();
+        let StreamEvent::Done { ref full, .. } = done else {
+            panic!("应返回 Done");
+        };
+        assert!(full.contains("用法"), "回显用法：{full}");
+        assert_eq!(
+            log.read(&root, &meta.id).unwrap().len(),
+            records_before,
+            "未识别指令不落任何消息"
         );
     }
 

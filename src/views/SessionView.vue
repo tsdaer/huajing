@@ -723,6 +723,13 @@ watch(cardGeneration, () => {
             <li v-if="m.role === 'system' || m.role === 'narration'" class="list-none">
               <NarrationLine :content="m.content" />
             </li>
+            <!-- OOC 导演通道（增强 D）：弱化显示，可整体折叠；不进剧情记忆 -->
+            <li v-else-if="m.role === 'ooc'" class="list-none">
+              <details class="mx-auto max-w-[80%] rounded border border-dashed border-base-content/20 px-3 py-1">
+                <summary class="cursor-pointer select-none text-xs italic text-base-content/45">OOC 导演指令</summary>
+                <pre class="mb-0 mt-1 whitespace-pre-wrap font-sans text-xs text-base-content/60">{{ m.content }}</pre>
+              </details>
+            </li>
             <li
               v-else-if="novelMode && m.role === 'char'"
               class="list-none border-l-2 border-base-content/10 pl-4 font-serif text-[15px] leading-relaxed text-base-content/90"

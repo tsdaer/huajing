@@ -2,6 +2,23 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [Unreleased] · 增强计划 · 包 D OOC 导演通道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+
+### Added · 包 D（/ooc 前缀，不进剧情记忆）
+
+- **指令解析与执行**：输入框 `/ooc …` 前缀走导演通道（在 chat 档校验**之前**
+  分流——OOC 不依赖生成配置）：`/ooc goto <状态路径>`（状态树手动跳转：exit 钩子
+  → 转移事件 → enter 钩子，与状态树转移同一套事件形态）、`/ooc thread open
+  <标题>/<起因>` 与 `/ooc thread resolve <线id>/<结果>`（复用 M3.0 手动开/收线
+  同一份宿主内核 `open_thread_at` / `resolve_thread_at`，事件与面板操作完全一致，
+  origin=manual）；未识别子命令回显用法且不落任何消息
+- **记忆通道隔离**：OOC 消息落为 `role="ooc"`——不进摘要批次
+  （`summary_batch_scenes` 白名单外）、不触发 on_message 钩子（rebuild 门
+  user|char 外）、不进宫殿（DoD 单测按 ooc 消息所在轮钉死）
+- **前端**：OOC 消息弱化显示（虚线边框 + 斜体 `<details>` 可折叠）
+- **DoD**：OOC 驱动的跳转/收线与面板操作同源（单测断言转移事件与 origin=manual）；
+  `/ooc` 消息不进任何记忆通道（单测钉死）；`cargo test` 492 例全绿
+
 ## [Unreleased] · 增强计划 · 包 F 小说模式（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 F（互动式散文剧；决断 9/10）
