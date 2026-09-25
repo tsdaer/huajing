@@ -633,6 +633,23 @@ async function scrollToBottom() {
   if (el) el.scrollTop = el.scrollHeight;
 }
 
+/** D10：流式滚动合帧——requestAnimationFrame 每帧最多滚一次，且仅当用户已接近
+ *  底部（80px 内）才自动跟随。逐 token 强制贴底 + 强制布局曾是长会话掉帧的来源；
+ *  回看历史时流式 token 也不再拽走视线。消息重读等主动滚动仍走 scrollToBottom。 */
+let followScrollQueued = false;
+function requestFollowScroll() {
+  if (followScrollQueued) return;
+  followScrollQueued = true;
+  requestAnimationFrame(() => {
+    followScrollQueued = false;
+    const el = streamEl.value;
+    if (!el) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) {
+      el.scrollTop = el.scrollHeight;
+    }
+  });
+}
+
 async function loadAll() {
   error.value = "";
   generating.value = false;
@@ -801,7 +818,7 @@ function onDelta(e: StreamEvent, sid: string, gen: number) {
     const name = e.name ?? last?.name ?? cardName.value;
     if (last && last.name === name) last.text += e.text;
     else streams.value.push({ name, text: e.text });
-    void scrollToBottom();
+    requestFollowScroll(); // D10：合帧滚动替代逐 token 强制布局
   } else if (e.event === "hook_event") {
     // turn 由后端带上（产生该事件的钩子轮次）；没有就回退到本地推算
     pushHookEvent(e.kind, e.value, e.turn ?? -1);

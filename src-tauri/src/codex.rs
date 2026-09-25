@@ -1258,6 +1258,13 @@ impl AliasTrie {
 pub struct Codex {
     entities: Vec<CodexEntity>,
     by_id: HashMap<String, usize>,
+    /// 加固 D6：fold(名字/别名) → 实体下标的倒排（键 = trim + 拉丁小写，与
+    /// eq_fold 同口径）。find_by_ref / 在场源原来是「每轮每角色 × 全实体 ×
+    /// (id+name+别名)」的线性扫，build 时建一次即 O(1) 查询。
+    by_ref: HashMap<String, Vec<usize>>,
+    /// 加固 D6：fold(secrets.revealed_by 声明值) → 实体下标（源 3 的声明式揭示
+    /// 原来每个 reveal 字符串全实体全秘密扫一遍）。
+    revealed_by: HashMap<String, Vec<usize>>,
     trie: AliasTrie,
     /// 无向一跳 always_with 邻接表。设计 §6.2 的注释要求"提到便签 → 连带激活小雨"
     /// （边声明在小雨侧），§6.3 的措辞是"已激活实体的一跳关系连带激活"——取两者
@@ -1270,12 +1277,30 @@ impl Codex {
     /// 重复 id 以首个为准（一致性校验在 §6.8 管线里做）。
     pub fn build(entities: Vec<CodexEntity>) -> Codex {
         let mut by_id: HashMap<String, usize> = HashMap::new();
+        let mut by_ref: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut revealed_by: HashMap<String, Vec<usize>> = HashMap::new();
         let mut trie = AliasTrie::new();
         for (i, e) in entities.iter().enumerate() {
             by_id.entry(e.id.clone()).or_insert(i);
             trie.insert(&e.name, i);
             for a in &e.aliases {
                 trie.insert(a, i);
+            }
+            // D6 倒排：ref 键与 revealed_by 声明值（fold 键与 eq_fold 同口径；
+            // 同键多实体按 build 序追加，查询取最小下标 = 原线性扫描的 position 语义）
+            for key in [&e.id, &e.name].into_iter().chain(e.aliases.iter()) {
+                let k = fold_str(key);
+                if !k.is_empty() {
+                    by_ref.entry(k).or_default().push(i);
+                }
+            }
+            for sec in e.secrets.values() {
+                if let Some(x) = sec.revealed_by.as_deref() {
+                    let k = fold_str(x);
+                    if !k.is_empty() {
+                        revealed_by.entry(k).or_default().push(i);
+                    }
+                }
             }
         }
         let mut always_with: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1297,6 +1322,8 @@ impl Codex {
         Codex {
             entities,
             by_id,
+            by_ref,
+            revealed_by,
             trie,
             always_with,
         }
@@ -1359,9 +1386,12 @@ impl Codex {
         None
     }
 
-    /// id / name / 别名精确命中（拉丁大小写不敏感）
+    /// id / name / 别名精确命中（拉丁大小写不敏感）。
+    /// D6：走 by_ref 倒排，命中取最小下标（= 原全量线性扫描的 position 语义）。
     fn find_by_ref(&self, s: &str) -> Option<usize> {
-        self.entities.iter().position(|e| ref_matches(e, s))
+        self.by_ref
+            .get(&fold_str(s))
+            .and_then(|v| v.iter().copied().min())
     }
 }
 
@@ -1573,14 +1603,10 @@ impl Codex {
             } else if let Some(i) = self.find_by_ref(r) {
                 targets.push(i);
             }
-            // 声明式揭示：secrets.revealed_by 命中（如 "state:日常.夜谈"，§6.2/§6.4）
-            for (i, e) in self.entities.iter().enumerate() {
-                if e.secrets
-                    .values()
-                    .any(|s| s.revealed_by.as_deref().is_some_and(|x| eq_fold(x, r)))
-                {
-                    targets.push(i);
-                }
+            // 声明式揭示：secrets.revealed_by 命中（如 "state:日常.夜谈"，§6.2/§6.4）。
+            // D6：revealed_by 倒排（fold 键），不再每个 reveal 全实体全秘密扫
+            if let Some(idxs) = self.revealed_by.get(&fold_str(r)) {
+                targets.extend(idxs.iter().copied());
             }
             targets.sort_unstable();
             targets.dedup();
@@ -1592,12 +1618,22 @@ impl Codex {
         }
 
         // ---- 源 2：在场（权重 4）→ 卡片 ----
+        // D6：ref 命中走倒排；地点的自由文本包含（place_contains）仍扫 place 实体
         if let Some(p) = place {
+            let mut targets: Vec<usize> = self
+                .by_ref
+                .get(&fold_str(p))
+                .map(|v| v.clone())
+                .unwrap_or_default();
             for (i, e) in self.entities.iter().enumerate() {
-                if !presentable(i) {
-                    continue;
+                if e.ty == "place" && place_contains(e, p) {
+                    targets.push(i);
                 }
-                if ref_matches(e, p) || (e.ty == "place" && place_contains(e, p)) {
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            for i in targets {
+                if presentable(i) {
                     bump(
                         &mut hits,
                         i,
@@ -1613,9 +1649,11 @@ impl Codex {
             if a.is_empty() {
                 continue;
             }
-            for (i, e) in self.entities.iter().enumerate() {
-                if presentable(i) && ref_matches(e, a) {
-                    bump(&mut hits, i, W_PRESENCE, Depth::Card, format!("在场:{a}"));
+            if let Some(idxs) = self.by_ref.get(&fold_str(a)) {
+                for &i in idxs {
+                    if presentable(i) {
+                        bump(&mut hits, i, W_PRESENCE, Depth::Card, format!("在场:{a}"));
+                    }
                 }
             }
         }
@@ -1773,9 +1811,10 @@ impl Codex {
             items.truncate(budget.max_cards);
         }
 
-        // token 预算：先降级（深度高 → 激活弱 → 输出序靠后），再裁撤（激活弱先走）
+        // token 预算：先降级（深度高 → 激活弱 → 输出序靠后），再裁撤（激活弱先走）。
+        // 加固 D7：tokens 是逐条渲染的独立估计，求和可加——运行总计替代每轮重算
+        let mut total: usize = items.iter().map(|it| it.tokens).sum();
         loop {
-            let total: usize = items.iter().map(|it| it.tokens).sum();
             if total <= budget.tokens {
                 break;
             }
@@ -1804,6 +1843,7 @@ impl Codex {
                     items[i].reasons.push(reason.to_string());
                 }
                 let (text, tokens) = render(items[i].idx, next);
+                total = total - items[i].tokens + tokens;
                 items[i].text = text;
                 items[i].tokens = tokens;
                 continue;
@@ -1824,6 +1864,7 @@ impl Codex {
             }
             match drop {
                 Some(i) => {
+                    total -= items[i].tokens;
                     items.remove(i);
                 }
                 None => break,

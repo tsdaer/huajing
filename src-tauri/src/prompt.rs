@@ -378,11 +378,29 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     let mut keep = 0usize;
     // 从尾部往前收：装得下就再收一条；装不下时只有「还没到硬性保底」才继续收。
     // 消息是整条——丢就整条丢，绝不切在一句话中间（设计 §4.2）。
+    // 加固 D7：候选串的 token 估计走字符类增量账（每行只数一次），不再每步
+    // 重新 join 全部剩余行 + 全量估计——C3 从 O(n²) 降为 O(n)。
+    let mut cand_cjk = 0usize;
+    let mut cand_other = 0usize;
     while keep < n {
-        let candidate = lines[n - keep - 1..].join("\n");
-        if estimate_tokens(&candidate) > c3_limit && keep + 1 > keep_min {
+        let line = &lines[n - keep - 1];
+        let mut line_cjk = 0usize;
+        let mut line_other = 0usize;
+        for c in line.chars() {
+            if is_cjk(c) {
+                line_cjk += 1;
+            } else {
+                line_other += 1;
+            }
+        }
+        // join 的换行计入 other（keep>0 时新行与已有正文之间多一个分隔符）
+        let new_cjk = cand_cjk + line_cjk;
+        let new_other = cand_other + line_other + usize::from(keep > 0);
+        if new_cjk + new_other.div_ceil(4) > c3_limit && keep + 1 > keep_min {
             break;
         }
+        cand_cjk = new_cjk;
+        cand_other = new_other;
         keep += 1;
     }
     let c3_content = lines[n - keep..].join("\n");
@@ -916,6 +934,72 @@ fn card_trim_note(
 ///
 /// 尾部条目先「降级」为只留 anchors/辨识点行（**anchors 行最后被裁**），仍超预算才整条
 /// 「裁撤」；裁到只剩 1 条时停手——保留排序最前那条的完整文本（设计 §4.2/§6.3）。
+/// 层文本的增量 token 账（加固 D7）：`estimate_tokens` 的估计按「整串字符类 +
+/// 一次取整」计，join 后的整串 token ≠ 各串估计之和——降级/裁撤逐条重算整层
+/// 是 O(n²)。维护整串的 cjk/other 字符计数，逐条增减后按同一公式出估计，
+/// 与整串重算逐字节一致（既有组装快照测试为基准）。
+struct LayerLedger {
+    body_cjk: usize,
+    body_other: usize,
+    /// 层标签长度（"<world>" / "<memory>"；外壳 other 字符 = 2×tag_len + 3）
+    tag_len: usize,
+}
+
+fn count_classes(text: &str) -> (usize, usize) {
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for c in text.chars() {
+        if is_cjk(c) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    (cjk, other)
+}
+
+impl LayerLedger {
+    /// 按层内条目文本建账（条目间 join 的换行计入 other）
+    fn new(cards: &[SourceCard], tag: &str) -> Self {
+        let mut led = LayerLedger {
+            body_cjk: 0,
+            body_other: 0,
+            tag_len: tag.len(),
+        };
+        for (i, c) in cards.iter().enumerate() {
+            let (cjk, other) = count_classes(&c.text);
+            led.body_cjk += cjk;
+            led.body_other += other + usize::from(i > 0);
+        }
+        led
+    }
+
+    /// 整层 render 的 token 估计（空层 render 为空串）
+    fn estimate(&self, items: usize) -> usize {
+        if items == 0 {
+            return 0;
+        }
+        self.body_cjk + (self.body_other + self.tag_len * 2 + 3).div_ceil(4)
+    }
+
+    /// 某条文本被替换（B3 降级为辨识点行）。
+    /// 账面恒 >= 0（旧文本的计数必然在账上），usize 减法走 isize 中间量防下溢。
+    fn swap_text(&mut self, old: &str, new: &str) {
+        let (oc, oo) = count_classes(old);
+        let (nc, no) = count_classes(new);
+        self.body_cjk = (self.body_cjk as isize + nc as isize - oc as isize) as usize;
+        self.body_other = (self.body_other as isize + no as isize - oo as isize) as usize;
+    }
+
+    /// 从尾部裁掉一条（B3/B4 裁撤）
+    fn remove_last(&mut self, text: &str, remaining: usize) {
+        let (c, o) = count_classes(text);
+        self.body_cjk = (self.body_cjk as isize - c as isize) as usize;
+        self.body_other =
+            (self.body_other as isize - (o + usize::from(remaining > 0)) as isize) as usize;
+    }
+}
+
 fn entity_layer(cards: &[SourceCard], limit: usize) -> Option<CardLayerText> {
     if cards.is_empty() {
         return None; // 空层省略，不产生空标签（设计 §4.3）
@@ -935,12 +1019,15 @@ fn entity_layer(cards: &[SourceCard], limit: usize) -> Option<CardLayerText> {
     let mut kept: Vec<SourceCard> = cards.to_vec();
     let mut demoted = 0usize;
     let mut culled = 0usize;
+    // D7：增量账替代每次整层重渲染
+    let mut ledger = LayerLedger::new(&kept, "<world>");
     // ① 降级：从尾部逐条降为「辨识点行」（第 1 条不降级——排序最前那条完整保留）
     let mut i = kept.len();
-    while i > 1 && estimate_tokens(&render(&kept)) > limit {
+    while i > 1 && ledger.estimate(kept.len()) > limit {
         i -= 1;
         if let Some(line) = anchors_line(&kept[i].text) {
             if line != kept[i].text {
+                ledger.swap_text(&kept[i].text, &line);
                 kept[i].tokens = estimate_tokens(&line);
                 kept[i].text = line;
                 demoted += 1;
@@ -948,8 +1035,9 @@ fn entity_layer(cards: &[SourceCard], limit: usize) -> Option<CardLayerText> {
         }
     }
     // ② 裁撤：仍超预算 → 从尾部整条裁掉（裁到只剩 1 条为止）
-    while kept.len() > 1 && estimate_tokens(&render(&kept)) > limit {
-        kept.pop();
+    while kept.len() > 1 && ledger.estimate(kept.len()) > limit {
+        let text = kept.pop().expect("len > 1");
+        ledger.remove_last(&text.text, kept.len());
         culled += 1;
     }
     let content = render(&kept);
@@ -984,8 +1072,11 @@ fn recall_layer(cards: &[SourceCard], limit: usize) -> Option<CardLayerText> {
     };
     let mut kept: Vec<SourceCard> = cards.to_vec();
     let mut culled = 0usize;
-    while !kept.is_empty() && estimate_tokens(&render(&kept)) > limit {
-        kept.pop();
+    // D7：增量账替代每次整层重渲染
+    let mut ledger = LayerLedger::new(&kept, "<memory>");
+    while !kept.is_empty() && ledger.estimate(kept.len()) > limit {
+        let text = kept.pop().expect("len > 0");
+        ledger.remove_last(&text.text, kept.len());
         culled += 1;
     }
     Some(CardLayerText {

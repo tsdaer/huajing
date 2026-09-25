@@ -175,7 +175,7 @@ pub fn get_card(dir_name: String) -> Result<card::CardDetail, String> {
 
 // ---------- sessions（设计 §12）----------
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)] // 前端一次性传入向导的全部字段，保持扁平更好用
 pub fn new_session(
     app: AppHandle,
@@ -408,14 +408,35 @@ fn project(
     event::project_over(records, &base_for(root, meta, records))
 }
 
-/// 读事件流并投影
+/// 读事件流并投影（加固 D1-2：genesis 流走增量投影缓存，成本 O(新增记录) 而非
+/// O(流长度)；老会话（基线来自派生文件）保持全量投影）。
 fn project_session(
     log: &store::EventLog,
     root: &std::path::Path,
     meta: &store::SessionMeta,
-) -> Result<event::Projection, String> {
+) -> Result<std::sync::Arc<event::Projection>, String> {
     let records = log.read(root, &meta.id).map_err(|e| e.to_string())?;
-    Ok(project(&records, root, meta))
+    Ok(project_cached(log, root, meta, &records))
+}
+
+/// D1-2：带缓存的投影——genesis 流的折叠是纯函数（基线为空），缓存可续；
+/// 老会话的基线来自派生文件，不在缓存语义内，保持全量。
+fn project_cached(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    records: &std::sync::Arc<Vec<LogRecord>>,
+) -> std::sync::Arc<event::Projection> {
+    if event::has_genesis(records) {
+        return log
+            .project_cached_records(&meta.id, records, |rs| {
+                event::project_over(rs, &event::Base::default())
+            })
+            .unwrap_or_else(|_| {
+                std::sync::Arc::new(event::project_over(records, &event::Base::default()))
+            });
+    }
+    std::sync::Arc::new(event::project_over(records, &base_for(root, meta, records)))
 }
 
 /// 投影 → 派生文件（state.json / blackboard.json / palace.jsonl）。
@@ -462,10 +483,25 @@ fn sync_now(
     log: &store::EventLog,
     root: &std::path::Path,
     meta: &store::SessionMeta,
-) -> Result<event::Projection, String> {
+) -> Result<std::sync::Arc<event::Projection>, String> {
     let proj = project_session(log, root, meta)?;
     sync_derived(root, meta, &proj)?;
     Ok(proj)
+}
+
+/// 一批事件一次落盘（加固 D1-1）：append N 条 + **一次**投影 + **一次**派生文件同步。
+/// 一轮的轮末推进/总结批次原来逐条 commit——每条都投影 + 重写 6 个派生文件
+///（palace.jsonl 是全量记忆），单轮累计 O(n²)。单事件路径 [`commit`] 是 batch=1 的包装。
+fn commit_batch(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    bodies: Vec<LogBody>,
+) -> Result<std::sync::Arc<event::Projection>, String> {
+    for body in bodies {
+        log.append(root, &meta.id, body).map_err(|e| e.to_string())?;
+    }
+    sync_now(log, root, meta)
 }
 
 /// 追加事件 → 重投影 → 落派生文件。**这是会话状态唯一的写入路径。**
@@ -474,9 +510,8 @@ fn commit(
     root: &std::path::Path,
     meta: &store::SessionMeta,
     body: LogBody,
-) -> Result<event::Projection, String> {
-    log.append(root, &meta.id, body).map_err(|e| e.to_string())?;
-    sync_now(log, root, meta)
+) -> Result<std::sync::Arc<event::Projection>, String> {
+    commit_batch(log, root, meta, vec![body])
 }
 
 /// 角色 state 现状：投影优先，空对象降级用卡上 default_state（设计 §4.3）
@@ -685,7 +720,7 @@ fn locate_message(records: &[LogRecord], index: usize) -> Option<(usize, u64)> {
 
 /// 编辑指定下标的消息内容（加固 A4/B1 包装）：入口获取会话写入闸门并全程持有，
 /// 生成/编辑进行中被拒；主体见 [`edit_message_body`]。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn edit_message(
     session_id: String,
     index: usize,
@@ -731,7 +766,7 @@ fn edit_message_body(
 
 /// 删除指定下标的消息（加固 A4/B1 包装）：入口获取会话写入闸门并全程持有；
 /// 主体见 [`delete_message_body`]。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_message(
     session_id: String,
     index: usize,
@@ -3088,22 +3123,17 @@ fn commit_reply_core(
     board.clock = clock;
     let board = scene_board_value(&proj, scene_id.as_deref(), board);
     let (stepped_day, stepped_clock) = (board.day, board.clock.clone());
-    log.append(
-        root,
-        &meta.id,
-        LogBody::Blackboard(event::BlackboardEvent {
-            turn,
-            reason: "clock".into(),
-            board,
-            scene_id: scene_id.clone(),
-            ts: store::unix_now(),
-        }),
-    )
-    .map_err(|e| e.to_string())?;
-
+    // 时钟步进 + 主动心声消费一批落盘（加固 D1-1）：事件顺序不变，落盘收敛为一次投影
+    let mut bodies = vec![LogBody::Blackboard(event::BlackboardEvent {
+        turn,
+        reason: "clock".into(),
+        board,
+        scene_id: scene_id.clone(),
+        ts: store::unix_now(),
+    })];
     // 主动心声消费（M3.5）：她这轮真的开口了 → 心里话清空 + 意图外化开线。
     // 章盖在步进后的时钟上（与 rebuild 的重放路径同口径）
-    for body in consume_proactive_say(
+    bodies.extend(consume_proactive_say(
         &proj,
         cast,
         speaker,
@@ -3111,9 +3141,8 @@ fn commit_reply_core(
         scene,
         stepped_day,
         &stepped_clock,
-    ) {
-        commit(log, root, meta, body)?;
-    }
+    ));
+    commit_batch(log, root, meta, bodies)?;
 
     // 回复落盘后跑 on_message（设计 §3：每条新消息落地后，在场成员各跑一次）
     let mut report: Option<llm::HookReport> = None;
@@ -3148,20 +3177,25 @@ fn finalize_turn(
     scene: Option<&str>,
     report: &mut llm::HookReport,
 ) -> Result<(), String> {
-    // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——在场成员各自推进，结果同样是事件
+    // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——在场成员各自推进，结果同样是事件。
+    // 加固 D1-1：全成员的 psyche 补丁一批落盘（一次投影 + 一次派生同步）
     if let Ok(proj) = project_session(log, root, meta) {
+        let mut bodies: Vec<LogBody> = Vec::new();
         for m in present_members(cast, &proj, scene) {
             let (body, emotion) = tick_psyche(&proj, &m.dir, &m.loaded, turn);
             if let Some(body) = body {
-                if let Err(e) = commit(log, root, meta, body) {
-                    report.logs.push(e);
-                }
+                bodies.push(body);
             }
             if let Some(emotion) = emotion {
                 report.ui_events.push(llm::UiEmit {
                     kind: "emotion".into(),
                     value: emotion,
                 });
+            }
+        }
+        if !bodies.is_empty() {
+            if let Err(e) = commit_batch(log, root, meta, bodies) {
+                report.logs.push(e);
             }
         }
     }
@@ -3171,6 +3205,7 @@ fn finalize_turn(
     // M3.2：判据环境与揭示见证者取本场景分区。
     let active_entities = runtime.map(|r| r.previously_active(&meta.id));
     if let Ok(proj) = project_session(log, root, meta) {
+        let mut tree_bodies: Vec<LogBody> = Vec::new();
         for m in present_members(cast, &proj, scene) {
             let Some(tree) = load_tree(&m.loaded, tree_cache) else {
                 continue;
@@ -3188,10 +3223,13 @@ fn finalize_turn(
             );
             // 转移的界面事件（on_enter 的 ui.emit）与本轮钩子事件一起回给前端
             report.ui_events.extend(emits);
-            for body in events {
-                if let Err(e) = commit(log, root, meta, body) {
-                    report.logs.push(e);
-                }
+            // D1-1：各成员的转移事件先收拢，全成员一批落盘（判据环境取的是同一份
+            // proj，与原逐条提交的判据输入一致；事件顺序 = 成员序 × 转移序，不变）
+            tree_bodies.extend(events);
+        }
+        if !tree_bodies.is_empty() {
+            if let Err(e) = commit_batch(log, root, meta, tree_bodies) {
+                report.logs.push(e);
             }
         }
     }
@@ -4613,7 +4651,7 @@ async fn run_ingest_stage(
 }
 
 /// ⑦⑧ 审阅后的落盘（确定性）：查重冲突 → 切入点切面 → 写卡 + 正史增量 + 世界线。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn ingest_commit(
     world: String,
     pack: serde_json::Value,
@@ -5763,7 +5801,7 @@ pub fn create_scene(
         &note.unwrap_or_else(|| format!("——{title}·{place_text}——")),
     )
     .map_err(|e| e.to_string())?;
-    Ok(scene_view(&sync_now(&log, &root, &meta)?))
+    Ok(scene_view(sync_now(&log, &root, &meta)?.as_ref()))
 }
 
 /// 切场（设计 §10.3：视角切到另一场景，被切走的场景冻结；插入小说式过渡）
@@ -5819,7 +5857,7 @@ fn switch_scene_at(
         }
     });
     append_transition(log, root, meta, turn, scene_id, &transition).map_err(|e| e.to_string())?;
-    Ok(scene_view(&sync_now(log, root, meta)?))
+    Ok(scene_view(sync_now(log, root, meta)?.as_ref()))
 }
 
 /// 分场（设计 §10.3：一部分角色离场另立场景，视角跟到新场景）
@@ -5873,7 +5911,7 @@ pub fn split_scene(
         &note.unwrap_or_else(|| format!("与此同时，{place_text}——{title}")),
     )
     .map_err(|e| e.to_string())?;
-    Ok(scene_view(&sync_now(&log, &root, &meta)?))
+    Ok(scene_view(sync_now(&log, &root, &meta)?.as_ref()))
 }
 
 /// 合场（设计 §10.3：两路场景并进聚焦场景——在场者并集、时间取较晚一路、
@@ -5952,7 +5990,7 @@ fn merge_scenes_at(
         &note.unwrap_or_else(|| format!("两条线在此交汇——{place}——")),
     )
     .map_err(|e| e.to_string())?;
-    Ok(scene_view(&sync_now(log, root, meta)?))
+    Ok(scene_view(sync_now(log, root, meta)?.as_ref()))
 }
 
 /// 编辑场景分区（地点/在场者/局部时钟/标题；flags 经黑板面板的场景视图维护）
@@ -7142,7 +7180,7 @@ fn decide_proposal_core(
 
 /// 收件箱批量处理（M3.8 · DoD 8）：全部确认 / 全部否决。
 /// 只动 status = propose 的条目；codex 提案照走单条同款物化。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn decide_all_proposals(
     session_id: String,
     accept: bool,
@@ -7158,12 +7196,16 @@ fn decide_all_proposals_core(
     accept: bool,
 ) -> Result<usize, String> {
     let meta = store::load_session(root, session_id).map_err(|e| e.to_string())?;
-    let pending: Vec<String> = project_session(log, root, &meta)?
+    // 加固 D9：轮次取一次——提案确认不产生新消息，批内 turn 根本不变
+    //（原来每确认一条都全量投影一次只为取它）
+    let start = project_session(log, root, &meta)?;
+    let pending: Vec<String> = start
         .proposals
         .iter()
         .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) == Some("propose"))
         .map(|(id, _)| id.clone())
         .collect();
+    let turn = start.last_message().map(|m| m.turn).unwrap_or(0);
     let world = session_world(&meta);
     for id in &pending {
         let proj = commit(
@@ -7171,10 +7213,7 @@ fn decide_all_proposals_core(
             root,
             &meta,
             LogBody::Proposal(event::ProposalEvent {
-                turn: project_session(log, root, &meta)?
-                    .last_message()
-                    .map(|m| m.turn)
-                    .unwrap_or(0),
+                turn,
                 id: id.clone(),
                 op: if accept { "accept" } else { "reject" }.into(),
                 kind: String::new(),
@@ -7455,28 +7494,50 @@ fn pick_util_provider(root: &std::path::Path) -> Result<Provider, String> {
         .ok_or_else(|| "未配置可用接入点".to_string())
 }
 
-/// 按轮回放黑板事件，取「第 turn 轮结束时」的故事时间（M3.0 ⑤）。
+/// 故事时间前缀表（加固 D8 · M3.0 ⑤）：从事件流一次遍历折出「黑板事件按轮」的
+/// 故事时刻，之后按轮二分查询。批次总结的情景记忆盖**事发时刻**的章——原实现
+/// 每条记忆都全量扫一遍事件流（O(n×k)），一批 10–30 条的长会话是实打实的平方级。
 ///
-/// 批次总结的情景记忆此前一律盖**总结时刻**的章（管线在轮末异步跑，此刻的
-/// 黑板已比事发时刻晚了很多轮）——时间线视图会把它排到错误的桶里，时间衰减
-/// 也从错误的起点开始淡去。这里从事件流里折出第 turn 轮的黑板状态；
-/// 找不到（比 init 还早）则由调用方回退当前黑板。
-fn story_time_at_turn(
-    log: &store::EventLog,
-    root: &std::path::Path,
-    meta: &store::SessionMeta,
-    turn: u64,
-) -> Option<(i64, String)> {
-    let records = log.read(root, &meta.id).ok()?;
-    let mut hit: Option<(i64, String)> = None;
-    for r in records.iter() {
-        if let LogBody::Blackboard(b) = &r.body {
-            if b.turn <= turn {
-                hit = Some((b.board.day, b.board.clock.clone()));
+/// 语义与原线性扫描逐字节一致：记录序里最后一个 `turn <= 查询轮` 的黑板事件；
+/// 事件流的黑板轮次非降（正常写入恒真）走二分，万一乱序退回线性扫保持语义。
+struct StoryTimeline {
+    /// 记录序的 (turn, day, clock)
+    rows: Vec<(u64, i64, String)>,
+    /// turn 非降（二分可用）
+    sorted: bool,
+}
+
+impl StoryTimeline {
+    fn build(records: &[LogRecord]) -> Self {
+        let mut rows: Vec<(u64, i64, String)> = Vec::new();
+        let mut sorted = true;
+        for r in records {
+            if let LogBody::Blackboard(b) = &r.body {
+                if let Some(last) = rows.last() {
+                    if b.turn < last.0 {
+                        sorted = false;
+                    }
+                }
+                rows.push((b.turn, b.board.day, b.board.clock.clone()));
             }
         }
+        StoryTimeline { rows, sorted }
     }
-    hit
+
+    /// 第 turn 轮结束时（含该轮）最后一次黑板事件的故事时间
+    fn at(&self, turn: u64) -> Option<(i64, String)> {
+        if self.sorted {
+            let idx = self.rows.partition_point(|(t, _, _)| *t <= turn);
+            idx.checked_sub(1)
+                .map(|i| (self.rows[i].1, self.rows[i].2.clone()))
+        } else {
+            self.rows
+                .iter()
+                .rev()
+                .find(|(t, _, _)| *t <= turn)
+                .map(|(_, d, c)| (*d, c.clone()))
+        }
+    }
 }
 
 /// 把总结产物落成事件（与 Tauri 无关，便于单测）：摘要增量、情景记忆、L3 事实、设定提案。
@@ -7551,12 +7612,13 @@ fn apply_summary_outcome_locked(
     let character = first_character(meta)?;
     let mut applied = 0usize;
     let ts = store::unix_now();
+    // D1-1：整批产物收拢进一个 batch，末尾一次 commit_batch（一次投影 + 一次派生同步）
+    let mut bodies: Vec<LogBody> = Vec::new();
+    // D8：故事时间前缀表——一次遍历，之后每条记忆 O(log n) 查询
+    let timeline = StoryTimeline::build(&log.read(root, &meta.id).map_err(|e| e.to_string())?);
 
     if !outcome.summary_delta.trim().is_empty() {
-        commit(
-            log,
-            root,
-            meta,
+        bodies.push(
             LogBody::Summary(event::SummaryEvent {
                 turn: to_turn,
                 delta: outcome.summary_delta.clone(),
@@ -7565,15 +7627,12 @@ fn apply_summary_outcome_locked(
                 scene_id: Some(scene_id.to_string()),
                 ts,
             }),
-        )?;
+        );
         applied += 1;
     }
     // 世界层大事记（仅公开事件）：单独成卷，任何场景组装时都能读到
     if !outcome.chronicle.trim().is_empty() {
-        commit(
-            log,
-            root,
-            meta,
+        bodies.push(
             LogBody::Summary(event::SummaryEvent {
                 turn: to_turn,
                 delta: outcome.chronicle.clone(),
@@ -7582,7 +7641,7 @@ fn apply_summary_outcome_locked(
                 scene_id: None,
                 ts,
             }),
-        )?;
+        );
         applied += 1;
     }
 
@@ -7594,7 +7653,8 @@ fn apply_summary_outcome_locked(
         // 情景记忆盖**事发时刻**的章（M3.0 ⑤）：批次内消息的故事时间从事件流折出，
         // 而不是管线运行时的当前黑板；事件流里查不到才回退当前（例如 force 总结远古批次）
         let ep_turn = ep.turns.first().copied().unwrap_or(to_turn);
-        let (ep_day, ep_clock) = story_time_at_turn(log, root, meta, ep_turn)
+        let (ep_day, ep_clock) = timeline
+            .at(ep_turn)
             .unwrap_or((story_day, story_clock.to_string()));
         let mut obj = palace::MemObject {
             id: palace::next_id(base + i + 1),
@@ -7622,17 +7682,14 @@ fn apply_summary_outcome_locked(
             obj.witnesses = obj.actors.clone();
         }
         let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
-        commit(
-            log,
-            root,
-            meta,
+        bodies.push(
             LogBody::Memory(event::MemoryEvent {
                 turn: obj.turn,
                 origin: "pipeline".into(),
                 object,
                 ts,
             }),
-        )?;
+        );
         applied += 1;
     }
 
@@ -7645,7 +7702,8 @@ fn apply_summary_outcome_locked(
     let mut hearsay_slots = base + outcome.episodes.len();
     for hs in &outcome.hearsays {
         let hs_turn = hs.turns.first().copied().unwrap_or(to_turn);
-        let (hs_day, hs_clock) = story_time_at_turn(log, root, meta, hs_turn)
+        let (hs_day, hs_clock) = timeline
+            .at(hs_turn)
             .unwrap_or((story_day, story_clock.to_string()));
         for listener in &hs.listeners {
             hearsay_slots += 1;
@@ -7668,17 +7726,14 @@ fn apply_summary_outcome_locked(
                 rehearsals: 0,
             };
             let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
-            commit(
-                log,
-                root,
-                meta,
+            bodies.push(
                 LogBody::Memory(event::MemoryEvent {
                     turn: obj.turn,
                     origin: "pipeline".into(),
                     object,
                     ts,
                 }),
-            )?;
+            );
             applied += 1;
         }
     }
@@ -7687,10 +7742,7 @@ fn apply_summary_outcome_locked(
     // origin = pipeline：模型产物随事件流重放（is_derived 只认 tree 来源），编辑历史不丢。
     for hs in &outcome.hearsays {
         for target in &hs.reveals {
-            commit(
-                log,
-                root,
-                meta,
+            bodies.push(
                 LogBody::Codex(event::CodexEvent {
                     turn: hs.turns.first().copied().unwrap_or(to_turn),
                     op: "reveal".into(),
@@ -7701,12 +7753,13 @@ fn apply_summary_outcome_locked(
                     witnesses: hs.listeners.clone(),
                     ts,
                 }),
-            )?;
+            );
             applied += 1;
         }
     }
     // L3 事实：批次末的故事时间（事实是批次里学到的，同样不该盖总结时刻的章）
-    let (fact_day, fact_clock) = story_time_at_turn(log, root, meta, to_turn)
+    let (fact_day, fact_clock) = timeline
+        .at(to_turn)
         .unwrap_or((story_day, story_clock.to_string()));
     // id 顺延在转述之后（转述记忆一条提案 × 每位听众各占一号）
     let fact_base =
@@ -7731,17 +7784,14 @@ fn apply_summary_outcome_locked(
             rehearsals: 0,
         };
         let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
-        commit(
-            log,
-            root,
-            meta,
+        bodies.push(
             LogBody::Memory(event::MemoryEvent {
                 turn: to_turn,
                 origin: "pipeline".into(),
                 object,
                 ts,
             }),
-        )?;
+        );
         applied += 1;
     }
 
@@ -7753,10 +7803,7 @@ fn apply_summary_outcome_locked(
         if a.finding == summarize::AUDIT_FACT {
             continue; // 与 codex 合并处理，见下
         }
-        commit(
-            log,
-            root,
-            meta,
+        bodies.push(
             LogBody::Proposal(event::ProposalEvent {
                 turn: to_turn,
                 id: format!("audit.{}.{}.{}", a.target, to_turn, i),
@@ -7772,7 +7819,7 @@ fn apply_summary_outcome_locked(
                 note: Some(a.evidence.clone()),
                 ts,
             }),
-        )?;
+        );
         applied += 1;
     }
     let mut codex_drafts: Vec<summarize::CodexDraft> = outcome.codex.clone();
@@ -7810,10 +7857,7 @@ fn apply_summary_outcome_locked(
                 "summary",
                 format!("设定提案与辨识点冲突，已驳回：{}（{}）", draft.target, reason),
             );
-            commit(
-                log,
-                root,
-                meta,
+            bodies.push(
                 LogBody::Proposal(event::ProposalEvent {
                     turn: to_turn,
                     id,
@@ -7824,7 +7868,7 @@ fn apply_summary_outcome_locked(
                     note: Some(format!("与辨识点冲突，自动驳回：{reason}")),
                     ts,
                 }),
-            )?;
+            );
             applied += 1;
             continue;
         }
@@ -7849,10 +7893,7 @@ fn apply_summary_outcome_locked(
                         .unwrap_or_else(store::Blackboard::default_board),
                 };
                 board.extra.insert(key, val);
-                commit(
-                    log,
-                    root,
-                    meta,
+                bodies.push(
                     LogBody::Blackboard(event::BlackboardEvent {
                         turn: to_turn,
                         reason: "pipeline".into(),
@@ -7860,16 +7901,13 @@ fn apply_summary_outcome_locked(
                         scene_id: Some(scene_id.to_string()),
                         ts,
                     }),
-                )?;
+                );
                 applied += 1;
             }
             grade if grade == complete::CaptureGrade::MinorFact && auto_minor => {
                 // 既有实体的小事实 + 用户开了自动接受：连落 propose 与 accept 两条事件
                 // （动作可溯源），物化与手动确认同一条路
-                commit(
-                    log,
-                    root,
-                    meta,
+                bodies.push(
                     LogBody::Proposal(event::ProposalEvent {
                         turn: to_turn,
                         id: id.clone(),
@@ -7880,11 +7918,8 @@ fn apply_summary_outcome_locked(
                         note: None,
                         ts,
                     }),
-                )?;
-                commit(
-                    log,
-                    root,
-                    meta,
+                );
+                bodies.push(
                     LogBody::Proposal(event::ProposalEvent {
                         turn: to_turn,
                         id,
@@ -7895,15 +7930,12 @@ fn apply_summary_outcome_locked(
                         note: Some("小事实自动接受（设置：运行期自动接受）".into()),
                         ts,
                     }),
-                )?;
+                );
                 materialize_accepted(root, &world, &draft.kind, payload);
                 applied += 2;
             }
             _ => {
-                commit(
-                    log,
-                    root,
-                    meta,
+                bodies.push(
                     LogBody::Proposal(event::ProposalEvent {
                         turn: to_turn,
                         id,
@@ -7914,7 +7946,7 @@ fn apply_summary_outcome_locked(
                         note: None,
                         ts,
                     }),
-                )?;
+                );
                 applied += 1;
             }
         }
@@ -7929,10 +7961,7 @@ fn apply_summary_outcome_locked(
             "importance": draft.importance,
             "resurface": draft.resurface_value(),
         });
-        commit(
-            log,
-            root,
-            meta,
+        bodies.push(
             LogBody::Proposal(event::ProposalEvent {
                 turn: to_turn,
                 id: format!("thread.{}.{}.{}", to_turn, i, draft.title),
@@ -7943,7 +7972,7 @@ fn apply_summary_outcome_locked(
                 note: Some(draft.framing.clone()),
                 ts,
             }),
-        )?;
+        );
         applied += 1;
     }
 
@@ -7955,10 +7984,7 @@ fn apply_summary_outcome_locked(
             "intensity": draft.intensity,
             "source": draft.source,
         });
-        commit(
-            log,
-            root,
-            meta,
+        bodies.push(
             LogBody::Proposal(event::ProposalEvent {
                 turn: to_turn,
                 id: format!("psyche.{}.{}.{}", to_turn, i, draft.name),
@@ -7969,10 +7995,12 @@ fn apply_summary_outcome_locked(
                 note: None,
                 ts,
             }),
-        )?;
+        );
         applied += 1;
     }
 
+    // D1-1：整批一次落盘
+    commit_batch(log, root, meta, bodies)?;
     Ok(applied)
 }
 
@@ -12632,5 +12660,113 @@ return { state_tree = {
         let again = acquire_flag_guard(&flags, "flag-test").expect("Drop 后要能再拿");
         drop(again);
         acquire_flag_guard(&flags, "flag-test").expect("串行多轮不受影响");
+    }
+
+    #[test]
+    fn eventlog_projection_cache_is_incremental() {
+        // D1-2：同链 append 后投影只 fold 新增（零全量折叠），rewrite 后恰一次全量重建
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let log = store::EventLog::new();
+        let fulls = std::cell::Cell::new(0u64);
+        let counted = |rs: &[LogRecord]| {
+            fulls.set(fulls.get() + 1);
+            event::project_over(rs, &event::Base::default())
+        };
+
+        let records = log.read(&root, &meta.id).unwrap();
+        let p1 = log
+            .project_cached_records(&meta.id, &records, counted)
+            .unwrap();
+        assert_eq!(fulls.get(), 1, "冷启动恰一次全量折叠");
+
+        // 同链重复投影：缓存命中，零全量
+        let again = log
+            .project_cached_records(&meta.id, &records, counted)
+            .unwrap();
+        assert_eq!(fulls.get(), 1, "命中缓存不重算");
+        assert_eq!(again.messages.len(), p1.messages.len());
+
+        // append 后投影：只 fold 新增
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Message(Message {
+                name: None,
+                turn: 9,
+                role: "user".into(),
+                content: "增量的一条".into(),
+                ts: 0,
+                scene_id: None,
+            }),
+        )
+        .unwrap();
+        let records2 = log.read(&root, &meta.id).unwrap();
+        let p2 = log
+            .project_cached_records(&meta.id, &records2, counted)
+            .unwrap();
+        assert_eq!(fulls.get(), 1, "append 后投影走增量，零全量折叠");
+        assert_eq!(p2.messages.len(), p1.messages.len() + 1);
+        assert_eq!(p2.messages.last().unwrap().content, "增量的一条");
+        assert_eq!(p2.last_seq, records2.last().unwrap().seq, "增量折叠推进 seq");
+
+        // rewrite：链被换，缓存作废 → 恰一次全量
+        log.rewrite(&root, &meta.id, &records2).unwrap();
+        let records3 = log.read(&root, &meta.id).unwrap();
+        let p3 = log
+            .project_cached_records(&meta.id, &records3, counted)
+            .unwrap();
+        assert_eq!(fulls.get(), 2, "rewrite 后恰一次全量重建");
+        assert_eq!(p3.messages.len(), p2.messages.len(), "rewrite 内容不变时投影一致");
+    }
+
+    #[test]
+    fn story_timeline_matches_linear_scan() {
+        // D8：前缀表与原线性扫描逐字节一致（含同轮重复取后者、乱序回退线性）
+        let mk = |turn: u64, day: i64, clock: &str| {
+            let mut board = store::Blackboard::default_board();
+            board.day = day;
+            board.clock = clock.into();
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn,
+                reason: "clock".into(),
+                board,
+                scene_id: None,
+                ts: 0,
+            })
+        };
+        let naive = |records: &[LogRecord], turn: u64| {
+            records
+                .iter()
+                .filter_map(|r| match &r.body {
+                    LogBody::Blackboard(b) if b.turn <= turn => {
+                        Some((b.board.day, b.board.clock.clone()))
+                    }
+                    _ => None,
+                })
+                .last()
+        };
+
+        let records: Vec<LogRecord> = vec![mk(1, 1, "08:00"), mk(2, 1, "10:00"), mk(2, 1, "11:00"), mk(5, 3, "09:00")]
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| LogRecord::new(i as u64 + 1, b))
+            .collect();
+        let tl = StoryTimeline::build(&records);
+        assert!(tl.sorted);
+        for turn in 0..=6u64 {
+            assert_eq!(tl.at(turn), naive(&records, turn), "turn={turn}");
+        }
+
+        // 乱序事件流：退回线性扫，语义与原实现完全一致
+        let bad: Vec<LogRecord> = vec![mk(5, 3, "09:00"), mk(2, 1, "10:00")]
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| LogRecord::new(i as u64 + 1, b))
+            .collect();
+        let tl = StoryTimeline::build(&bad);
+        assert!(!tl.sorted);
+        for turn in 0..=6u64 {
+            assert_eq!(tl.at(turn), naive(&bad, turn), "乱序 turn={turn}");
+        }
     }
 }

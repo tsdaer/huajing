@@ -99,6 +99,41 @@
   不再反向激活、真提及与别名路径照常
 - **C8 预算棘轮注释对齐实现**（×2、封顶 32768、至多四梯；行为不动）
 
+### Changed · 包 D 热路径性能（P2）
+
+- **D1 批量落盘 + 增量投影（最大热点）**：新增 `commit_batch`（一批事件一次
+  投影 + 一次派生文件同步；palace.jsonl 是全量记忆重写，原来每条事件都来一遍）；
+  `EventLog` 缓存 `(based_on_len, Projection)`——genesis 流的折叠是纯函数，
+  新记录只 fold 增量（O(流长度) → O(新增)），rewrite/外部截断自动失效。
+  落盘点批量化：轮末心理与状态树效果、回复时钟步进 + 心声消费、总结批次
+  （10–30 条产物一次落盘）。`project_session` 返回 `Arc<Projection>` 共享只读视图。
+  **验收仪表**：`event::FULL_FOLD_COUNT` + 单测——同链 append 后投影零全量折叠、
+  rewrite 后恰一次重建（投影语义不变的硬门槛：既有 455 测试全绿）
+- **D2 finalize 路径重复投影**：D1-2 缓存生效后 finalize/剧场/世界线的每成员
+  投影自动降为 O(新增)；finalize 内部不再有全量 fold
+- **D3 重命令移出主线程**：edit_message / delete_message / new_session /
+  ingest_commit / decide_all_proposals 改 `#[tauri::command(async)]`
+  （sync fn 落 sync_threadpool）——长会话里点编辑消息不再冻结窗口
+- **D4 EventLog 按会话分锁**：外层表只做条目查找，条目锁各自独立——
+  会话 A 的大文件增量读不再阻塞会话 B 的一切命令与后台总结
+- **D5 palace 召回三处优化（每轮必跑）**：归一化集合提升到 recall 顶层算一次；
+  打分阶段持引用、截断后仅克隆幸存条；seen 去重改 BTreeSet（确定性不变）。
+  召回结果与改前逐字节一致（32 项既有召回测试为基准）
+- **D6 codex 双倒排**：`fold(名字/别名) → idx`（find_by_ref 与在场源的
+  position 语义逐字对齐）与 `fold(revealed_by) → idx`（声明式揭示）build 时
+  建一次；每轮每角色的全实体线性扫归零。激活结果一致（35 项 codex 测试为基准）
+- **D7 裁剪增量记账**：C3 窗口裁剪、B3/B4 层降级/裁撤改字符类增量账
+  （`estimate_tokens` 整串估计不可加，按整串计数增减，结果与重算一致）；
+  codex 预算循环的逐轮求和改运行总计。组装快照测试全绿
+- **D8 故事时间前缀表**：`StoryTimeline` 一次遍历建表 + 按轮二分（乱序回退
+  线性保语义），apply_summary_outcome 的 O(n×k) 记忆盖章归零；对拍单测钉死
+  与原线性扫描逐字节一致
+- **D9 decide_all_proposals**：轮次取一次（提案确认不产生新消息），删掉
+  批内每条一次的全量投影
+- **D10 前端流式滚动合帧**：rAF 每帧最多滚一次 + 仅当用户接近底部（80px 内）
+  自动跟随——逐 token 强制贴底与强制布局不再掉帧，回看历史不被拽走视线。
+  （流式气泡子组件拆分随 E1 做）
+
 ## [0.3.0] - 2026-09-25
 
 > M3「热闹、会长大、有节奏、不串台」完成定版（代码侧 M3.0–M3.11 全部落地，

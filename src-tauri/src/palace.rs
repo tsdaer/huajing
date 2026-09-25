@@ -386,41 +386,56 @@ impl RecallHit {
     }
 }
 
+/// 一次召回的打分上下文（加固 D5）：从查询派生的归一化集合在 `recall` 顶层
+/// 算一次传入，不再在 `score_of` 里对每条记忆重复去重（每条 O(k²)）。
+struct ScoreCtx {
+    hints: Vec<(String, String)>,
+    present: Vec<(String, String)>,
+    mentions: Vec<(String, String)>,
+    threads: Vec<(String, String)>,
+    place_norm: String,
+}
+
 /// 召回：视角过滤 → 打分 → 排序（score 降序，同分按 (story_day, turn, id) 升序）
 /// → top-K → token 预算截断（至少保留 1 条）。
 ///
+/// 加固 D5：打分阶段只持引用，截断后仅克隆幸存条（不再每条整卡 clone）；
+/// seen 去重用 BTreeSet（保持确定性，不引入哈希迭代序）。
 /// 全程无哈希迭代顺序参与决策，同样的输入必然得到同样的输出（`7.3）。
 pub fn recall(objs: &[MemObject], q: &RecallQuery) -> Vec<RecallHit> {
     let viewer = normalize_tag(&q.viewer);
-    let mut hits: Vec<RecallHit> = Vec::new();
-    let mut seen_ids: Vec<String> = Vec::new();
+    let ctx = ScoreCtx {
+        hints: dedup_tags(&q.hints),
+        present: dedup_tags(&q.present),
+        mentions: dedup_tags(&q.mentions),
+        threads: dedup_tags(&q.active_threads),
+        place_norm: normalize_tag(q.place.as_deref().unwrap_or("")),
+    };
+    let mut hits: Vec<(&MemObject, f32, Vec<String>)> = Vec::new();
+    let mut seen_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for m in objs {
         // 视角过滤是硬约束（`10.4）：只召回 witnesses 含当前角色的记忆。
-        if !viewer.is_empty() && !contains_tag(&m.witnesses_or_actors(), &viewer) {
-            continue;
+        // （D5：borrow 判定，不再为过滤克隆 witnesses/actors 列表）
+        if !viewer.is_empty() {
+            let present_list = if m.witnesses.is_empty() { &m.actors } else { &m.witnesses };
+            if !contains_tag(present_list, &viewer) {
+                continue;
+            }
         }
         // B4 内部条目互斥去重（`4.1）：同一条记忆（非空 id）只出现一次。
         let id = m.id.trim();
-        if !id.is_empty() {
-            if seen_ids.iter().any(|s| s == id) {
-                continue;
-            }
-            seen_ids.push(id.to_string());
+        if !id.is_empty() && !seen_ids.insert(id.to_string()) {
+            continue;
         }
-        let (score, reasons) = score_of(m, q, &viewer);
-        hits.push(RecallHit {
-            mem: m.clone(),
-            score,
-            reasons,
-        });
+        let (score, reasons) = score_of(m, q, &ctx, &viewer);
+        hits.push((m, score, reasons));
     }
 
     hits.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.mem.story_day.cmp(&b.mem.story_day))
-            .then_with(|| a.mem.turn.cmp(&b.mem.turn))
-            .then_with(|| a.mem.id.cmp(&b.mem.id))
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.0.story_day.cmp(&b.0.story_day))
+            .then_with(|| a.0.turn.cmp(&b.0.turn))
+            .then_with(|| a.0.id.cmp(&b.0.id))
     });
 
     if q.top_k > 0 {
@@ -429,8 +444,8 @@ pub fn recall(objs: &[MemObject], q: &RecallQuery) -> Vec<RecallHit> {
     if q.budget_tokens > 0 {
         let mut used = 0usize;
         let mut keep = 0usize;
-        for h in &hits {
-            let cost = h.tokens();
+        for (m, _, _) in &hits {
+            let cost = estimate_tokens(&render_memory_line(m));
             if keep > 0 && used + cost > q.budget_tokens {
                 break;
             }
@@ -439,20 +454,27 @@ pub fn recall(objs: &[MemObject], q: &RecallQuery) -> Vec<RecallHit> {
         }
         hits.truncate(keep);
     }
-    hits
+    hits.into_iter()
+        .map(|(mem, score, reasons)| RecallHit {
+            mem: mem.clone(),
+            score,
+            reasons,
+        })
+        .collect()
 }
 
-/// 单条记忆的打分与激活原因。viewer 已归一化（空串 = 无视角）。
-fn score_of(m: &MemObject, q: &RecallQuery, viewer: &str) -> (f32, Vec<String>) {
+/// 单条记忆的打分与激活原因。viewer 已归一化（空串 = 无视角）；
+/// 查询派生的归一化集合由 [`ScoreCtx`] 一次性算好传入。
+fn score_of(m: &MemObject, q: &RecallQuery, ctx: &ScoreCtx, viewer: &str) -> (f32, Vec<String>) {
     // 加固 A5：story_day 来自 palace.jsonl 反序列化，手写 i64::MIN 会让裸减法在
     // debug 构建溢出 panic——threads.rs 同场景用的 saturating_sub，这里对齐。
     let decay = decay_factor(q.now_day.saturating_sub(m.story_day) as f64);
 
-    let hints = dedup_tags(&q.hints);
-    let present = dedup_tags(&q.present);
-    let mentions = dedup_tags(&q.mentions);
-    let threads = dedup_tags(&q.active_threads);
-    let place_norm = normalize_tag(q.place.as_deref().unwrap_or(""));
+    let hints = &ctx.hints;
+    let present = &ctx.present;
+    let mentions = &ctx.mentions;
+    let threads = &ctx.threads;
+    let place_norm = &ctx.place_norm;
 
     let mut relevance = 1.0f64;
     let mut reasons: Vec<String> = Vec::new();
@@ -461,7 +483,7 @@ fn score_of(m: &MemObject, q: &RecallQuery, viewer: &str) -> (f32, Vec<String>) 
     }
 
     // 状态树 recall 提示（「回到事发地点才想起那件事」，`5.4）。
-    for (norm, display) in &hints {
+    for (norm, display) in hints.iter() {
         if m.links_match(norm) {
             relevance += HINT_LINK_WEIGHT;
             reasons.push(format!("提示:{display}"));
@@ -469,21 +491,21 @@ fn score_of(m: &MemObject, q: &RecallQuery, viewer: &str) -> (f32, Vec<String>) 
     }
     // 当前地点：place 字段或 place: link 命中都算（记忆自带的 place 是权威值）。
     if !place_norm.is_empty()
-        && (normalize_tag(m.place.as_deref().unwrap_or("")) == place_norm
+        && (normalize_tag(m.place.as_deref().unwrap_or("")) == *place_norm
             || m.links_match(&format!("place:{place_norm}")))
     {
         relevance += PLACE_LINK_WEIGHT;
         reasons.push(format!("关联地点:{}", q.place.as_deref().unwrap_or("").trim()));
     }
     // 在场者：person: link。
-    for (norm, display) in &present {
+    for (norm, display) in present.iter() {
         if m.links_match(&format!("person:{norm}")) {
             relevance += PRESENT_LINK_WEIGHT;
             reasons.push(format!("在场者:{display}"));
         }
     }
     // 最近窗口提及的实体/话题。
-    for (norm, display) in &mentions {
+    for (norm, display) in mentions.iter() {
         if m.links_match(norm) {
             relevance += MENTION_LINK_WEIGHT;
             reasons.push(format!("提及:{display}"));

@@ -692,8 +692,13 @@ impl Projection {
     }
 }
 
+/// 全量投影计数（加固 D1 的验收仪表）：一轮对话（构造用例）的全量 fold 应 ≤2，
+/// 增量投影生效后通常为 0——测试据此断言「投影次数不再随会话长度线性恶化」。
+pub static FULL_FOLD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 在基线上折叠事件流
 pub fn project_over(records: &[LogRecord], base: &Base) -> Projection {
+    FULL_FOLD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut p = Projection {
         states: base.states.clone(),
         blackboard: base.blackboard.clone(),

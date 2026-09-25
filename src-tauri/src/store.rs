@@ -724,7 +724,9 @@ pub fn read_proposals(root: &Path, session_id: &str) -> StoreResult<Vec<serde_js
 /// 会话事件流缓存（Tauri State；跨命令复用）
 #[derive(Default)]
 pub struct EventLog {
-    inner: std::sync::Mutex<HashMap<String, LogEntry>>,
+    /// 按会话分锁（加固 D4）：外层表只做条目查找，条目内的文件 IO 与缓存操作
+    /// 持各自的锁——会话 A 的大文件增量读不再阻塞会话 B 的一切命令与后台总结。
+    inner: std::sync::Mutex<HashMap<String, std::sync::Arc<std::sync::Mutex<LogEntry>>>>,
 }
 
 #[derive(Default)]
@@ -732,6 +734,17 @@ struct LogEntry {
     records: std::sync::Arc<Vec<crate::event::LogRecord>>,
     /// 已消费到的字节偏移（最后一个完整行的行尾）
     pos: u64,
+    /// 增量投影缓存（加固 D1-2）：折叠是纯函数（基线为空的 genesis 流）时，
+    /// 新记录只 fold 进缓存——每条事件的投影成本从 O(流长度) 降到 O(新增)。
+    /// rewrite / 外部截断重置时清空。
+    proj: Option<ProjCache>,
+}
+
+#[derive(Default)]
+struct ProjCache {
+    /// 缓存投影覆盖到的记录数（records 链是 append-only 前缀扩展时才可续）
+    based_on_len: usize,
+    proj: std::sync::Arc<crate::event::Projection>,
 }
 
 fn poisoned() -> StoreError {
@@ -743,19 +756,25 @@ impl EventLog {
         EventLog::default()
     }
 
+    /// 取（或建）一个会话的缓存条目句柄；外层表锁只在这里短暂持有
+    fn entry(
+        &self,
+        session_id: &str,
+    ) -> StoreResult<std::sync::Arc<std::sync::Mutex<LogEntry>>> {
+        let mut map = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(map.entry(session_id.to_string()).or_default().clone())
+    }
+
     /// 读取会话全部事件（增量续读；无新数据时直接返回缓存 Arc，零拷贝零解析）
     pub fn read(
         &self,
         root: &Path,
         session_id: &str,
     ) -> StoreResult<std::sync::Arc<Vec<crate::event::LogRecord>>> {
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
-        sync_entry(&mut map, root, session_id)?;
-        Ok(map
-            .get(session_id)
-            .expect("sync_entry 已建立条目")
-            .records
-            .clone())
+        let entry = self.entry(session_id)?;
+        let mut e = entry.lock().map_err(|_| poisoned())?;
+        sync_entry(&mut e, root, session_id)?;
+        Ok(e.records.clone())
     }
 
     /// 消息视图（对话历史；顺序即对话顺序）
@@ -774,22 +793,22 @@ impl EventLog {
     ) -> StoreResult<crate::event::LogRecord> {
         let body = body.into();
         use std::io::Write;
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
-        sync_entry(&mut map, root, session_id)?;
+        let entry = self.entry(session_id)?;
+        let mut e = entry.lock().map_err(|_| poisoned())?;
+        sync_entry(&mut e, root, session_id)?;
 
         let path = session_dir(root, session_id).join("messages.jsonl");
-        let entry = map.get_mut(session_id).expect("sync_entry 已建立条目");
         // 加固 A3：崩溃残留的尾部半行——sync_entry 只消费完整行，pos 落后于文件长度。
         // 直接 append 会把新行粘在半行后面（非法 JSON，这条消息重启后读不回）。
         // 先补一个换行封口：半行（或无换行的整行）成为独立一行被读侧处理，pos 对齐后再写新行。
-        let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(entry.pos);
-        if file_len > entry.pos {
+        let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(e.pos);
+        if file_len > e.pos {
             let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
             f.write_all(b"\n")?;
-            entry.pos = file_len + 1;
+            e.pos = file_len + 1;
         }
 
-        let seq = entry.records.last().map(|r| r.seq).unwrap_or(0) + 1;
+        let seq = e.records.last().map(|r| r.seq).unwrap_or(0) + 1;
         let record = crate::event::LogRecord::new(seq, body);
         let line = record
             .to_line()
@@ -800,8 +819,8 @@ impl EventLog {
             .open(&path)?;
         f.write_all(line.as_bytes())?;
 
-        std::sync::Arc::make_mut(&mut entry.records).push(record.clone());
-        entry.pos += line.len() as u64;
+        std::sync::Arc::make_mut(&mut e.records).push(record.clone());
+        e.pos += line.len() as u64;
         Ok(record)
     }
 
@@ -821,11 +840,13 @@ impl EventLog {
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
         atomic_write(&dir.join("messages.jsonl"), text.as_bytes())?;
 
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
-        let entry = map.entry(session_id.to_string()).or_default();
+        let entry = self.entry(session_id)?;
+        let mut e = entry.lock().map_err(|_| poisoned())?;
         // 重新编号后缓存与文件一致（parse_lines 也是按位置编号）
-        entry.records = std::sync::Arc::new(crate::event::parse_lines(text.as_bytes(), 1).0);
-        entry.pos = text.len() as u64;
+        e.records = std::sync::Arc::new(crate::event::parse_lines(text.as_bytes(), 1).0);
+        e.pos = text.len() as u64;
+        // D1-2：链被整体换掉，投影缓存作废（下一次投影全量重算）
+        e.proj = None;
         Ok(())
     }
 
@@ -841,25 +862,57 @@ impl EventLog {
             }
         }
     }
+
+    /// 增量投影（加固 D1-2）：缓存命中（链自上次投影起只是 append 扩展）时只
+    /// fold 新增记录，否则用 `full` 全量重算并放入缓存。`full` 只应做「空基线
+    /// 全量折叠」——基线来自派生文件的老会话投影不走这条路径（基线不在缓存
+    /// 语义内）。rewrite / 外部截断重置自动失效。
+    pub fn project_cached_records(
+        &self,
+        session_id: &str,
+        records: &std::sync::Arc<Vec<crate::event::LogRecord>>,
+        full: impl Fn(&[crate::event::LogRecord]) -> crate::event::Projection,
+    ) -> StoreResult<std::sync::Arc<crate::event::Projection>> {
+        let entry = self.entry(session_id)?;
+        let mut e = entry.lock().map_err(|_| poisoned())?;
+        let cache_ok = e
+            .proj
+            .as_ref()
+            .map(|c| c.based_on_len <= records.len())
+            .unwrap_or(false);
+        let proj = if cache_ok {
+            let cache = e.proj.as_mut().expect("上面刚判过 Some");
+            let p = std::sync::Arc::make_mut(&mut cache.proj);
+            for rec in &records[cache.based_on_len..] {
+                crate::event::fold(p, rec);
+            }
+            cache.based_on_len = records.len();
+            std::sync::Arc::clone(&cache.proj)
+        } else {
+            let fresh = std::sync::Arc::new(full(records));
+            e.proj = Some(ProjCache {
+                based_on_len: records.len(),
+                proj: std::sync::Arc::clone(&fresh),
+            });
+            fresh
+        };
+        Ok(proj)
+    }
 }
 
 /// 将缓存条目推进到文件当前末尾（只解析新增的完整行）
-fn sync_entry(
-    map: &mut HashMap<String, LogEntry>,
-    root: &Path,
-    session_id: &str,
-) -> StoreResult<()> {
+fn sync_entry(entry: &mut LogEntry, root: &Path, session_id: &str) -> StoreResult<()> {
     use std::io::{Read, Seek, SeekFrom};
     let path = session_dir(root, session_id).join("messages.jsonl");
     if !path.exists() {
         return Err(StoreError::NotFound(format!("会话「{}」", session_id)));
     }
     let len = std::fs::metadata(&path)?.len();
-    let entry = map.entry(session_id.to_string()).or_default();
     if len < entry.pos {
         // 文件被外部截断/重写：丢弃缓存全量重读
         entry.pos = 0;
         std::sync::Arc::make_mut(&mut entry.records).clear();
+        entry.proj = None; // D1-2：链被换，投影缓存一并作废
     }
     if len == entry.pos {
         return Ok(());
