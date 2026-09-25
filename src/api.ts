@@ -110,13 +110,16 @@ export const api = {
       actors: bb.actors,
     }),
 
-  /** 预览组装（干跑，不发送） */
-  previewPrompt: (sessionId: string) => invoke<PromptAssembly>("preview_prompt", { sessionId }),
+  /** 预览组装（干跑，不发送）。speaker（M3.11）：以谁的视角看注入层，缺省 = 主角色 */
+  previewPrompt: (sessionId: string, speaker?: string) =>
+    invoke<PromptAssembly>("preview_prompt", { sessionId, speaker: speaker || undefined }),
   /** 最近一次实际发送的组装 */
   lastPrompt: (sessionId: string) => invoke<PromptAssembly | null>("last_prompt", { sessionId }),
 
-  /** 记忆检查器数据（M2.8）：一次拉全状态树 / 剧情线 / 心理 / 宫殿 / 设定集 / 收件箱 */
-  inspectorData: (sessionId: string) => invoke<InspectorData>("inspector_data", { sessionId }),
+  /** 记忆检查器数据（M2.8）：一次拉全状态树 / 剧情线 / 心理 / 宫殿 / 设定集 / 收件箱。
+   *  character（M3.11）：以谁的视角看（状态树/心理/宫殿/揭示集按角色分道），缺省 = 主角色 */
+  inspectorData: (sessionId: string, character?: string) =>
+    invoke<InspectorData>("inspector_data", { sessionId, character: character || undefined }),
   /** 设定收件箱：确认或否决一条提案，返回更新后的提案 */
   decideProposal: (sessionId: string, id: string, accept: boolean, note?: string) =>
     invoke<InspectorProposal>("decide_proposal", { sessionId, id, accept, note }),
@@ -204,8 +207,9 @@ export const api = {
   codexResolvePreview: (sessionId: string, day?: number) =>
     invoke<ResolvePreview>("codex_resolve_preview", { sessionId, day }),
 
-  /** 角色私有 state 现状（卡内状态面板） */
-  getCardState: (sessionId: string) => invoke<Record<string, unknown>>("get_card_state", { sessionId }),
+  /** 角色私有 state 现状（卡内状态面板）。character（M3.11）：看谁的 state，缺省主角色 */
+  getCardState: (sessionId: string, character?: string) =>
+    invoke<Record<string, unknown>>("get_card_state", { sessionId, character: character || undefined }),
   /** 卡内长期记忆写入流（palace.jsonl） */
   listCardMemory: (sessionId: string) => invoke<MemRecord[]>("list_card_memory", { sessionId }),
 

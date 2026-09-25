@@ -329,6 +329,66 @@ pub async fn chat_complete(
         "max_tokens": max_tokens,
         "stream": false,
     });
+    self_or_retry(provider, messages, max_tokens, temperature, extra_proxy, 0).await
+}
+
+/// 非流式调用的预算棘轮：推理型模型的思考 token 计入 max_tokens（M2.6 的教训），
+/// 思考太长会「finish_reason=length、正文为空」。内容为空且被长度截断时，
+/// 换 4 倍预算（封顶 16384）重试一次——非推理模型永远一次成功，不多花一分钱。
+/// M3.11 真机验收实锤：deepseek-flash 在 2048 下思考耗掉 7692 字符，素材管线的
+/// 分类/归纳全数返回空。
+fn retry_budget(max_tokens: u32) -> Option<u32> {
+    let next = max_tokens.saturating_mul(2);
+    if next == max_tokens || next > 32768 {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+fn self_or_retry<'a>(
+    provider: &'a Provider,
+    messages: &'a [ChatMessage],
+    max_tokens: u32,
+    temperature: f32,
+    extra_proxy: Option<&'a str>,
+    depth: u8,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (content, finish_reason) = chat_once_full(provider, messages, max_tokens, temperature, extra_proxy).await?;
+        let empty = content.trim().is_empty();
+        if empty && finish_reason.as_deref() == Some("length") {
+            if depth < 4 {
+                if let Some(next) = retry_budget(max_tokens) {
+                    return self_or_retry(provider, messages, next, temperature, extra_proxy, depth + 1).await;
+                }
+            }
+            return Err(format!(
+                "{} 的思考耗尽了 max_tokens（{}），加大预算后仍无正文",
+                provider.name, max_tokens
+            ));
+        }
+        Ok(content)
+    })
+}
+
+/// 一次非流式请求的完整结果：正文 + finish_reason（预算棘轮靠它判断空正文的原因）
+async fn chat_once_full(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    temperature: f32,
+    extra_proxy: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let (client, _proxy) = build_client(extra_proxy).await?;
+    let url = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
+    let body = serde_json::json!({
+        "model": provider.model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
     let resp = client
         .post(&url)
         .bearer_auth(&provider.api_key)
@@ -350,9 +410,8 @@ pub async fn chat_complete(
         .json()
         .await
         .map_err(|e| format!("响应解析失败（{}）：{e}", provider.name))?;
-    value
-        .get("choices")
-        .and_then(|c| c.get(0))
+    let choice = value.get("choices").and_then(|c| c.get(0));
+    let content = choice
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
@@ -362,7 +421,12 @@ pub async fn chat_complete(
                 "响应里没有 choices[0].message.content：{}",
                 truncate(&value.to_string(), 300)
             )
-        })
+        })?;
+    let finish_reason = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    Ok((content, finish_reason))
 }
 
 /// embeddings 地址（自检与真实调用共用，避免两处规则漂移）
@@ -626,6 +690,23 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+
+#[cfg(test)]
+mod ratchet_tests {
+    use super::*;
+
+    /// M3.11 真机验收的预算棘轮：推理型模型的思考耗尽 max_tokens 时 ×2 重试
+    /// （至多四梯），封顶 32768、到顶不再重试（宁可报错也不无限烧钱）。
+    #[test]
+    fn retry_budget_doubles_until_cap() {
+        assert_eq!(retry_budget(1024), Some(2048));
+        assert_eq!(retry_budget(2048), Some(4096));
+        assert_eq!(retry_budget(4096), Some(8192));
+        assert_eq!(retry_budget(8192), Some(16384));
+        assert_eq!(retry_budget(16384), Some(32768));
+        assert_eq!(retry_budget(32768), None, "32768 是封顶：再往上翻倍即不重试");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

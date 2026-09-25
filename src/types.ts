@@ -200,6 +200,21 @@ export interface SceneView {
   active?: string | null;
 }
 
+/** 场景操作向导（M3.11）的一次提交：新建/分场/合场/编辑各带各的字段 */
+export type SceneSubmit =
+  | { kind: "create"; title: string; place: string; actors: string[] }
+  | { kind: "split"; title: string; place: string; moving: string[] }
+  | { kind: "merge"; from: string }
+  | {
+      kind: "edit";
+      sceneId: string;
+      title: string;
+      place: string;
+      actors: string[];
+      day: number;
+      clock: string;
+    };
+
 // ---------- 角色卡（card.rs · 设计 §3）----------
 
 /** 示例对话中的一行（role: user | char） */

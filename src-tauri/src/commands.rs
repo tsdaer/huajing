@@ -296,6 +296,19 @@ fn first_character(meta: &store::SessionMeta) -> Result<String, String> {
         .ok_or_else(|| "会话未配置角色".to_string())
 }
 
+/// 检查器/预览的视角解析（M3.11 多角色检查器）：显式角色必须在阵容里，
+/// 缺省 = 主角色。1v1 走同一条路径，行为不变。
+fn resolve_viewpoint(
+    meta: &store::SessionMeta,
+    character: Option<String>,
+) -> Result<String, String> {
+    match character {
+        Some(dir) if meta.characters.iter().any(|c| c == &dir) => Ok(dir),
+        Some(dir) => Err(format!("角色「{dir}」不在这个会话的阵容里")),
+        None => first_character(meta),
+    }
+}
+
 /// 角色阵容的一个成员：目录名 + 已装载卡
 pub struct CastMember {
     pub dir: String,
@@ -1886,7 +1899,14 @@ fn assemble_prompt_core(
             speaker_run = Some((run, before));
         }
     }
-    let (run, before) = speaker_run.expect("发言人必在场（调用方已校验）");
+    // 发言人不在本场景的在场名单（检查器预览场外成员 / 重roll 后场景变动）：
+    // 她不在台上——on_context 不跑（与冻结场景同一纪律：不参与轮转的成员钩子全跳过），
+    // B 层照常按她的视角组装（状态取既有 state）。此前这里是 panic——
+    // 异步命令里 panic 前端 promise 永不返回（真机 M3.11 验收当场暴露）
+    let (run, before) = match speaker_run {
+        Some(pair) => pair,
+        None => (card::HookRun::default(), current_state(proj, &character, loaded)),
+    };
     let card_state = run.state.clone().unwrap_or_else(|| before.clone());
 
     // ---- B2 指令层：状态树活跃路径的 directive（设计 §7.4「输出约束」）----
@@ -2400,7 +2420,8 @@ fn run_message_hooks(
             other_logs.extend(report.logs);
         }
     }
-    let mut report = speaker_report.expect("发言人必在场（调用方已校验）");
+    // 发言人不在场（场景变动后重roll 等边缘）：空报告 = 钩子不跑，不 panic
+    let mut report = speaker_report.unwrap_or_default();
     report.logs.extend(other_logs);
     report
 }
@@ -2773,7 +2794,8 @@ fn commit_reply_core(
             other_logs.extend(r.logs);
         }
     }
-    let mut report = report.expect("发言人必在场（调用方已校验）");
+    // 发言人不在场（场景变动后的边缘）：空报告 = 钩子不跑，不 panic
+    let mut report = report.unwrap_or_default();
     report.logs.extend(other_logs);
     Ok(report)
 }
@@ -5936,6 +5958,7 @@ fn codex_complete_apply_core(
 pub async fn preview_prompt(
     app: AppHandle,
     session_id: String,
+    speaker: Option<String>,
     log: State<'_, store::EventLog>,
     codex_cache: State<'_, CodexCache>,
     runtime: State<'_, SessionRuntime>,
@@ -5945,6 +5968,8 @@ pub async fn preview_prompt(
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
     let cast = Cast::load(&root, &meta)?;
+    // M3.11 多角色检查器：`speaker` = 以谁的视角预览注入层；缺省 = 主角色
+    let speaker = resolve_viewpoint(&meta, speaker)?;
     let proj = project_session(&log, &root, &meta)?;
     let scene = scene_ctx(&proj);
     let turn = proj.messages.last().map(|m| m.turn).unwrap_or(0) + 1;
@@ -5967,7 +5992,7 @@ pub async fn preview_prompt(
         &root,
         &meta,
         &cast,
-        cast.first().dir.as_str(),
+        &speaker,
         &proj.messages,
         &proj,
         None,
@@ -6451,25 +6476,25 @@ fn timeline_entries(
 /// 一次给全：状态树路径与转移历史、剧情线、心理、宫殿三视图、设定集清单与揭示集。
 /// 设计 §14：这些面板合称「记忆检查器」——看「我们处于哪个阶段、欠着什么线、
 /// 她心里在想什么、她记得什么、这次注入了什么」。
+#[allow(clippy::too_many_arguments)]
 fn inspector_payload(
     root: &std::path::Path,
     meta: &store::SessionMeta,
+    character: &str,
     loaded: &card::LoadedCard,
     proj: &event::Projection,
     codex_cache: Option<&CodexCache>,
     tree_cache: Option<&TreeCache>,
     runtime: Option<&SessionRuntime>,
 ) -> Result<serde_json::Value, String> {
-    let character = first_character(meta)?;
     let board = blackboard_of(proj);
     let bb_map = blackboard_env(&board);
 
     // 状态树：活跃路径 + 最近转移历史（新的在前）；M3.1 起按角色分道
-    // （检查器暂以主角色视角展示，逐视角切换的完整面板在 M3.10）
     let tree = load_tree(loaded, tree_cache);
     let path = tree
         .as_ref()
-        .map(|t| active_path_of(proj, t, &character))
+        .map(|t| active_path_of(proj, t, character))
         .unwrap_or_default();
     let state_tree = tree.as_ref().map(|t| {
         serde_json::json!({
@@ -6482,8 +6507,15 @@ fn inspector_payload(
             "warnings": t.validate(),
         })
     });
-    let transitions: Vec<&event::TransitionEvent> =
-        proj.transitions.iter().rev().take(20).collect();
+    // M3.11 视角切换：转移按角色分道，其他角色的转移不进这个视角的面板
+    // （旧会话的转移无 character 字段 = 单角色历史，任何视角都认）
+    let transitions: Vec<&event::TransitionEvent> = proj
+        .transitions
+        .iter()
+        .rev()
+        .filter(|t| t.character.as_deref().map(|c| c == character).unwrap_or(true))
+        .take(20)
+        .collect();
 
     // 剧情线：活跃/已了结/已放弃 + C1 的只读投影
     let thread_list: Vec<threads::Thread> = proj
@@ -6530,7 +6562,7 @@ fn inspector_payload(
         .collect();
 
     // 心理：内心摘要 + 情绪槽 + 意图（含触发记录）+ 心里话队列 + 衰减轨迹
-    let state = current_state(proj, &character, loaded);
+    let state = current_state(proj, character, loaded);
     let p = psyche::Psyche::from_state(&state);
     let psyche_view = serde_json::json!({
         "summary": p.summary_line_for(&loaded.card.name),
@@ -6542,7 +6574,7 @@ fn inspector_payload(
     });
 
     // 宫殿：三视图 + 最近记忆（每条都能溯源到轮次）
-    let memories = memory_objects(proj, &character, board.day);
+    let memories = memory_objects(proj, character, board.day);
     let palace_view = serde_json::json!({
         "count": memories.len(),
         "rooms": palace::rooms(&memories),
@@ -6625,7 +6657,7 @@ fn inspector_payload(
         "codex": { "world": world, "count": entities.len(), "entities": entities },
         "summary": proj.summary,
         "proposals": proposals,
-        "known": proj.known_for(&character).into_iter().collect::<Vec<_>>(),
+        "known": proj.known_for(character).into_iter().collect::<Vec<_>>(),
         "blackboard": board,
         "activeEntities": runtime.map(|r| r.previously_active(&meta.id)).unwrap_or_default(),
     }))
@@ -6873,10 +6905,13 @@ fn transient_key_value(value: &serde_json::Value) -> Option<(String, serde_json:
     Some((key, val.clone()))
 }
 
-/// 记忆检查器数据（M2.8 面板）：一次性给前端全部投影视图
+/// 记忆检查器数据（M2.8 面板）：一次性给前端全部投影视图。
+/// M3.11 多角色检查器：`character` = 以谁的视角看（状态树/心理/宫殿/揭示集按角色分道），
+/// 必须在阵容里；缺省 = 主角色，1v1 行为不变。
 #[tauri::command]
 pub fn inspector_data(
     session_id: String,
+    character: Option<String>,
     log: State<'_, store::EventLog>,
     codex_cache: State<'_, CodexCache>,
     tree_cache: State<'_, TreeCache>,
@@ -6884,11 +6919,13 @@ pub fn inspector_data(
 ) -> Result<serde_json::Value, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let viewpoint = resolve_viewpoint(&meta, character)?;
+    let loaded = card::load_card(&root, &viewpoint).map_err(|e| e.to_string())?;
     let proj = project_session(&log, &root, &meta)?;
     inspector_payload(
         &root,
         &meta,
+        &viewpoint,
         &loaded,
         &proj,
         Some(&codex_cache),
@@ -7598,10 +7635,15 @@ pub async fn summarize_now(session_id: String) -> Result<String, String> {
 
 /// 角色私有 state 现状（会话快照为空时回退卡上 `state` 初始值）
 #[tauri::command]
-pub fn get_card_state(session_id: String) -> Result<serde_json::Value, String> {
+/// 卡内私有 state 现状（卡内状态面板）。M3.11：`character` = 看谁的 state，缺省主角色。
+pub fn get_card_state(
+    session_id: String,
+    character: Option<String>,
+) -> Result<serde_json::Value, String> {
     let root = root();
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
-    let loaded = card::load_card(&root, &first_character(&meta)?).map_err(|e| e.to_string())?;
+    let viewpoint = resolve_viewpoint(&meta, character)?;
+    let loaded = card::load_card(&root, &viewpoint).map_err(|e| e.to_string())?;
     load_card_state(&root, &meta, &loaded)
 }
 
@@ -8304,6 +8346,110 @@ return {
         assert_eq!(stored_state(&root, &meta), state_before, "预览不改状态");
     }
 
+    /// M3.11 真机验收暴露的缺陷：发言人不在这个场景的在场名单时，
+    /// assemble_prompt_core 里的 expect 直接 panic——异步命令里 panic 让前端
+    /// promise 永不返回（检查器预览场外成员 / 重roll 后场景变动的边缘都会踩）。
+    /// 纪律：不参与轮转的成员钩子全跳过（与冻结场景一致），B 层照常按她的视角组装。
+    #[test]
+    fn assembling_an_offstage_member_skips_hooks_instead_of_panicking() {
+        let ache = r#"
+return {
+  spec = 'charcard/1.0', name = '阿澈', scenario = '图书馆', personality = '爽朗', first_mes = '（阿澈入席）',
+  state = { favorability = 10 },
+  hooks = {
+    on_context = function(ctx, state)
+      state.favorability = (state.favorability or 0) + 1
+      ctx.inject('system', '【阿澈在场】')
+    end,
+  },
+}
+"#;
+        let xiaoyu = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+}
+"#;
+        let (_dir, meta, root) = setup_cast2(xiaoyu, ache);
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+        // 小玲式的离场：把阿澈从**聚焦场景分区**的在场名单划掉
+        // （真机的 update_blackboard 命令写的就是场景分区；世界层事件不动分区）
+        let mut proj = project_session(&log, &root, &meta).unwrap();
+        let mut board = blackboard_of(&proj);
+        board.actors = vec!["小雨".into()];
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 0,
+                reason: "manual".into(),
+                scene_id: Some(scene::DEFAULT_SCENE_ID.into()),
+                board,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        proj = project_session(&log, &root, &meta).unwrap();
+
+        // 场外成员组装：不 panic，A1/B 层照常，但她的 on_context 没跑（好感不动、无注入行）
+        let run = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &cast,
+            "阿澈",
+            &proj.messages.clone(),
+            &proj,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            Some(scene::DEFAULT_SCENE_ID), // 聚焦场景：阿澈已不在场
+            &[],
+        )
+        .expect("场外成员应能组装而非 panic");
+        assert!(!run.assembly.layers.is_empty());
+        let joined = run
+            .assembly
+            .layers
+            .iter()
+            .map(|l| l.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("【阿澈在场】"), "不在台上的成员 on_context 不跑：{joined}");
+        assert!(
+            !joined.contains("【阿澈在场】"),
+            "不在台上的成员 on_context 不跑（无她的注入行）：{joined}"
+        );
+        assert_eq!(
+            run.card_state["favorability"], serde_json::json!(10),
+            "on_context 没跑：好感不动（她注入行也没有）"
+        );
+        assert!(run.ui_events.is_empty(), "场外成员无界面事件：{:?}", run.ui_events);
+        // 在场成员照常跑钩子（对照面：主角色小雨没有钩子，但机制上 present 循环未被跳过）
+        let run2 = assemble_prompt_core(
+            &noop_sink(),
+            &root,
+            &meta,
+            &cast,
+            "小雨",
+            &proj.messages.clone(),
+            &proj,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            Some(scene::DEFAULT_SCENE_ID),
+            &[],
+        )
+        .expect("在场成员照常组装");
+        assert!(!run2.assembly.layers.is_empty());
+    }
+
     #[test]
     fn regenerate_plan_rolls_back_reply_or_retries_failed_turn() {
         let user = |turn, content: &str| Message {
@@ -8924,11 +9070,17 @@ return {
             b2.content
         );
 
-        // 重放同一事件流得到同一条路径（设计 §7.3-5）
+        // 重放同一事件流得到同一条路径（设计 §7.3-5）。
+        // 转移是重放时重导的派生事件，ts 取重放时刻——比较时忽略它（跨秒边界会偶发）
         let records = log.read(&root, &meta.id).unwrap();
         let rebuilt = rebuild_from(&log, &root, &meta, &single_cast(&meta, &loaded), &records, 1).unwrap();
         let c = event::project_over(&rebuilt, &event::Base::default());
-        assert_eq!(c.transitions, proj.transitions, "重放得到同一批转移");
+        let shape = |ts: &[event::TransitionEvent]| -> Vec<(u64, Vec<String>, Vec<String>, String)> {
+            ts.iter()
+                .map(|t| (t.turn, t.from.clone(), t.to.clone(), t.reason.clone()))
+                .collect()
+        };
+        assert_eq!(shape(&c.transitions), shape(&proj.transitions), "重放得到同一批转移");
         assert_eq!(c.known_for("小雨"), proj.known_for("小雨"), "重放得到同一份揭示集");
     }
 
@@ -8960,7 +9112,8 @@ return {
         simulate_turn(&root, &meta, &loaded, &log, 1, "谢谢你。");
 
         let proj = project_session(&log, &root, &meta).unwrap();
-        let payload = inspector_payload(&root, &meta, &loaded, &proj, None, None, None).unwrap();
+        let payload =
+            inspector_payload(&root, &meta, "小雨", &loaded, &proj, None, None, None).unwrap();
 
         assert_eq!(payload["character"], "小雨");
         let tree = &payload["stateTree"];
@@ -8985,6 +9138,115 @@ return {
         assert_eq!(payload["threads"]["active"].as_array().unwrap().len(), 0);
         assert_eq!(payload["codex"]["world"], "default");
         assert!(payload["known"].as_array().unwrap().is_empty());
+    }
+
+    /// M3.11 多角色检查器：面板逐视角切换——状态树转移/宫殿/揭示集按角色分道，
+    /// 仅 A 见过的事实不出现在 B 的检查器面板（DoD 4 的检查器侧镜像）。
+    #[test]
+    fn inspector_serves_each_viewpoint_in_a_multi_character_session() {
+        let xiaoyu = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = { favorability = 50 },
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '轻松日常。',
+        transitions = {
+          { to = '夜谈', priority = 5,
+            when = function(ev, bb, st)
+              return (bb.clock or '') >= '21:00'
+            end },
+        },
+      },
+      ['夜谈'] = { parent = '日常', directive = '夜深人静。', reveal = { 'char.小雨.secrets.工作牌' } },
+    },
+  },
+}
+"#;
+        let ache = r#"
+return {
+  spec = 'charcard/1.0', name = '阿澈', scenario = '图书馆', personality = '爽朗', first_mes = '（阿澈入席）',
+}
+"#;
+        let (_dir, meta, root) = setup_cast2(xiaoyu, ache);
+        let dir = root.join("codex/default/entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("char.小雨.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'char.小雨', type = 'char', name = '小雨',
+  aliases = { '夜班管理员' },
+  one_liner = '大学图书馆夜班管理员。',
+  facts = { look = { impression = '旧毛衣' } },
+  secrets = {
+    ['工作牌'] = { content = '她挂着的旧胸牌，其实是已故母亲的遗物。', known_by = { '小雨' } },
+  },
+}
+"#,
+        )
+        .unwrap();
+
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+        // 阿澈离场：reveal 的见证者只剩小雨
+        let mut proj = project_session(&log, &root, &meta).unwrap();
+        let mut board = blackboard_of(&proj);
+        board.actors = vec!["小雨".into()];
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 0,
+                reason: "manual".into(),
+                scene_id: None,
+                board,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+        // 第一轮（小雨发言）：越过门槛转移进「夜谈」并 reveal 秘密
+        simulate_turn_as(&root, &meta, &cast, "小雨", &log, 1, "小雨，你的胸牌挺特别的。");
+        proj = project_session(&log, &root, &meta).unwrap();
+
+        let secret_path = "char.小雨.secrets.工作牌";
+        let yu = card::load_card(&root, "小雨").unwrap();
+        let che = card::load_card(&root, "阿澈").unwrap();
+
+        // 小雨视角：转移史是她的，揭示集含秘密
+        let pyu = inspector_payload(&root, &meta, "小雨", &yu, &proj, None, None, None).unwrap();
+        assert!(pyu["transitions"].as_array().unwrap().iter().any(|t| {
+            t["to"].as_array().unwrap().last().map(|s| s == "夜谈").unwrap_or(false)
+        }), "小雨视角应有夜谈转移：{:?}", pyu["transitions"]);
+        assert!(
+            pyu["known"].as_array().unwrap().iter().any(|k| k == secret_path),
+            "小雨视角的揭示集应含秘密：{:?}",
+            pyu["known"]
+        );
+        assert_eq!(pyu["stateTree"]["path"].as_array().unwrap().last(), Some(&serde_json::json!("夜谈")));
+
+        // 阿澈视角：没有自己的转移，揭示集无秘密——检查器面板与注入层同一纪律
+        let pche = inspector_payload(&root, &meta, "阿澈", &che, &proj, None, None, None).unwrap();
+        assert!(
+            pche["transitions"].as_array().unwrap().is_empty(),
+            "阿澈视角不应看到小雨的转移：{:?}",
+            pche["transitions"]
+        );
+        assert!(
+            !pche["known"].as_array().unwrap().iter().any(|k| k == secret_path),
+            "串台：仅小雨见过的秘密不得进阿澈的揭示集面板：{:?}",
+            pche["known"]
+        );
+
+        // 不在阵容里的视角直接报错（命令入口的 resolve_viewpoint 必须守住）
+        assert!(
+            resolve_viewpoint(&meta, Some("路人".into())).is_err(),
+            "阵容外的视角应被拒绝"
+        );
+        assert!(resolve_viewpoint(&meta, Some("小雨".into())).is_ok());
+        assert_eq!(resolve_viewpoint(&meta, None).unwrap(), "小雨", "缺省 = 主角色");
     }
 
     /// M2.6 数据模型：摘要增量与设定提案进事件流，派生文件（summary.md / proposals.jsonl）由投影写出；
@@ -9072,7 +9334,8 @@ return {
 
         // 检查器面板能看到摘要与提案
         let proj_view = project_session(&log, &root, &meta).unwrap();
-        let payload = inspector_payload(&root, &meta, &loaded, &proj_view, None, None, None).unwrap();
+        let payload =
+            inspector_payload(&root, &meta, "小雨", &loaded, &proj_view, None, None, None).unwrap();
         assert!(payload["summary"].as_str().unwrap().contains("第二段"));
         assert_eq!(payload["proposals"][0]["status"], "accept");
 

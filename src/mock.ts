@@ -403,6 +403,8 @@ export function setupMock() {
       sessionId?: string;
       content?: string;
       index?: number;
+      character?: string;
+      speaker?: string;
       onEvent?: { onmessage?: (e: StreamEvent) => void };
       provider?: Provider;
       name?: string;
@@ -459,11 +461,12 @@ export function setupMock() {
       case "get_card":
         return cardDetail;
       case "list_sessions":
+        // M3.11：mock 会话升级为双角色阵容——群聊 UI（发言权/视角切换/同台徽标）浏览器模式可走查
         return [
           {
             id: sessionId,
             created_at: "2026-09-19T10:15:00Z",
-            characters: ["小雨"],
+            characters: ["小雨", "阿澈"],
             persona: "夜读者",
             seed: 42,
           } satisfies SessionMeta,
@@ -473,7 +476,7 @@ export function setupMock() {
         return {
           id: sessionId,
           created_at: "2026-09-19T10:15:00Z",
-          characters: q.characters?.length ? q.characters : ["小雨"],
+          characters: q.characters?.length ? q.characters : ["小雨", "阿澈"],
           persona: "夜读者",
           seed: 42,
         } satisfies SessionMeta;
@@ -537,7 +540,10 @@ export function setupMock() {
       case "import_st_card":
         throw new Error("浏览器 mock 不支持导入：请用 pnpm tauri dev");
       case "get_card_state":
-        return { ...mockCardState };
+        // M3.11 视角切换：mock 示意数据不分角色，带一条标记以示来源
+        return a.character
+          ? { ...mockCardState, [`【${a.character}的state】`]: "（mock 示意）" }
+          : { ...mockCardState };
       case "list_card_memory":
         return memoryRecords;
       // ---------- 场景与多线（M3.2 · 设计 §10.3） ----------
@@ -585,11 +591,73 @@ export function setupMock() {
         });
         return sceneView();
       }
-      case "split_scene":
-      case "merge_scenes":
-        throw new Error("浏览器 mock 不支持分场/合场：请用 pnpm tauri dev");
-      case "update_scene":
+      case "split_scene": {
+        // M3.11：mock 实装分场语义——moving 离场另立新场景，原场景冻结，视角跟过去
+        const q = a as unknown as { title: string; place: string; moving: string[] };
+        const here = mockScenes.find((x) => x.id === activeScene);
+        const id = `scene.${Date.now()}`;
+        mockScenes.push({
+          id,
+          title: q.title,
+          place: q.place,
+          actors: [...(q.moving ?? [])],
+          day: here?.day ?? blackboard.day,
+          clock: here?.clock ?? blackboard.clock,
+          created_turn: 0,
+          origin: "split",
+          parent: activeScene,
+          status: "active",
+          ts: Math.floor(Date.now() / 1000),
+        });
+        if (here) {
+          here.actors = here.actors.filter((x) => !(q.moving ?? []).includes(x));
+          here.status = "frozen";
+        }
+        activeScene = id;
+        messages.push({
+          turn: 0,
+          role: "system",
+          content: `与此同时，${q.place || q.title}——`,
+          ts: Math.floor(Date.now() / 1000),
+          scene_id: id,
+        });
         return sceneView();
+      }
+      case "merge_scenes": {
+        // M3.11：mock 实装合场语义——在场者并集、时间取较晚、被并入方归档，记忆零写入
+        const from = ((a as unknown as { from: string[] }).from ?? []) as string[];
+        const here = mockScenes.find((x) => x.id === activeScene);
+        for (const id of from) {
+          const sc = mockScenes.find((x) => x.id === id);
+          if (!sc || !here) continue;
+          for (const who of sc.actors) if (!here.actors.includes(who)) here.actors.push(who);
+          if (sc.day > here.day || (sc.day === here.day && sc.clock > here.clock)) {
+            here.day = sc.day;
+            here.clock = sc.clock;
+          }
+          sc.status = "merged";
+        }
+        return sceneView();
+      }
+      case "update_scene": {
+        const q = a as unknown as {
+          sceneId: string;
+          title?: string;
+          place?: string;
+          actors?: string[];
+          day?: number;
+          clock?: string;
+        };
+        const sc = mockScenes.find((x) => x.id === q.sceneId);
+        if (sc) {
+          if (q.title !== undefined) sc.title = q.title;
+          if (q.place !== undefined) sc.place = q.place;
+          if (q.actors !== undefined) sc.actors = [...q.actors];
+          if (q.day !== undefined) sc.day = q.day;
+          if (q.clock !== undefined) sc.clock = q.clock;
+        }
+        return sceneView();
+      }
       // ---------- 剧场模式（M3.6 · 设计 §10.5）：浏览器 mock 只做视图示意 ----------
       case "theater_view":
         return mockTheaterView;
@@ -663,9 +731,10 @@ export function setupMock() {
       // 记忆检查器（M2.8）：形状与 commands.rs 的 inspector_data 对齐，
       // 让浏览器调试路径也能看到 M2 的七个面板（数据是示意值，不参与对话逻辑）。
       case "inspector_data":
+        // M3.11 视角切换：多角色时按 character 回显视角（示意数据本身不分视角）
         return {
           session: a.sessionId ?? "mock",
-          character: "小雨",
+          character: (a as { character?: string }).character || "小雨",
           stateTree: {
             root: "日常",
             path: ["日常", "日常.夜谈"],

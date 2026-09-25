@@ -151,8 +151,12 @@ pub struct ProposalEvent {
     pub id: String,
     /// propose | accept | reject
     pub op: String,
-    /// new_entity | new_fact | fact_change | relation | episode | thread | psyche
-    #[serde(default)]
+    /// new_entity | new_fact | fact_change | relation | episode | thread | psyche。
+    /// **线上键是 `proposal_kind`**：事件流行已有判别键 `kind`（"proposal"），
+    /// M3.11 真机验收发现同名互相覆盖——落盘后 codex kind 全变成 "proposal"，
+    /// 收件箱确认因此拿不到类型、从未物化过 codex 类提案（补全路径直调
+    /// materialize 才幸存）。
+    #[serde(default, rename = "proposal_kind")]
     pub kind: String,
     #[serde(default = "default_origin")]
     pub origin: String,
@@ -1120,6 +1124,53 @@ pub fn state_patch(before: &serde_json::Value, after: &serde_json::Value) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M3.11 真机验收发现的缺陷：ProposalEvent 自身的 codex kind 与事件流行的
+    /// 判别键 `kind` 同名，to_value 的判别插入把它覆盖成 "proposal"——落盘即失真，
+    /// 收件箱确认读不到类型、codex 类提案从未物化进 grown.json。
+    /// 线上键改 `proposal_kind` 后往返必须保真。
+    #[test]
+    fn proposal_kind_survives_the_log_roundtrip() {
+        let ev = ProposalEvent {
+            turn: 4,
+            id: "codex.char.小雨.4.0".into(),
+            op: "propose".into(),
+            kind: "new_fact".into(),
+            origin: "pipeline".into(),
+            payload: Some(serde_json::json!({
+                "target": "char.小雨",
+                "value": { "facet": "schedule", "value": "周三休息" },
+                "reason": "第 4 轮提到",
+            })),
+            note: None,
+            ts: 0,
+        };
+        let v = LogBody::Proposal(ev.clone()).to_value().unwrap();
+        // 行判别键仍是 "proposal"（from_value 靠它分派）
+        assert_eq!(v["kind"], "proposal");
+        // codex kind 活在 proposal_kind 里，不再被覆盖
+        assert_eq!(v["proposal_kind"], "new_fact");
+        let back = match LogBody::from_value(v).unwrap() {
+            LogBody::Proposal(p) => p,
+            other => panic!("应还原为提案事件：{other:?}"),
+        };
+        assert_eq!(back.kind, "new_fact");
+        assert_eq!(back, ev);
+        // 投影折叠后收件箱条目带 codex kind（materialize 靠它分流）
+        let mut proj = Projection::default();
+        fold(
+            &mut proj,
+            &LogRecord {
+                seq: 1,
+                body: LogBody::Proposal(back),
+            },
+        );
+        assert_eq!(
+            proj.proposals["codex.char.小雨.4.0"]["kind"], "new_fact",
+            "收件箱条目的 kind 应是 codex 类型"
+        );
+    }
+
 
     fn msg(turn: u64, role: &str, content: &str) -> Message {
         Message {

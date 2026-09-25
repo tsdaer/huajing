@@ -19,6 +19,8 @@ import type {
 } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
+import SceneDialog from "../components/SceneDialog.vue";
+import type { SceneSubmit } from "../types";
 import StatePathPanel from "../components/inspector/StatePathPanel.vue";
 import ThreadsPanel from "../components/inspector/ThreadsPanel.vue";
 import PsychePanel from "../components/inspector/PsychePanel.vue";
@@ -122,6 +124,8 @@ async function calibrateWorld(day: number) {
 const inspector = ref<InspectorData | null>(null);
 const inspLoading = ref(false);
 const inspError = ref("");
+/** M3.11 多角色检查器：以谁的视角看（角色目录名；"" = 主角色）。1v1 无选择器 */
+const inspView = ref("");
 /** 「立即总结」的进行态与结果（总结可能较慢） */
 const summarizing = ref(false);
 const summaryResult = ref("");
@@ -133,13 +137,21 @@ async function loadInspector() {
   inspLoading.value = true;
   inspError.value = "";
   try {
-    inspector.value = await api.inspectorData(props.meta.id);
+    inspector.value = await api.inspectorData(props.meta.id, inspView.value || undefined);
   } catch (e) {
     inspError.value = String(e);
   } finally {
     inspLoading.value = false;
   }
 }
+
+/** 切视角：检查器重拉 + 注入层切到该视角的预览（「最近一次发送」是别人的组装，不再适用）；
+ *  卡内状态也跟着换人（getCardState 按视角） */
+watch(inspView, () => {
+  if (panel.value === "inspector") void loadInspector();
+  void refreshCard();
+  void refreshInspector();
+});
 
 /** 打开抽屉时拉一次；已经有数据就复用缓存，重拉交给「刷新」 */
 function ensureInspector() {
@@ -424,9 +436,6 @@ const scenes = ref<Scene[]>([]);
 const activeScene = ref("");
 const sceneBusy = ref(false);
 
-/** 当前场景的信息（冻结标识、在场者） */
-const activeSceneInfo = computed(() => scenes.value.find((sc) => sc.id === activeScene.value));
-
 /** 消息的场景视图：只显示聚焦场景的分段（index 保留在**全量**消息流里的下标，
  *  编辑/删除仍按全量下标发给后端）。过渡插页（system）永远显示。 */
 const sceneMessagesView = computed(() =>
@@ -496,89 +505,42 @@ async function switchTo(sc: Scene) {
   }
 }
 
-/** 新建场景（prompt 三连：标题/地点/在场者——v0 用系统对话框，M3.10 再换成向导） */
-async function createSceneCmd() {
-  const title = window.prompt("新场景的标题（如：坡下的旧书店）");
-  if (!title?.trim()) return;
-  const place = window.prompt("新场景的地点") ?? "";
-  const castHint = props.meta.characters.join(", ");
-  const actorsRaw = window.prompt(`在场角色（逗号分隔；可选：${castHint}）`, castHint) ?? "";
-  sceneBusy.value = true;
-  error.value = "";
-  try {
-    const view = await api.createScene(
-      props.meta.id,
-      title.trim(),
-      place.trim(),
-      actorsRaw
-        .split(/[,，]/)
-        .map((a) => a.trim())
-        .filter(Boolean),
-    );
-    scenes.value = view.scenes;
-    activeScene.value = view.active ?? "";
-    messages.value = await api.readMessages(props.meta.id);
-    void jumpToLastPage();
-  } catch (e) {
-    error.value = String(e);
-  } finally {
-    sceneBusy.value = false;
-  }
-}
-
-/** 分场：挑人离场另立场景（视角跟到新场景） */
-async function splitSceneCmd() {
-  const here = activeSceneInfo.value;
-  const hint = here?.actors.join(", ") ?? props.meta.characters.join(", ");
-  const movingRaw = window.prompt(`分场：哪些角色离场？（逗号分隔；此刻在场：${hint}）`);
-  if (!movingRaw?.trim()) return;
-  const moving = movingRaw
-    .split(/[,，]/)
-    .map((a) => a.trim())
-    .filter(Boolean);
-  const title = window.prompt("新场景的标题（如：天台）");
-  if (!title?.trim()) return;
-  const place = window.prompt("新场景的地点") ?? "";
-  sceneBusy.value = true;
-  error.value = "";
-  try {
-    const view = await api.splitScene(props.meta.id, title.trim(), place.trim(), moving);
-    scenes.value = view.scenes;
-    activeScene.value = view.active ?? "";
-    messages.value = await api.readMessages(props.meta.id);
-    void jumpToLastPage();
-  } catch (e) {
-    error.value = String(e);
-  } finally {
-    sceneBusy.value = false;
-  }
-}
-
-/** 合场：把另一路场景并进当前场景（对齐需确认——在场者并集、时间取较晚） */
-async function mergeSceneCmd() {
-  const candidates = scenes.value.filter(
-    (sc) => sc.id !== activeScene.value && sc.status !== "merged",
-  );
-  if (!candidates.length) {
+/** M3.11 场景操作向导：新建/分场/合场/编辑走应用内对话框（替换 window.prompt/confirm） */
+const sceneDlgOpen = ref(false);
+const sceneDlgKind = ref<"create" | "split" | "merge" | "edit">("create");
+function openSceneDialog(kind: "create" | "split" | "merge" | "edit") {
+  if (sceneBusy.value) return;
+  if (kind === "merge" && !scenes.value.some((sc) => sc.id !== activeScene.value && sc.status !== "merged")) {
     error.value = "没有可以并进来的场景";
     return;
   }
-  const listed = candidates.map((sc, i) => `${i + 1}. ${sc.title}（${sc.place}）`).join("\n");
-  const pick = window.prompt(
-    `合场：把哪一路并进「${activeSceneInfo.value?.title ?? "当前场景"}」？\n${listed}\n\n输入序号（合场后各角色记忆不合并，只并舞台）：`,
-  );
-  if (!pick?.trim()) return;
-  const chosen = candidates[Number(pick.trim()) - 1];
-  if (!chosen) return;
-  const ok = window.confirm(
-    `确认合场？\n\n「${chosen.title}」的在场者将并入当前场景，故事时间取较晚的一路（${chosen.day}天 ${chosen.clock || "?"}）。被并入的场景归档留档。`,
-  );
-  if (!ok) return;
+  sceneDlgKind.value = kind;
+  sceneDlgOpen.value = true;
+}
+
+/** 场景操作提交：一个出口分派四类动作，成功后统一刷新（场景条 + 消息流 + 页脚对齐） */
+async function onSceneSubmit(p: SceneSubmit) {
   sceneBusy.value = true;
   error.value = "";
   try {
-    const view = await api.mergeScenes(props.meta.id, [chosen.id]);
+    let view: SceneView;
+    if (p.kind === "create") {
+      view = await api.createScene(props.meta.id, p.title, p.place, p.actors);
+    } else if (p.kind === "split") {
+      view = await api.splitScene(props.meta.id, p.title, p.place, p.moving);
+    } else if (p.kind === "merge") {
+      view = await api.mergeScenes(props.meta.id, [p.from]);
+    } else {
+      view = await api.updateScene(props.meta.id, p.sceneId, {
+        title: p.title,
+        place: p.place,
+        actors: p.actors,
+        day: p.day,
+        clock: p.clock,
+      });
+    }
     scenes.value = view.scenes;
+    // merge 不换聚焦；create/split 后端会把聚焦切到新场景
     activeScene.value = view.active ?? activeScene.value;
     messages.value = await api.readMessages(props.meta.id);
     void jumpToLastPage();
@@ -669,6 +631,7 @@ async function loadAll() {
   // 换会话：检查器数据作废（下次打开抽屉再拉）；事件流视图与世界主线视图同理
   inspector.value = null;
   inspError.value = "";
+  inspView.value = "";
   summaryResult.value = "";
   timeline.value = null;
   timelineError.value = "";
@@ -705,9 +668,15 @@ async function loadAll() {
   }
 }
 
-/** 检查器：优先"最近一次发送"，无记录时干跑预览 */
+/** 检查器：优先"最近一次发送"，无记录时干跑预览。
+ *  选了非主角色视角时一律预览——「最近一次发送」的组装是发言人那位的 */
 async function refreshInspector() {
   try {
+    if (inspView.value) {
+      assembly.value = await api.previewPrompt(props.meta.id, inspView.value);
+      assemblySource.value = "preview";
+      return;
+    }
     const last = await api.lastPrompt(props.meta.id);
     if (last) {
       assembly.value = last;
@@ -723,7 +692,7 @@ async function refreshInspector() {
 
 async function preview() {
   try {
-    assembly.value = await api.previewPrompt(props.meta.id);
+    assembly.value = await api.previewPrompt(props.meta.id, inspView.value || undefined);
     assemblySource.value = "preview";
   } catch (e) {
     error.value = String(e);
@@ -841,11 +810,11 @@ function applyReport(report: HookReport) {
   for (const e of report.ui_events) pushHookEvent(e.kind, e.value, report.turn);
 }
 
-/** 读卡内状态与记忆流（面板数据源） */
+/** 读卡内状态与记忆流（面板数据源）；状态按当前视角（M3.11） */
 async function refreshCard() {
   try {
     const [state, mem] = await Promise.all([
-      api.getCardState(props.meta.id),
+      api.getCardState(props.meta.id, inspView.value || undefined),
       api.listCardMemory(props.meta.id),
     ]);
     cardState.value = state;
@@ -1071,9 +1040,17 @@ watch(cardGeneration, () => {
         <div class="ml-auto flex flex-none items-center gap-1 pl-2">
           <button
             class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+            data-tip="编辑当前场景：标题/地点/在场者/局部时钟"
+            :disabled="sceneBusy || !activeScene"
+            @click="openSceneDialog('edit')"
+          >
+            <Icon name="edit" :size="15" />
+          </button>
+          <button
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
             data-tip="新场景：另起一个舞台（视角随即切过去）"
             :disabled="sceneBusy"
-            @click="createSceneCmd"
+            @click="openSceneDialog('create')"
           >
             <Icon name="plus" :size="15" />
           </button>
@@ -1081,15 +1058,15 @@ watch(cardGeneration, () => {
             class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
             data-tip="分场：挑人离场另立场景（「与此同时」）"
             :disabled="sceneBusy"
-            @click="splitSceneCmd"
+            @click="openSceneDialog('split')"
           >
             <Icon name="split" :size="15" />
           </button>
           <button
             class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
-            data-tip="合场：把另一路场景并进当前场景（需确认）"
+            data-tip="合场：把另一路场景并进当前场景（对话框里讲清对齐后果）"
             :disabled="sceneBusy"
-            @click="mergeSceneCmd"
+            @click="openSceneDialog('merge')"
           >
             <Icon name="merge" :size="15" />
           </button>
@@ -1435,10 +1412,36 @@ watch(cardGeneration, () => {
             </button>
           </div>
 
+          <!-- M3.11 多角色检查器：以谁的视角看（状态路径/心理/宫殿/揭示集/注入层都跟着换人） -->
+          <div v-if="speakers.length > 1" class="flex flex-none items-center gap-1.5">
+            <span class="text-[11px] text-base-content/45">视角</span>
+            <div role="tablist" class="tabs tabs-box tabs-xs">
+              <button
+                role="tab"
+                class="tab tooltip tooltip-bottom"
+                :class="{ 'tab-active': !inspView }"
+                data-tip="主角色（缺省视角）"
+                @click="inspView = ''"
+              >
+                主角色
+              </button>
+              <button
+                v-for="dir in speakers"
+                :key="dir"
+                role="tab"
+                class="tab"
+                :class="{ 'tab-active': inspView === dir }"
+                @click="inspView = dir"
+              >
+                {{ dir }}
+              </button>
+            </div>
+          </div>
+
           <template v-if="inspTab === 'layers'">
           <div class="flex items-center justify-between gap-2">
             <p v-if="assembly" class="m-0 text-xs text-base-content/50">
-              {{ assemblySource === "last" ? "最近一次发送" : "预览 · 干跑" }}
+              {{ inspView ? `预览 · 视角：${inspView}` : assemblySource === "last" ? "最近一次发送" : "预览 · 干跑" }}
             </p>
             <button class="btn btn-ghost btn-xs flex-none" @click="preview">
               <Icon name="refresh" :size="13" />刷新
@@ -1779,5 +1782,16 @@ watch(cardGeneration, () => {
         </div>
       </aside>
     </div>
+
+    <!-- M3.11 场景操作向导：新建 / 分场 / 合场 / 编辑 -->
+    <SceneDialog
+      v-model="sceneDlgOpen"
+      :kind="sceneDlgKind"
+      :scenes="scenes"
+      :active-scene-id="activeScene"
+      :cast="speakers"
+      :busy="sceneBusy"
+      @submit="onSceneSubmit"
+    />
   </div>
 </template>

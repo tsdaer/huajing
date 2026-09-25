@@ -1004,8 +1004,12 @@ fn read_intents(v: &Value) -> Vec<Intent> {
         let (name, strength, linked_thread, since_turn, triggered) = match entry {
             Value::String(s) => (s.trim().to_string(), DEFAULT_INTENT_STRENGTH, None, 0, None),
             Value::Object(m) => (
+                // 卡作者格式（设计 §3/§9）用 `goal` 写意图目的；`name` 是运行时规范键
+                // （write_back 序列化用它）。M3.11 真机验收发现只认 `name` 会把
+                // 照设计文档写的卡的意图整条静默丢弃——补上别名读取。
                 m.get(NAME_KEY)
                     .and_then(Value::as_str)
+                    .or_else(|| m.get("goal").and_then(Value::as_str))
                     .unwrap_or("")
                     .trim()
                     .to_string(),
@@ -1159,6 +1163,24 @@ mod tests {
     }
 
     // ---------- from_state / write_into ----------
+
+    #[test]
+    fn card_authoring_goal_key_reads_as_intent_name() {
+        // M3.11 真机验收发现的缺陷：设计 §3/§9 的卡作者格式用 `goal` 写意图目的，
+        // 读侧只认 `name` 会把照设计文档写的卡的意图整条静默丢弃——别名必须吃得下。
+        let p = Psyche::from_state(&json!({
+            "psyche": {
+                "intents": [
+                    { "goal": "想约大家去老渡口踏勘", "strength": 0.7, "blockers": {} },
+                    { "name": "规范键意图", "strength": 0.5 }
+                ]
+            }
+        }));
+        assert_eq!(intent_names(&p), vec!["想约大家去老渡口踏勘", "规范键意图"]);
+        approx(p.intents[0].strength, 0.7);
+        // goal 写法也要能触发主动行为（0.7 ≥ 0.6 − 0.1×0.3 − 0.05）
+        assert_eq!(p.wants_to_act(), vec!["想约大家去老渡口踏勘"]);
+    }
 
     #[test]
     fn from_state_defaults_when_psyche_missing() {
