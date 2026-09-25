@@ -1,6 +1,6 @@
 //! Tauri 命令层：前端可调用的入口。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -683,10 +683,8 @@ fn locate_message(records: &[LogRecord], index: usize) -> Option<(usize, u64)> {
     None
 }
 
-/// 编辑指定下标的消息内容：改写该消息事件 → 丢弃它所在轮次起的派生事件 → 重放重算。
-///
-/// 这正是 M1 遗留问题的解药：改掉那句「谢谢」，好感度会跟着退回去
-/// （设计 §7.3-5「转移是事件流的纯函数」）。返回更新后的全量消息。
+/// 编辑指定下标的消息内容（加固 A4/B1 包装）：入口获取会话写入闸门并全程持有，
+/// 生成/编辑进行中被拒；主体见 [`edit_message_body`]。
 #[tauri::command]
 pub fn edit_message(
     session_id: String,
@@ -694,10 +692,29 @@ pub fn edit_message(
     content: String,
     log: State<'_, store::EventLog>,
 ) -> Result<Vec<Message>, String> {
+    let guard = gate()
+        .acquire(&session_id)
+        .ok_or_else(|| "会话写入进行中，请等当前操作结束".to_string())?;
+    let result = edit_message_body(&session_id, index, content, &log);
+    drop(guard);
+    flush_parked_summaries(&root(), &session_id);
+    result
+}
+
+/// 编辑主体：改写该消息事件 → 丢弃它所在轮次起的派生事件 → 重放重算。
+///
+/// 这正是 M1 遗留问题的解药：改掉那句「谢谢」，好感度会跟着退回去
+/// （设计 §7.3-5「转移是事件流的纯函数」）。返回更新后的全量消息。
+fn edit_message_body(
+    session_id: &str,
+    index: usize,
+    content: String,
+    log: &State<'_, store::EventLog>,
+) -> Result<Vec<Message>, String> {
     let root = root();
-    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let meta = store::load_session(&root, session_id).map_err(|e| e.to_string())?;
     let cast = Cast::load(&root, &meta)?;
-    let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
+    let records = log.read(&root, session_id).map_err(|e| e.to_string())?;
     let Some((pos, turn)) = locate_message(&records, index) else {
         return Err(format!("消息下标越界：{index}"));
     };
@@ -705,33 +722,49 @@ pub fn edit_message(
     if let LogBody::Message(m) = &mut edited[pos].body {
         m.content = content;
     }
-    let rebuilt = rebuild_from(&log, &root, &meta, &cast, &edited, turn)?;
-    log.rewrite(&root, &session_id, &rebuilt)
+    let rebuilt = rebuild_from(log, &root, &meta, &cast, &edited, turn)?;
+    log.rewrite(&root, session_id, &rebuilt)
         .map_err(|e| e.to_string())?;
-    sync_now(&log, &root, &meta)?;
+    sync_now(log, &root, &meta)?;
     Ok(event::messages(&rebuilt))
 }
 
-/// 删除指定下标的消息：移除该消息事件 → 从它所在轮次起重放重算，返回更新后的全量消息
+/// 删除指定下标的消息（加固 A4/B1 包装）：入口获取会话写入闸门并全程持有；
+/// 主体见 [`delete_message_body`]。
 #[tauri::command]
 pub fn delete_message(
     session_id: String,
     index: usize,
     log: State<'_, store::EventLog>,
 ) -> Result<Vec<Message>, String> {
+    let guard = gate()
+        .acquire(&session_id)
+        .ok_or_else(|| "会话写入进行中，请等当前操作结束".to_string())?;
+    let result = delete_message_body(&session_id, index, &log);
+    drop(guard);
+    flush_parked_summaries(&root(), &session_id);
+    result
+}
+
+/// 删除主体：移除该消息事件 → 从它所在轮次起重放重算，返回更新后的全量消息
+fn delete_message_body(
+    session_id: &str,
+    index: usize,
+    log: &State<'_, store::EventLog>,
+) -> Result<Vec<Message>, String> {
     let root = root();
-    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let meta = store::load_session(&root, session_id).map_err(|e| e.to_string())?;
     let cast = Cast::load(&root, &meta)?;
-    let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
+    let records = log.read(&root, session_id).map_err(|e| e.to_string())?;
     let Some((pos, turn)) = locate_message(&records, index) else {
         return Err(format!("消息下标越界：{index}"));
     };
     let mut edited = records.as_ref().clone();
     edited.remove(pos);
-    let rebuilt = rebuild_from(&log, &root, &meta, &cast, &edited, turn)?;
-    log.rewrite(&root, &session_id, &rebuilt)
+    let rebuilt = rebuild_from(log, &root, &meta, &cast, &edited, turn)?;
+    log.rewrite(&root, session_id, &rebuilt)
         .map_err(|e| e.to_string())?;
-    sync_now(&log, &root, &meta)?;
+    sync_now(log, &root, &meta)?;
     Ok(event::messages(&rebuilt))
 }
 
@@ -1699,6 +1732,196 @@ pub struct CancelFlags(Mutex<HashMap<String, Arc<AtomicBool>>>);
 #[derive(Default)]
 pub struct LastAssemblies(Mutex<HashMap<String, prompt::PromptAssembly>>);
 
+// ---------- 会话写入闸门（加固 A4，与 B1 同一把锁）----------
+//
+// messages.jsonl 是唯一事实来源，而「动事件流」有两类写者：
+// - 前台命令（send_message / regenerate / edit_message / delete_message）：先读快照、
+//   计算上百毫秒后整体 rewrite（消息级操作）或全程持续 append（生成）；
+// - 后台总结（run_summary → apply_summary_outcome）：独立 EventLog 实例，批次
+//   append 10–30 条模型产物。情景记忆/转述重放不可再生，被旧快照覆盖即永久丢失。
+//
+// 闸门是 per-session 的 busy 位：前台命令**入口即获取、全程持有**（含全部 await），
+// 结束释放；总结落盘前 try-acquire，拿不到就整批暂存（内存队列），闸门空出后重放。
+// 实现 deliberately 不用 std Mutex 守卫跨 await：busy 位是原子标记，没有可阻塞的
+// 临界区，「全程持有」只是标记存活期，不违反本项目「锁不跨 await」的纪律。
+// stop_generation 故意不取闸门：它只置中断位，收尾的部分落盘发生在持有者自己的闸门内。
+
+/// 暂存的总结批次：闸门被前台占用时整批挂起，空出后原样重放
+struct ParkedSummary {
+    outcome: summarize::SummaryOutcome,
+    from_turn: u64,
+    to_turn: u64,
+    story_day: i64,
+    story_clock: String,
+    scene_id: String,
+}
+
+#[derive(Default)]
+pub struct WriteGate(Mutex<HashMap<String, Arc<GateSlot>>>);
+
+struct GateSlot {
+    busy: AtomicBool,
+    pending: Mutex<VecDeque<ParkedSummary>>,
+}
+
+impl Default for GateSlot {
+    fn default() -> Self {
+        GateSlot {
+            busy: AtomicBool::new(false),
+            pending: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+/// 暂存队列上限（正常只会有 1 条：有暂存时 spawn_summary 直接跳过；
+/// 手动 summarize_now 可能再塞，超限丢最旧——下轮总结会重跑同批消息）
+const MAX_PARKED_SUMMARIES: usize = 4;
+
+/// 前台持有闸门的 RAII 标记：Drop 时清位。armed = false 表示没拿到（不释放）。
+struct GateGuard {
+    session: String,
+    armed: bool,
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            gate().release(&self.session);
+        }
+    }
+}
+
+/// apply_summary_outcome 的两种归宿（调用方据此写诊断/回显）
+#[derive(Debug)]
+enum SummaryApply {
+    Applied(usize),
+    Parked,
+}
+
+fn gate() -> &'static WriteGate {
+    static GATE: std::sync::OnceLock<WriteGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(WriteGate::default)
+}
+
+impl WriteGate {
+    fn slot(&self, session_id: &str) -> std::sync::Arc<GateSlot> {
+        let Ok(mut map) = self.0.lock() else {
+            // 锁 poisoned：进程已在不一致状态，直接 panic 传播比静默串写好
+            panic!("写入闸门锁 poisoned")
+        };
+        map.entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// 前台获取（入口独占）：已在写入中返回 None
+    fn acquire(&self, session_id: &str) -> Option<GateGuard> {
+        let slot = self.slot(session_id);
+        if slot
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        Some(GateGuard {
+            session: session_id.to_string(),
+            armed: true,
+        })
+    }
+
+    /// 后台尝试：同 acquire，但调用方自行决定拿不到时的退路（暂存/跳过）
+    fn try_acquire(&self, session_id: &str) -> bool {
+        self.acquire(session_id).is_some()
+    }
+
+    fn release(&self, session_id: &str) {
+        let slot = self.slot(session_id);
+        slot.busy.store(false, Ordering::Release);
+    }
+
+    fn park_summary(&self, session_id: &str, batch: ParkedSummary) {
+        let slot = self.slot(session_id);
+        let Ok(mut q) = slot.pending.lock() else { return };
+        if q.len() >= MAX_PARKED_SUMMARIES {
+            q.pop_front(); // 丢最旧
+        }
+        q.push_back(batch);
+    }
+
+    /// 仅 flush 循环用：持有闸门后取出暂存批次
+    fn take_parked(&self, session_id: &str) -> Option<ParkedSummary> {
+        let slot = self.slot(session_id);
+        let Ok(mut q) = slot.pending.lock() else { return None };
+        q.pop_front()
+    }
+
+    fn has_pending(&self, session_id: &str) -> bool {
+        let slot = self.slot(session_id);
+        slot.pending.lock().map(|q| !q.is_empty()).unwrap_or(false)
+    }
+}
+
+/// 重放暂存的总结批次（加固 A4）：前台命令收尾时调用——闸门空出的确定性时机。
+/// 同步执行（无 LLM，纯落盘）；拿不到闸门（紧接的下一个命令抢了先）就原样保留，
+/// 等下次收尾再试。
+fn flush_parked_summaries(root: &std::path::Path, session_id: &str) -> usize {
+    let mut flushed = 0;
+    while gate().has_pending(session_id) {
+        if !gate().try_acquire(session_id) {
+            return flushed; // 别人先占了：等它的收尾再试
+        }
+        let batch = gate().take_parked(session_id);
+        match batch {
+            Some(batch) => match apply_parked_summary(root, session_id, &batch) {
+                Ok(()) => {
+                    flushed += 1;
+                    crate::diag::record(
+                        "summary",
+                        format!(
+                            "暂存批次重放完成（第 {}–{} 轮，场景 {}）",
+                            batch.from_turn, batch.to_turn, batch.scene_id
+                        ),
+                    );
+                }
+                Err(e) => {
+                    crate::diag::record("summary", format!("暂存批次重放失败（丢弃）：{e}"));
+                }
+            },
+            None => break,
+        }
+        gate().release(session_id);
+    }
+    flushed
+}
+
+/// 把一个暂存批次落成事件（上下文按当前事件流重derive；闸门由调用方持有）
+fn apply_parked_summary(
+    root: &std::path::Path,
+    session_id: &str,
+    batch: &ParkedSummary,
+) -> Result<(), String> {
+    let log = store::EventLog::new();
+    let meta = store::load_session(root, session_id).map_err(|e| e.to_string())?;
+    let world = session_world(&meta);
+    let cx = load_codex(root, None, &world);
+    let proj = project_session(&log, root, &meta)?;
+    apply_summary_outcome_locked(
+        &log,
+        root,
+        &meta,
+        &cx,
+        &proj,
+        batch.outcome.clone(),
+        batch.from_turn,
+        batch.to_turn,
+        batch.story_day,
+        &batch.story_clock,
+        &batch.scene_id,
+    )?;
+    Ok(())
+}
+
 /// 组装一轮上下文（send_message / regenerate / preview_prompt 共用）。
 /// `user_content` = Some 时为本轮真实发送（末尾带用户消息）；None 为检查器预览。
 /// 本轮组装的产物：注入层 + 被 hook 顺带改动的宿主状态。
@@ -2215,6 +2438,10 @@ fn spawn_summary(
     flags: &SummaryFlags,
     active: Vec<String>,
 ) {
+    // 加固 A4：已有暂存批次等着重放——同一批消息不再跑一遍总结（防重复落模型产物）
+    if gate().has_pending(session_id) {
+        return;
+    }
     if !flags.begin(session_id) {
         return; // 上一次总结还在跑
     }
@@ -4001,7 +4228,8 @@ pub fn world_set_clock(world: String, day: i64) -> Result<i64, String> {
     let root = root();
     let name = if world.trim().is_empty() { "default".into() } else { world };
     let mut w = store::load_world(&root, &name);
-    w.day = day.max(1);
+    // 加固 A7：i64::MAX 天会让 prompt::advance_clock 的 day + total/1440 溢出 panic
+    w.day = prompt::clamp_story_day(day);
     store::save_world(&root, &name, &w).map_err(|e| e.to_string())?;
     Ok(w.day)
 }
@@ -4657,7 +4885,49 @@ fn codex_resolve_preview_of(
     Ok(ResolvePreview { day, entities })
 }
 
-/// 发送一条用户消息并流式生成回复。
+/// 发送一条用户消息并流式生成回复（加固 A4/B1 包装）：
+/// 入口获取会话写入闸门并**全程持有**——并发的第二条消息在动事件流之前就被拒掉；
+/// 闸门清位后顺手重放暂存的总结批次。主体见 [`send_message_inner`]。
+#[tauri::command]
+pub async fn send_message(
+    app: AppHandle,
+    session_id: String,
+    content: String,
+    speaker: Option<String>,
+    on_event: Channel<StreamEvent>,
+    flags: State<'_, CancelFlags>,
+    log: State<'_, store::EventLog>,
+    assemblies: State<'_, LastAssemblies>,
+    codex_cache: State<'_, CodexCache>,
+    runtime: State<'_, SessionRuntime>,
+    tree_cache: State<'_, TreeCache>,
+    summary_flags: State<'_, SummaryFlags>,
+    embed_cache: State<'_, EmbedCache>,
+) -> Result<StreamEvent, String> {
+    let guard = gate()
+        .acquire(&session_id)
+        .ok_or_else(|| "上一条消息还在生成中".to_string())?;
+    let result = send_message_inner(
+        app,
+        session_id.clone(),
+        content,
+        speaker,
+        on_event,
+        flags,
+        log,
+        assemblies,
+        codex_cache,
+        runtime,
+        tree_cache,
+        summary_flags,
+        embed_cache,
+    )
+    .await;
+    drop(guard);
+    flush_parked_summaries(&root(), &session_id);
+    result
+}
+
 /// 流事件经 `on_event` 通道推给前端（delta / done / error），
 /// 返回值即终态事件。用户消息先落盘；回复（含中断时的部分文本）生成后落盘。
 ///
@@ -4669,8 +4939,8 @@ fn codex_resolve_preview_of(
 ///
 /// 事件顺序（与重放顺序一致，见 rebuild_from）：
 /// director 事件 → on_context 事件 → 用户消息事件 → on_message 事件 → 回复事件 → 时钟步进事件。
-#[tauri::command]
-pub async fn send_message(
+#[allow(clippy::too_many_arguments)]
+async fn send_message_inner(
     app: AppHandle,
     session_id: String,
     content: String,
@@ -4989,11 +5259,49 @@ fn truncate_turn(records: &[LogRecord], turn: u64, drop_reply: bool) -> Vec<LogR
     kept
 }
 
-/// 重roll（设计 §4 消息级操作）：移除末尾角色回复，以最后一条用户消息
-/// 重新流式生成。先删后生成——失败也不会出现两条并列回复。
-/// 发言人取被重roll 回复的署名（多角色时不换人重roll；1v1 无署名 = 主角色）。
+/// 重roll（设计 §4 消息级操作，加固 A4/B1 包装）：入口获取会话写入闸门并全程持有，
+/// 生成中被拒；主体见 [`regenerate_inner`]。
 #[tauri::command]
 pub async fn regenerate(
+    app: AppHandle,
+    session_id: String,
+    on_event: Channel<StreamEvent>,
+    flags: State<'_, CancelFlags>,
+    log: State<'_, store::EventLog>,
+    assemblies: State<'_, LastAssemblies>,
+    codex_cache: State<'_, CodexCache>,
+    runtime: State<'_, SessionRuntime>,
+    tree_cache: State<'_, TreeCache>,
+    summary_flags: State<'_, SummaryFlags>,
+    embed_cache: State<'_, EmbedCache>,
+) -> Result<StreamEvent, String> {
+    let guard = gate()
+        .acquire(&session_id)
+        .ok_or_else(|| "上一条消息还在生成中".to_string())?;
+    let result = regenerate_inner(
+        app,
+        session_id.clone(),
+        on_event,
+        flags,
+        log,
+        assemblies,
+        codex_cache,
+        runtime,
+        tree_cache,
+        summary_flags,
+        embed_cache,
+    )
+    .await;
+    drop(guard);
+    flush_parked_summaries(&root(), &session_id);
+    result
+}
+
+/// 重roll 主体：移除末尾角色回复，以最后一条用户消息
+/// 重新流式生成。先删后生成——失败也不会出现两条并列回复。
+/// 发言人取被重roll 回复的署名（多角色时不换人重roll；1v1 无署名 = 主角色）。
+#[allow(clippy::too_many_arguments)]
+async fn regenerate_inner(
     app: AppHandle,
     session_id: String,
     on_event: Channel<StreamEvent>,
@@ -5175,7 +5483,8 @@ pub fn update_blackboard(
         .and_then(|id| proj.scenes.get(id))
         .cloned();
     let board = store::Blackboard {
-        day,
+        // 加固 A7：与世界时钟校准同一口径——极端 day 会让时钟步进的 day 加法溢出 panic
+        day: prompt::clamp_story_day(day),
         clock: clock.trim().to_string(),
         place: place.trim().to_string(),
         actors: actors
@@ -7064,8 +7373,57 @@ fn story_time_at_turn(
 ///
 /// 一切 LLM 产物都**先落草稿/提案**，注入只认 canon（设计 §6.9）——唯一的例外是 L3 事实与
 /// 情景记忆：它们是「角色的亲身经历」，本就不进设定注入，而是走宫殿召回（§5.2）。
+///
+/// 加固 A4：这是**闸门管理版**——落盘前 try-acquire 写入闸门，拿不到（前台正在
+/// 生成/编辑）就整批暂存待重放，绝不与前台 rewrite 交错。闸门持有期内的实际落盘
+/// 走 [`apply_summary_outcome_locked`]。
 #[allow(clippy::too_many_arguments)]
 fn apply_summary_outcome(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    cx: &codex::Codex,
+    // 投影视图（M3.8 瞬时状态写黑板要取场景分区/世界层的现状）
+    proj: &event::Projection,
+    outcome: summarize::SummaryOutcome,
+    from_turn: u64,
+    to_turn: u64,
+    story_day: i64,
+    story_clock: &str,
+    // 本批归属的场景（M3.2 摘要分卷）：场景卷进 scene_summaries，大事记进世界层
+    scene_id: &str,
+) -> Result<SummaryApply, String> {
+    let session_id = meta.id.as_str();
+    if !gate().try_acquire(session_id) {
+        gate().park_summary(
+            session_id,
+            ParkedSummary {
+                outcome,
+                from_turn,
+                to_turn,
+                story_day,
+                story_clock: story_clock.to_string(),
+                scene_id: scene_id.to_string(),
+            },
+        );
+        crate::diag::record(
+            "summary",
+            format!(
+                "会话写入中，第 {from_turn}–{to_turn} 轮总结批次已暂存待重放"
+            ),
+        );
+        return Ok(SummaryApply::Parked);
+    }
+    let applied = apply_summary_outcome_locked(
+        log, root, meta, cx, proj, outcome, from_turn, to_turn, story_day, story_clock, scene_id,
+    );
+    gate().release(session_id);
+    applied.map(SummaryApply::Applied)
+}
+
+/// 落盘本体（闸门由调用方持有；与 Tauri 无关，便于单测）。
+#[allow(clippy::too_many_arguments)]
+fn apply_summary_outcome_locked(
     log: &store::EventLog,
     root: &std::path::Path,
     meta: &store::SessionMeta,
@@ -7611,16 +7969,20 @@ async fn run_summary(
         &board.clock,
         &scene_id,
     )?;
+    let applied_msg = match applied {
+        SummaryApply::Applied(n) => format!("落 {n} 条事件"),
+        SummaryApply::Parked => "会话写入中，批次已暂存待重放".to_string(),
+    };
     crate::diag::record(
         "summary",
         format!(
-            "总结第 {from_turn}–{to_turn} 轮（场景 {}）：落 {applied} 条事件（provider={}）",
+            "总结第 {from_turn}–{to_turn} 轮（场景 {}）：{applied_msg}（provider={}）",
             scene_id,
             provider.name
         ),
     );
     Ok(format!(
-        "已总结第 {from_turn}–{to_turn} 轮（场景 {scene_id}），落 {applied} 条事件"
+        "已总结第 {from_turn}–{to_turn} 轮（场景 {scene_id}）：{applied_msg}"
     ))
 }
 
@@ -9437,10 +9799,9 @@ return {
             }],
             audit: Vec::new(),
         });
-        let applied = apply_summary_outcome(
+        let applied = applied_n(apply_summary_outcome(
             &log, &root, &meta, &cx, &proj, outcome, 1, to_turn, 1, "20:00", "scene.main",
-        )
-        .unwrap();
+        ));
         assert!(applied >= 5, "摘要 + 2 条记忆 + 3 条提案：{applied}");
 
         let proj = project_session(&log, &root, &meta).unwrap();
@@ -9557,10 +9918,9 @@ return {
             ],
             ..Default::default()
         });
-        let applied = apply_summary_outcome(
+        let applied = applied_n(apply_summary_outcome(
             &log, &root, &meta, &cx, &proj, outcome, 1, 1, 1, "20:00", "scene.main",
-        )
-        .unwrap();
+        ));
 
         let proj = project_session(&log, &root, &meta).unwrap();
         // 2 条提示条目 + 1 驳回 + 1 待审提案 = 4 条事件（缺引源的那条没进流）
@@ -9820,10 +10180,9 @@ state_tree = {
         });
         // 假装总结发生在很久以后：调用方传来的「当前」黑板已是第 9 天深夜
         let proj_view = project_session(&log, &root, &meta).unwrap();
-        apply_summary_outcome(
+        applied_n(apply_summary_outcome(
             &log, &root, &meta, &cx, &proj_view, outcome, 1, 1, 9, "23:50", "scene.main",
-        )
-        .unwrap();
+        ));
 
         let proj = project_session(&log, &root, &meta).unwrap();
         let objects: Vec<palace::MemObject> = proj
@@ -10288,10 +10647,9 @@ return {
             ..summarize::SummaryOutcome::default()
         });
         let proj_view = project_session(&log, &root, &meta).unwrap();
-        let applied = apply_summary_outcome(
+        let applied = applied_n(apply_summary_outcome(
             &log, &root, &meta, &cx, &proj_view, outcome, 1, 2, 1, "21:15", "scene.main",
-        )
-        .unwrap();
+        ));
         assert_eq!(applied, 2, "一条转述记忆 + 一条揭示事件：{applied}");
 
         proj = project_session(&log, &root, &meta).unwrap();
@@ -11667,10 +12025,9 @@ return { state_tree = {
 
         // 缺省（不自动接受）：transient → 黑板；小事实与全新实体都进收件箱待审
         let proj = project_session(&log, &root, &meta).unwrap();
-        let applied = apply_summary_outcome(
+        let applied = applied_n(apply_summary_outcome(
             &log, &root, &meta, &cx, &proj, outcome, 2, 3, 1, "20:00", "scene.main",
-        )
-        .unwrap();
+        ));
         assert_eq!(applied, 3);
         let proj = project_session(&log, &root, &meta).unwrap();
         let sc = proj.scenes.get("scene.main").expect("genesis 场景");
@@ -11713,10 +12070,9 @@ return { state_tree = {
             ..summarize::SummaryOutcome::default()
         };
         let proj = project_session(&log, &root, &meta).unwrap();
-        apply_summary_outcome(
+        applied_n(apply_summary_outcome(
             &log, &root, &meta, &cx, &proj, outcome2, 4, 5, 1, "21:00", "scene.main",
-        )
-        .unwrap();
+        ));
         let proj = project_session(&log, &root, &meta).unwrap();
         assert_eq!(
             proj.proposals.get("codex.char.小雨.5.0").unwrap()["status"],
@@ -11988,4 +12344,154 @@ return { state_tree = {
         assert_eq!(store::load_world(root, "testworld").day, 30);
     }
 
+    // ---------- A4 写入闸门：前台 rewrite 与后台总结批次互斥 ----------
+
+    /// 测试便捷：闸门空闲路径下批次即时落盘，取应用条数
+    fn applied_n(r: Result<SummaryApply, String>) -> usize {
+        match r.expect("落盘要成功") {
+            SummaryApply::Applied(n) => n,
+            SummaryApply::Parked => panic!("闸门空闲时不应暂存"),
+        }
+    }
+
+    /// 一批带单条情景记忆的总结产物（A4 用例的弹药）
+    fn episode_outcome() -> summarize::SummaryOutcome {
+        summarize::SummaryOutcome {
+            episodes: vec![summarize::EpisodeDraft {
+                content: "小雨在图书馆把书还了".into(),
+                salience: 0.9,
+                emotion: Some("平静".into()),
+                place: Some("图书馆".into()),
+                actors: vec!["小雨".into()],
+                witnesses: vec!["小雨".into()],
+                links: vec!["place:图书馆".into()],
+                thread: None,
+                turns: vec![1],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gate_is_exclusive_per_session() {
+        let g = gate();
+        let h1 = g.acquire("闸门单测-互斥").expect("首个持有者要拿到");
+        assert!(
+            g.acquire("闸门单测-互斥").is_none(),
+            "持有期间并发进入要被拒"
+        );
+        assert!(!g.try_acquire("闸门单测-互斥"));
+        drop(h1);
+        let h2 = g.acquire("闸门单测-互斥").expect("释放后要能再拿");
+        drop(h2);
+        // 不同会话互不影响
+        let _a = g.acquire("闸门单测-A").expect("A 要拿到");
+        let _b = g.acquire("闸门单测-B").expect("B 会话独立拿锁");
+    }
+
+    #[test]
+    fn summary_batch_parks_during_write_and_replays_without_loss() {
+        // A4 核心场景：前台 read 快照 → rewrite 期间，后台总结的批次不得
+        // 插进重写窗口、也不得丢——先暂存，闸门空出后原样重放。
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let session_id = meta.id.clone();
+        let log = store::EventLog::new();
+        let base_records = log.read(&root, &session_id).unwrap().len();
+
+        // 前台持有闸门（模拟生成/编辑进行中）
+        let guard = gate().acquire(&session_id).expect("拿闸门");
+
+        // 后台总结要落盘：闸门被占 → 整批暂存，事件流一条不动
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let cx = load_codex(&root, None, "default");
+        let applied = apply_summary_outcome(
+            &log,
+            &root,
+            &meta,
+            &cx,
+            &proj,
+            episode_outcome(),
+            1,
+            2,
+            1,
+            "20:00",
+            scene::DEFAULT_SCENE_ID,
+        )
+        .unwrap();
+        assert!(matches!(applied, SummaryApply::Parked), "{applied:?}");
+        assert!(gate().has_pending(&session_id), "批次要进暂存队列");
+        assert_eq!(
+            log.read(&root, &session_id).unwrap().len(),
+            base_records,
+            "暂存期间不落任何事件"
+        );
+
+        // 前台编辑路径照常 rewrite（用旧快照重建），随后收尾释放闸门
+        let records = log.read(&root, &session_id).unwrap();
+        let rebuilt = records.as_ref().clone();
+        log.rewrite(&root, &session_id, &rebuilt).unwrap();
+        drop(guard);
+
+        // 收尾重放：批次完整落进 rewrite 之后的流，无一条丢失
+        assert_eq!(flush_parked_summaries(&root, &session_id), 1);
+        assert!(!gate().has_pending(&session_id));
+        let records = log.read(&root, &session_id).unwrap();
+        assert_eq!(
+            records.len(),
+            base_records + 1,
+            "重放恰好多一条记忆事件：{}",
+            records.len()
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(&r.body, LogBody::Memory(_))),
+            "暂存批次的情景记忆要落盘"
+        );
+        // 派生文件同步过（投影里读回宫殿情景记忆验证）
+        let proj2 = project_session(&log, &root, &meta).unwrap();
+        assert!(
+            proj2.episodes.iter().any(|e| e.get("content").and_then(|c| c.as_str())
+                == Some("小雨在图书馆把书还了")),
+            "palace 情景记忆要能读回：{:?}",
+            proj2.episodes
+        );
+    }
+
+    #[test]
+    fn flush_defers_while_gate_still_busy() {
+        // 暂存后 flush 时闸门仍被占（下一个命令抢了先）→ 批次保留，下次收尾再试
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let session_id = meta.id.clone();
+        let log = store::EventLog::new();
+
+        let guard = gate().acquire(&session_id).expect("拿闸门");
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let cx = load_codex(&root, None, "default");
+        let applied = apply_summary_outcome(
+            &log,
+            &root,
+            &meta,
+            &cx,
+            &proj,
+            episode_outcome(),
+            1,
+            2,
+            1,
+            "20:00",
+            scene::DEFAULT_SCENE_ID,
+        )
+        .unwrap();
+        assert!(matches!(applied, SummaryApply::Parked));
+
+        assert_eq!(
+            flush_parked_summaries(&root, &session_id),
+            0,
+            "闸门未释放时 flush 是空操作"
+        );
+        assert!(gate().has_pending(&session_id), "批次保留待下次收尾");
+        drop(guard);
+        assert_eq!(flush_parked_summaries(&root, &session_id), 1, "释放后重放");
+        assert!(!gate().has_pending(&session_id));
+    }
 }

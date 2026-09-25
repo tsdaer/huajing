@@ -1144,6 +1144,16 @@ fn is_cjk(c: char) -> bool {
 
 // ---------- 黑板时钟步进 ----------
 
+/// 故事天数的合法边界（加固 A7）：黑板/世界时钟的手填 day 都钳到这里。
+/// 上限的存在理由：advance_clock 做 `day + total/1440` 的裸加法，day 若到
+/// i64::MAX 会在 debug 构建溢出 panic；999_999 天对任何剧情都绰绰有余。
+pub const MAX_STORY_DAY: i64 = 999_999;
+
+/// 手填故事天数钳到 `1..=MAX_STORY_DAY`
+pub fn clamp_story_day(day: i64) -> i64 {
+    day.clamp(1, MAX_STORY_DAY)
+}
+
 /// 时钟步进：每轮 +CLOCK_STEP_MINUTES，跨日进位；
 /// clock 为空（未设置）则保持不动，等 UI 手动设定。
 pub fn advance_clock(day: i64, clock: &str) -> (i64, String) {
@@ -1399,6 +1409,20 @@ mod tests {
         // 未设置时钟：不动
         assert_eq!(advance_clock(1, ""), (1, "".to_string()));
         assert_eq!(advance_clock(1, "25:99"), (1, "25:99".to_string()));
+    }
+
+    #[test]
+    fn story_day_clamp_keeps_advance_clock_in_safe_range() {
+        // A7：黑板/世界时钟的手填 day 曾不设上限——i64::MAX 会让 advance_clock 的
+        // day + total/1440 在 debug 构建溢出 panic。钳到上限后跨日进位必须安全。
+        assert_eq!(clamp_story_day(i64::MAX), MAX_STORY_DAY);
+        assert_eq!(clamp_story_day(i64::MIN), 1);
+        assert_eq!(clamp_story_day(0), 1);
+        assert_eq!(clamp_story_day(42), 42, "正常值原样通过");
+        // 上限天 + 一整轮的跨日进位不再溢出
+        let (day, clock) = advance_clock(MAX_STORY_DAY, "23:59");
+        assert_eq!(day, MAX_STORY_DAY + 1);
+        assert_eq!(clock, "00:09".to_string());
     }
 
     // ---------- M2.7 预算分配与确定性降级 ----------

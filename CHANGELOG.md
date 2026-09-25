@@ -2,6 +2,45 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [Unreleased] · 全库审查加固清偿（[docs/plan/hardening.md](docs/plan/hardening.md)）
+
+> 2026-09-25 全库审查（4 个并行审查代理分区通读 + 高危项人工复核）的逐包清偿，
+> 目标：崩溃与数据丢失归零、异步生命周期有守卫、热路径告别 O(n²)。每包一个 commit，
+> 每项修复配钉死行为的单测。
+
+### Fixed · 包 A 崩溃与数据安全（P0）
+
+- **A1 粘贴含全 `=` 的行不再 panic**：wiki 粘贴里的纯 `====` 分隔线让 `heading_of`
+  的切片 start > end 直接炸（`clean_source → segment_sections` 全链路可达）；加守卫后
+  按「非标题行」处理，正常标题行为不变。钉子：`heading_of` 边界 + 纯粘贴构造用例
+- **A2 事件流重写原子化**：`messages.jsonl` 是唯一事实来源，edit/delete/重roll 的
+  truncate+写在中途崩溃/断电会留半截文件且不可重建。新增 `store::atomic_write`
+  （临时文件 → fsync → rename），落盘点：`EventLog::rewrite`、`save_world`、
+  `save_grown`、`save_providers`；崩溃最坏留 `.tmp` 残骸，目标文件绝不半截
+- **A3 崩溃残留半行不再粘坏新消息**：上次崩溃留下「末行无换行的半截 JSON」时，
+  append 先补换行封口（半行作为坏行被读侧跳过）、缓存偏移对齐后再写新行——
+  新消息重启后完整可读回
+- **A4 总结落盘 vs 前台重写的竞态归零（写入闸门）**：新增 per-session `WriteGate`
+  （原子 busy 位 + RAII guard，不跨 await 持锁）——前台命令（send_message /
+  regenerate / edit_message / delete_message）入口获取、全程持有、并发进入即拒；
+  后台总结批次落盘前 try-acquire，拿不到就整批暂存（上限 4），前台收尾时确定性重放。
+  情景记忆/转述等模型产物不再被旧快照整体覆盖；有暂存批次时跳过新总结（防重复落产物）
+- **A5 palace 天数减法 saturating**：`story_day` 反序列化自 palace.jsonl，手写
+  `i64::MIN` 曾让裸减法在 debug 构建溢出 panic；对齐 threads.rs 的
+  `saturating_sub` 纪律，衰减因子饱和到边界
+- **A6 Lua 深层嵌套 state 打不穿宿主栈了**：mlua serde 桥只有环检测、无深度上限，
+  几千层非环嵌套表（指令计数限内可构造）会让 `from_value` 递归到栈溢出（abort，
+  错误边界拦不住）。全部 5 个 from_value 调用点（hook state 读回 ×2、卡静态 state、
+  codex 实体转换、`api.blackboard.set`）前置 64 层深度预检：超限丢该值 + 诊断日志，
+  正常浅层写入行为不变
+- **A7 数值输入硬边界**：`context_window` 钳到 1..=10_000_000（usize 乘 75 曾溢出
+  panic）；黑板/世界时钟的手填天数经 `prompt::clamp_story_day`（1..=999_999，
+  时钟步进的跨日加法不再可能溢出）；会话 ID 同毫秒碰撞时递增毫秒尾数重滚（目录不再互覆）
+
+### Changed
+
+- 事件流缓存 append 路径在半行封口时多一次 `\n` 追加（仅崩溃恢复场景，正常路径无开销）
+
 ## [0.3.0] - 2026-09-25
 
 > M3「热闹、会长大、有节奏、不串台」完成定版（代码侧 M3.0–M3.11 全部落地，

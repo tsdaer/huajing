@@ -444,7 +444,9 @@ pub fn recall(objs: &[MemObject], q: &RecallQuery) -> Vec<RecallHit> {
 
 /// 单条记忆的打分与激活原因。viewer 已归一化（空串 = 无视角）。
 fn score_of(m: &MemObject, q: &RecallQuery, viewer: &str) -> (f32, Vec<String>) {
-    let decay = decay_factor((q.now_day - m.story_day) as f64);
+    // 加固 A5：story_day 来自 palace.jsonl 反序列化，手写 i64::MIN 会让裸减法在
+    // debug 构建溢出 panic——threads.rs 同场景用的 saturating_sub，这里对齐。
+    let decay = decay_factor(q.now_day.saturating_sub(m.story_day) as f64);
 
     let hints = dedup_tags(&q.hints);
     let present = dedup_tags(&q.present);
@@ -953,6 +955,24 @@ mod tests {
 
         assert_eq!(decay_factor(7.0), 0.5);
         approx(decay_factor(3.0) as f32, (0.5f64.powf(3.0 / 7.0)) as f32);
+    }
+
+    #[test]
+    fn decay_saturates_on_extreme_story_days() {
+        // A5：story_day 来自 palace.jsonl 反序列化，手写 i64::MIN 曾让裸减法
+        // 在 debug 构建溢出 panic——衰减要饱和到边界而不是炸掉召回
+        let mut m = mem("mem_0001", i64::MIN, 1, "远古记忆");
+        m.witnesses = vec!["小雨".into()];
+        let hits = recall(&[m], &query("小雨", i64::MAX));
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].score.is_finite(), "分数必须有限：{}", hits[0].score);
+        assert_eq!(hits[0].score, 0.0, "Δ 饱和到 i64::MAX → 衰减到底");
+
+        // 负 Δ（记忆标的日子在未来）也不衰减
+        let mut m2 = mem("mem_0002", 10, 1, "未来标注的记忆");
+        m2.witnesses = vec!["小雨".into()];
+        let hits = recall(&[m2], &query("小雨", 1));
+        approx(hits[0].score, 0.8);
     }
 
     #[test]

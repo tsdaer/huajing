@@ -381,7 +381,8 @@ fn heading_of(line: &str) -> Option<(usize, String)> {
     if line.starts_with('=') && line.ends_with('=') && line.len() >= 4 {
         let lead = line.chars().take_while(|c| *c == '=').count();
         let tail = line.chars().rev().take_while(|c| *c == '=').count();
-        if lead >= 2 && lead == tail {
+        // 纯 `====` 行：lead == tail == len，切片 start > end 会 panic——没有标题文字，直接非标题
+        if lead >= 2 && lead == tail && lead < line.len() - tail {
             let title = line[lead..line.len() - tail].trim();
             if !title.is_empty() {
                 return Some((lead, title.to_string()));
@@ -2792,5 +2793,32 @@ mod tests {
         let text = serde_json::to_string(&pack).unwrap();
         let back: IngestPack = serde_json::from_str(&text).unwrap();
         assert_eq!(back, pack, "草稿包要能前后端无损往返");
+    }
+
+    #[test]
+    fn heading_of_all_equals_line_returns_none_instead_of_panic() {
+        // A1：纯 `====` 行（用户随手粘贴的分隔线）曾让切片 start > end 直接 panic
+        assert_eq!(heading_of("===="), None);
+        assert_eq!(heading_of("======"), None);
+        assert_eq!(heading_of("=="), None);
+        assert_eq!(heading_of("==   =="), None, "纯空格标题视同非标题");
+        assert_eq!(
+            heading_of("== 简介 =="),
+            Some((2, "简介".to_string())),
+            "正常标题行为不变"
+        );
+        assert_eq!(heading_of("=== 往世乐土 ==="), Some((3, "往世乐土".to_string())));
+    }
+
+    #[test]
+    fn segment_sections_survives_paste_of_all_equals_lines() {
+        // A1 构造用例：commands.rs 把粘贴原文直接喂 clean_source → segment_sections
+        let pasted = "====\n正文第一段。\n====\n== 真标题 ==\n正文第二段。\n=====\n";
+        let sections = segment_sections(&clean_source(pasted));
+        assert!(!sections.is_empty());
+        assert!(
+            sections.iter().any(|s| s.title.contains("真标题")),
+            "夹在分隔线里的正常标题仍要被识别：{sections:?}"
+        );
     }
 }

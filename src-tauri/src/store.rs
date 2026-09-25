@@ -60,6 +60,33 @@ impl From<toml::ser::Error> for StoreError {
     }
 }
 
+/// 原子落盘（加固 A2）：写同目录临时文件 → fsync → rename 原子替换。
+/// 中途崩溃/断电最坏留一个 `.tmp` 残骸，目标文件要么是完整的旧内容要么是
+/// 完整的新内容，绝不出现半截文件（messages.jsonl 是唯一事实来源，半截不可重建）。
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 pub type StoreResult<T> = Result<T, StoreError>;
 
 // ---------- 目录 ----------
@@ -134,7 +161,7 @@ pub fn save_providers(root: &Path, providers: &[Provider]) -> StoreResult<()> {
     let toml = toml::to_string_pretty(&ProvidersFile {
         providers: providers.to_vec(),
     })?;
-    std::fs::write(providers_path(root), toml + "\n")?;
+    atomic_write(&providers_path(root), (toml + "\n").as_bytes())?;
     Ok(())
 }
 
@@ -189,8 +216,13 @@ pub struct Settings {
 impl Settings {
     /// 输入预算（设计 §4.2）：模型上下文窗口 × 75%；输出预留另计，不在这里扣。
     /// `context_window` 缺省按 32768 计。
+    /// 加固 A7：手填的超大窗口先钳到 1..=10_000_000——usize 乘 75 在 debug 构建会溢出 panic。
     pub fn input_budget(&self) -> usize {
-        self.context_window.unwrap_or(32768) * 75 / 100
+        self.context_window
+            .unwrap_or(32768)
+            .clamp(1, 10_000_000)
+            .saturating_mul(75)
+            / 100
     }
 }
 
@@ -489,8 +521,12 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         req.characters.clone()
     };
     cast.dedup();
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis();
     let meta = SessionMeta {
-        id: session_id(now_secs),
+        id: unique_session_id_at(root, now_secs, millis),
         created_at: iso8601(now_secs),
         characters: cast.clone(),
         persona: req.persona.clone(),
@@ -734,13 +770,23 @@ impl EventLog {
         let mut map = self.inner.lock().map_err(|_| poisoned())?;
         sync_entry(&mut map, root, session_id)?;
 
+        let path = session_dir(root, session_id).join("messages.jsonl");
         let entry = map.get_mut(session_id).expect("sync_entry 已建立条目");
+        // 加固 A3：崩溃残留的尾部半行——sync_entry 只消费完整行，pos 落后于文件长度。
+        // 直接 append 会把新行粘在半行后面（非法 JSON，这条消息重启后读不回）。
+        // 先补一个换行封口：半行（或无换行的整行）成为独立一行被读侧处理，pos 对齐后再写新行。
+        let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(entry.pos);
+        if file_len > entry.pos {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
+            f.write_all(b"\n")?;
+            entry.pos = file_len + 1;
+        }
+
         let seq = entry.records.last().map(|r| r.seq).unwrap_or(0) + 1;
         let record = crate::event::LogRecord::new(seq, body);
         let line = record
             .to_line()
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
-        let path = session_dir(root, session_id).join("messages.jsonl");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -766,7 +812,7 @@ impl EventLog {
         }
         let text = crate::event::render_lines(records)
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
-        std::fs::write(dir.join("messages.jsonl"), &text)?;
+        atomic_write(&dir.join("messages.jsonl"), text.as_bytes())?;
 
         let mut map = self.inner.lock().map_err(|_| poisoned())?;
         let entry = map.entry(session_id.to_string()).or_default();
@@ -883,7 +929,7 @@ pub fn save_world(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(state)? + "\n")?;
+    atomic_write(&path, (serde_json::to_string_pretty(state)? + "\n").as_bytes())?;
     Ok(())
 }
 
@@ -918,7 +964,7 @@ pub fn save_grown(root: &Path, world: &str, grown: &GrownFile) -> StoreResult<()
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(grown)? + "\n")?;
+    atomic_write(&path, (serde_json::to_string_pretty(grown)? + "\n").as_bytes())?;
     Ok(())
 }
 
@@ -930,11 +976,7 @@ fn seed_now() -> u64 {
 }
 
 /// 会话 id：`20260919-180102-483`（本地无关的 UTC，毫秒尾数防同秒碰撞）
-fn session_id(secs: u64) -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_millis();
+fn session_id_at(secs: u64, millis: u32) -> String {
     let (y, m, d) = civil_from_days((secs / 86400) as i64);
     let rem = secs % 86400;
     format!(
@@ -947,6 +989,18 @@ fn session_id(secs: u64) -> String {
         rem % 60,
         millis
     )
+}
+
+/// 加固 A7：同毫秒两次 `new_session` 会拿到同一个 id、目录互覆——
+/// 目录已存在就递增毫秒尾数重滚，直到空位。
+fn unique_session_id_at(root: &Path, secs: u64, millis: u32) -> String {
+    let mut millis = millis % 1000;
+    let mut id = session_id_at(secs, millis);
+    while session_dir(root, &id).exists() {
+        millis = (millis + 1) % 1000;
+        id = session_id_at(secs, millis);
+    }
+    id
 }
 
 /// unix 秒 → ISO-8601 UTC（如 `2026-09-19T10:02:03Z`）
@@ -1656,5 +1710,161 @@ mod tests {
         // 新建缓存实例的全量重建也能工作（invalidate 后等价路径）
         log.invalidate(Some(&meta.id));
         assert_eq!(log.read(root.path(), &meta.id).unwrap().len(), n);
+    }
+
+    fn msg(turn: u64, content: &str) -> Message {
+        Message {
+            name: None,
+            turn,
+            role: "user".into(),
+            content: content.into(),
+            ts: 0,
+            scene_id: None,
+        }
+    }
+
+    #[test]
+    fn rewrite_is_atomic_and_leaves_no_tmp_residue() {
+        // A2：messages.jsonl 是唯一事实来源，rewrite 走临时文件 + rename，
+        // 崩溃最坏留 .tmp 残骸，目标文件绝不半截
+        let root = tempfile::tempdir().unwrap();
+        ensure_layout(root.path()).unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                characters: Vec::new(),
+                character: "小雨".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        let log = EventLog::new();
+        let r1 = log.append(root.path(), &meta.id, msg(1, "第一条")).unwrap();
+        let kept = vec![r1];
+        log.rewrite(root.path(), &meta.id, &kept).unwrap();
+
+        let path = session_dir(root.path(), &meta.id).join("messages.jsonl");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1, "rewrite 后只剩 kept 的那一行");
+        assert_eq!(
+            crate::event::messages(&log.read(root.path(), &meta.id).unwrap()).len(),
+            1
+        );
+        let residue: Vec<_> = std::fs::read_dir(session_dir(root.path(), &meta.id))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(residue.is_empty(), "不允许 .tmp 残留：{residue:?}");
+
+        // 同款修法的三个小落盘点：写后无 .tmp、内容完整
+        save_world(
+            root.path(),
+            "w1",
+            &crate::worldline::WorldState {
+                day: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_world(root.path(), "w1").day, 7,
+            "save_world 原子写后可读回"
+        );
+        save_grown(root.path(), "w1", &GrownFile::default()).unwrap();
+        assert!(load_grown(root.path(), "w1").entities.is_empty());
+        save_providers(root.path(), &[sample_provider("p", "chat")]).unwrap();
+        assert_eq!(load_providers(root.path()).unwrap().len(), 1);
+        let strays: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "{strays:?}");
+    }
+
+    #[test]
+    fn append_seals_torn_tail_line_instead_of_gluing() {
+        // A3：上次崩溃残留「末行无换行的半截 JSON」时，append 先封口再写——
+        // 新消息要能完整读回，坏行被读侧跳过，缓存偏移不错位
+        let root = tempfile::tempdir().unwrap();
+        ensure_layout(root.path()).unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                characters: Vec::new(),
+                character: "小雨".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        let dir = session_dir(root.path(), &meta.id);
+        let log = EventLog::new();
+        log.append(root.path(), &meta.id, msg(1, "完整的一条")).unwrap();
+
+        // 模拟崩溃残留：抹掉事件流，手写一行完整记录 + 一行无换行的半截 JSON
+        log.invalidate(Some(&meta.id));
+        let good_line = crate::event::LogRecord::message(1, msg(1, "完整的一条"))
+            .to_line()
+            .unwrap();
+        let full_line = crate::event::LogRecord::message(2, msg(1, "torn-half-line"))
+            .to_line()
+            .unwrap();
+        let torn = &full_line[..full_line.len() / 2]; // 无换行的半截（ASCII 内容，字节切安全）
+        std::fs::write(dir.join("messages.jsonl"), format!("{good_line}{torn}")).unwrap();
+
+        let record = log
+            .append(root.path(), &meta.id, msg(2, "崩溃后新消息"))
+            .unwrap();
+        assert_eq!(record.seq, 2, "坏行不计入序号");
+
+        // 缓存与直读文件两条路径都要一致：新消息完整、半行被跳过
+        let cached = crate::event::messages(&log.read(root.path(), &meta.id).unwrap());
+        log.invalidate(Some(&meta.id));
+        let reread = read_messages(root.path(), &meta.id).unwrap();
+        assert_eq!(cached.len(), 2, "{cached:?}");
+        assert_eq!(reread.len(), 2, "{reread:?}");
+        assert_eq!(cached[1].content, "崩溃后新消息");
+        assert_eq!(reread[1].content, "崩溃后新消息");
+        assert!(
+            !cached[1].content.contains("断电") && !reread[0].content.contains("断电"),
+            "半行不得粘连进任何一条消息"
+        );
+    }
+
+    #[test]
+    fn session_id_skips_existing_directory_on_collision() {
+        // A7：同毫秒两次建会话同 ID 会互覆目录——已占用就递增毫秒尾数重滚
+        let root = tempfile::tempdir().unwrap();
+        ensure_layout(root.path()).unwrap();
+        let secs: u64 = 1_790_000_000; // 固定秒，测毫秒碰撞路径
+        let first = unique_session_id_at(root.path(), secs, 483);
+        std::fs::create_dir_all(session_dir(root.path(), &first)).unwrap();
+        let second = unique_session_id_at(root.path(), secs, 483);
+        assert_ne!(first, second, "同毫秒第二次要避开已存在目录");
+        assert!(second.ends_with("-484"), "顺延毫秒尾数：{second}");
+        // 空目录无碰撞：原样返回
+        assert_eq!(unique_session_id_at(root.path(), secs, 700), session_id_at(secs, 700));
+    }
+
+    #[test]
+    fn input_budget_clamps_absurd_context_window() {
+        // A7：手填超大窗口曾让 usize 乘 75 在 debug 构建直接溢出 panic
+        let mut s = Settings::default();
+        assert_eq!(s.input_budget(), 32768 * 75 / 100, "缺省行为不变");
+        s.context_window = Some(usize::MAX);
+        assert_eq!(s.input_budget(), 10_000_000 * 75 / 100, "超大值钳到上限");
+        s.context_window = Some(0);
+        assert_eq!(s.input_budget(), 0, "0 钳到 1 后预算归零但不 panic");
+        s.context_window = Some(8192);
+        assert_eq!(s.input_budget(), 8192 * 75 / 100, "正常值不受影响");
     }
 }

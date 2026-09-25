@@ -216,6 +216,50 @@ pub struct CardSource {
     pub hook_names: Vec<String>,
 }
 
+// ---------- 深度预检（加固 A6）----------
+//
+// mlua 的 serde 桥（LuaSerdeExt::from_value）只有环检测、没有深度上限：卡/实体数据里
+// 几千层非环嵌套表（远在指令计数限内可构造）会让宿主递归下钻直到栈溢出——栈溢出是
+// abort 不是 panic，错误边界拦不住。所有 from_value 之前先做带深度上限的预检 walk，
+// 超限报错降级（丢该值 + 诊断日志），绝不下钻。
+
+/// mlua Value 递归深度上限（正常卡 state / 实体数据远用不到这么深）
+const LUA_VALUE_DEPTH_LIMIT: u32 = 64;
+
+/// 带深度上限的 mlua Value 预检：超限（或表遍历失败）返回 true，调用方按超深降级
+fn lua_value_depth_exceeds(root: &Value, limit: u32) -> bool {
+    fn walk(v: &Value, depth: u32, limit: u32) -> bool {
+        if depth > limit {
+            return true;
+        }
+        if let Value::Table(t) = v {
+            for item in t.pairs::<Value, Value>() {
+                // 遍历中途失败（键/值转换炸了）按超深同路降级
+                let Ok((k, val)) = item else {
+                    return true;
+                };
+                if walk(&k, depth + 1, limit) || walk(&val, depth + 1, limit) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    walk(root, 0, limit)
+}
+
+/// hook 改写后的 state 读回（加固 A6）：超深的本次写入整体丢弃，回落旧 state 并记诊断
+fn state_from_value(lua: &Lua, v: Value, fallback: serde_json::Value, where_: &str) -> serde_json::Value {
+    if lua_value_depth_exceeds(&v, LUA_VALUE_DEPTH_LIMIT) {
+        crate::diag::record(
+            "card.state",
+            format!("{where_}：state 嵌套超过 {LUA_VALUE_DEPTH_LIMIT} 层，本次写入丢弃"),
+        );
+        return fallback;
+    }
+    lua.from_value(v).unwrap_or(fallback)
+}
+
 /// 解析 card.lua 源码（沙箱内执行；任何失败返回错误原因）
 pub fn parse_card(source: &str) -> Result<CardSource, String> {
     let lua = new_sandbox().map_err(|e| format!("沙箱初始化失败：{e}"))?;
@@ -242,9 +286,21 @@ pub fn parse_card(source: &str) -> Result<CardSource, String> {
         }
     }
     let default_state = match table.get::<Value>("state") {
-        Ok(Value::Table(t)) => lua
-            .from_value(Value::Table(t))
-            .unwrap_or(serde_json::json!({})),
+        Ok(v @ Value::Table(_)) => {
+            if lua_value_depth_exceeds(&v, LUA_VALUE_DEPTH_LIMIT) {
+                // 加固 A6：卡 state 超深会让 from_value 打穿宿主栈——回落空表
+                crate::diag::record(
+                    "card.state",
+                    format!(
+                        "卡片「{}」state 嵌套超过 {LUA_VALUE_DEPTH_LIMIT} 层，回落空表",
+                        card.name
+                    ),
+                );
+                serde_json::json!({})
+            } else {
+                lua.from_value(v).unwrap_or(serde_json::json!({}))
+            }
+        }
         _ => serde_json::json!({}),
     };
     Ok(CardSource {
@@ -307,8 +363,14 @@ pub fn load_card(root: &Path, dir_name: &str) -> Result<LoadedCard, String> {
 pub fn eval_lua_value(source: &str) -> Result<serde_json::Value, String> {
     let lua = new_sandbox().map_err(|e| format!("沙箱初始化失败：{e}"))?;
     let table = eval_card(&lua, source).map_err(|e| format!("Lua 执行失败：{e}"))?;
-    lua.from_value(Value::Table(table))
-        .map_err(|e| format!("实体转 JSON 失败：{e}"))
+    let v = Value::Table(table);
+    if lua_value_depth_exceeds(&v, LUA_VALUE_DEPTH_LIMIT) {
+        // 加固 A6：codex 实体同险（几千层嵌套表会打穿宿主栈）——报错降级
+        return Err(format!(
+            "实体嵌套超过 {LUA_VALUE_DEPTH_LIMIT} 层（防宿主栈溢出的硬上限）"
+        ));
+    }
+    lua.from_value(v).map_err(|e| format!("实体转 JSON 失败：{e}"))
 }
 
 pub fn list_cards(root: &Path) -> Vec<CardSummary> {
@@ -542,7 +604,12 @@ pub fn run_hook_full(
     }
 
     // hooks 原地修改 state 表；失败后也读回部分修改（卡作者可在日志里看到错误）
-    run.result.state = Some(lua.from_value(state_value).unwrap_or(env.state.clone()));
+    run.result.state = Some(state_from_value(
+        &lua,
+        state_value,
+        env.state.clone(),
+        "hook",
+    ));
 
     // api.schedule_say 的心里话合并进 state.psyche.scheduled（M3.5）：
     // 队列住进卡私有 state，持久化与重放走既有 state patch 通道，无需新事件类型；
@@ -742,6 +809,16 @@ fn make_kv_ns(
                         allowed.join(" / ")
                     )));
                 }
+            }
+            if lua_value_depth_exceeds(&v, LUA_VALUE_DEPTH_LIMIT) {
+                // 加固 A6：api.blackboard.set 塞超深表同样会打穿宿主栈——拒绝该值
+                crate::diag::record(
+                    "card.state",
+                    format!("{ns_name}.set 值嵌套超过 {LUA_VALUE_DEPTH_LIMIT} 层，已丢弃"),
+                );
+                return Err(mlua::Error::runtime(format!(
+                    "{ns_name}.set 的值嵌套超过 {LUA_VALUE_DEPTH_LIMIT} 层"
+                )));
             }
             let json = lua.from_value::<serde_json::Value>(v)?;
             let mut log = log.borrow_mut();
@@ -980,7 +1057,12 @@ pub fn run_state_hook_full(
             .push(format!("状态钩子「{state_id}.{kind}」执行失败：{e}"));
     }
     // 与 hooks 一致：钩子原地改 state 表，失败后也读回部分修改（卡作者可在日志里看到错误）
-    run.result.state = Some(lua.from_value(state_value).unwrap_or(hook_env.state.clone()));
+    run.result.state = Some(state_from_value(
+        &lua,
+        state_value,
+        hook_env.state.clone(),
+        "状态钩子",
+    ));
     // api.schedule_say 与 hooks 同语义（M3.5）：心里话合并进 state.psyche.scheduled
     let says = schedule_log.borrow().clone();
     if !says.is_empty() {
@@ -1751,6 +1833,131 @@ return {
             cs.hook_names,
             vec!["on_context".to_string(), "on_message".to_string()]        );
         assert_eq!(cs.default_state["favorability"], 50);
+    }
+
+    /// Lua 侧构造 n 层嵌套表（A6 用例的弹药）
+    const DEEP_BUILDER: &str = r#"
+local function deep(n)
+  local t = {}
+  for _ = 1, n do t = { inner = t } end
+  return t
+end
+"#;
+
+    #[test]
+    fn hook_writing_deep_state_degrades_instead_of_aborting() {
+        // A6：100 层嵌套（超 64 上限）曾让 from_value 递归打穿宿主栈——
+        // 现在整体回退旧 state 并记诊断，进程活着
+        let source = format!(
+            r#"
+{DEEP_BUILDER}
+return {{
+  spec = "charcard/1.0", name = "深雨", scenario = "s", personality = "p", first_mes = "f",
+  state = {{ favorability = 50 }},
+  hooks = {{
+    on_load = function(state, api)
+      state.deep = deep(100)
+      state.favorability = 99 -- 同一次 hook 里的正常写入也随之回退（整体语义）
+    end,
+  }},
+}}
+"#
+        );
+        let r = run(
+            &source,
+            HookCall::OnLoad,
+            serde_json::json!({ "favorability": 50 }),
+            42,
+        );
+        assert_eq!(
+            r.state,
+            Some(serde_json::json!({ "favorability": 50 })),
+            "超深写入整体丢弃，回落旧 state：{:?}",
+            r.state
+        );
+        assert!(
+            crate::diag::recent(50)
+                .iter()
+                .any(|d| d.kind == "card.state" && d.detail.contains("嵌套超过")),
+            "要留下超深降级的诊断"
+        );
+    }
+
+    #[test]
+    fn shallow_state_writes_still_land() {
+        // A6 的反面：深度在限内的正常写入必须照常生效
+        let source = format!(
+            r#"
+{DEEP_BUILDER}
+return {{
+  spec = "charcard/1.0", name = "浅雨", scenario = "s", personality = "p", first_mes = "f",
+  state = {{ favorability = 50 }},
+  hooks = {{ on_load = function(state, api) state.deep = deep(30) end }},
+}}
+"#
+        );
+        let r = run(
+            &source,
+            HookCall::OnLoad,
+            serde_json::json!({ "favorability": 50 }),
+            42,
+        );
+        let st = r.state.expect("state 要被读回");
+        assert_eq!(st["favorability"], 50);
+        assert!(st["deep"]["inner"]["inner"].is_object(), "30 层在限内要完整落盘");
+    }
+
+    #[test]
+    fn parse_card_rejects_deep_state_field() {
+        // A6：卡静态 state 字段超深 → 回落空表，卡本体照常解析（不降级整卡）
+        let source = format!(
+            r#"
+{DEEP_BUILDER}
+return {{
+  spec = "charcard/1.0", name = "深卡", scenario = "s", personality = "p", first_mes = "f",
+  state = deep(100),
+}}
+"#
+        );
+        let cs = parse_card(&source).expect("解析不因 state 超深而失败");
+        assert_eq!(cs.card.name, "深卡");
+        assert_eq!(cs.default_state, serde_json::json!({}), "state 回落空表");
+    }
+
+    #[test]
+    fn eval_lua_value_rejects_deep_entity() {
+        // A6：codex 实体文件同险——超深报错而非打穿宿主栈
+        let source = format!("{DEEP_BUILDER}\nreturn deep(100)\n");
+        let err = eval_lua_value(&source).expect_err("超深实体要报错");
+        assert!(err.contains("嵌套超过"), "{err}");
+        // 限内的实体照常转换
+        let ok = eval_lua_value(&format!("{DEEP_BUILDER}\nreturn deep(10)\n")).expect("浅层实体要成功");
+        assert!(ok["inner"]["inner"].is_object());
+    }
+
+    #[test]
+    fn kv_set_rejects_deep_value() {
+        // A6：api.blackboard.set 塞超深表 → 拒绝该值（错误进 hook 日志），不碰宿主栈
+        let lua = new_sandbox().expect("沙箱");
+        let log: Rc<RefCell<Vec<KvSet>>> = Rc::new(RefCell::new(Vec::new()));
+        let ns = make_kv_ns(&lua, Rc::new(BTreeMap::new()), Rc::clone(&log), None, "blackboard");
+        let set: Function = ns.get("set").expect("set fn");
+        lua.globals().set("set", set).expect("挂全局");
+        lua.load(format!(
+            "{DEEP_BUILDER}\nreturn set('char.小雨.status', deep(100))\n"
+        ))
+        .set_name("test")
+        .exec()
+        .unwrap_err();
+        assert!(log.borrow().is_empty(), "超深值不得进写入日志");
+        // 浅值照常
+        lua.load(format!(
+            "{DEEP_BUILDER}\nreturn set('char.小雨.status', deep(5))\n"
+        ))
+        .set_name("test")
+        .exec()
+        .expect("浅值要能写入");
+        assert_eq!(log.borrow().len(), 1);
     }
 
     #[test]
