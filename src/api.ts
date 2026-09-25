@@ -19,6 +19,7 @@ import type {
   InspectorProposal,
   MemRecord,
   Message,
+  OptionsEvent,
   Persona,
   PromptAssembly,
   Provider,
@@ -156,6 +157,16 @@ export const api = {
   /** 类型化事件流视图（最新在前，默认 200 条） */
   sessionTimeline: (sessionId: string, limit?: number) =>
     invoke<TimelineEntry[]>("session_timeline", { sessionId, limit }),
+
+  // ---------- 小说模式（增强 F：互动式散文剧） ----------
+  /** 小说模式开关（v1 仅 1v1 单场景可开） */
+  setNovelMode: (sessionId: string, novel: boolean) =>
+    invoke<boolean>("set_novel_mode", { sessionId, novel }),
+  /** 某轮的段末走向选项（不传 turn = 最新一轮；None = 无选项/降级纯自由输入） */
+  latestOptions: (sessionId: string, turn?: number) =>
+    invoke<OptionsEvent | null>("latest_options", { sessionId, turn }),
+  /** 小说化导出：事件流 → novel.md（只读导出，返回文件路径） */
+  exportNovel: (sessionId: string) => invoke<string>("export_novel", { sessionId }),
 
   // ---------- 场景与多线（M3.2 · 设计 §10.3：「与此同时」） ----------
   /** 场景列表 + 当前聚焦场景 */

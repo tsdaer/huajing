@@ -344,6 +344,10 @@ pub struct SessionMeta {
     /// 「设定·暂定」注入当轮生效；提案照落收件箱，确认后才算正史。
     #[serde(default)]
     pub improv: bool,
+    /// 小说模式（增强 F1 · 决断 9：会话级模式开关，非新引擎）：v1 仅 1v1 单场景
+    /// 可开。开启后叙事锁小说体、消息按散文排版、段末生成走向选项
+    #[serde(default)]
+    pub novel_mode: bool,
     /// 语义源嵌入模型（M3.10 · 设计 §6.13）：首次实际启用语义召回时把
     /// 「provider 名 + 模型名」记进会话（可回放语义随版本声明）；None = 从未启用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -548,6 +552,7 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
     let meta = SessionMeta {
         id: unique_session_id_at(root, now_secs, millis),
         created_at: iso8601(now_secs),
+        novel_mode: false,
         characters: cast.clone(),
         persona: req.persona.clone(),
         world: None,

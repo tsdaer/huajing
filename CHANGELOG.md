@@ -2,6 +2,32 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [Unreleased] · 增强计划 · 包 F 小说模式（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+
+### Added · 包 F（互动式散文剧；决断 9/10）
+
+- **F1 会话模式与渲染**：`SessionMeta.novel_mode` 会话级开关（v1 仅 1v1 单场景
+  可开，`set_novel_mode` 命令守卫）；开启后 A1 契约追加【小说模式】条款——叙事锁
+  小说体、每段 300–800 字、段落结尾留钩子但不替读者做决定、正文不得罗列
+  「你可以……」；前端消息区切散文排版：char 消息按段落流（左边线 + 衬线），
+  user 消息折叠为段间「走向」提示条，narration 沿用 E 包散文通道
+- **F2 段末选项管线（新引擎件）**：`event.rs` 第 14 类 `Options` 事件
+  （`{turn, options:[{label,gist}], origin:"model"}`）——**模型产物**随事件流
+  重放、编辑历史重放不重调模型（`is_derived` false；投影 `options` 同轮后写覆盖）；
+  生成异步不阻塞主链路：util 档非流式 ≤300 token，上下文 = B1 现状 + 活跃线
+  （标题/重要度）+ psyche 意图 + 最近一段正文，要求 3–4 个选项且至少一个接住
+  悬置线；`parse_options` 容忍围栏/杂讯、坏产出（<2 或 >6、缺字段）整组拒绝；
+  **未配 util 档 → 不落选项事件，选项区降级为纯自由输入**（DoD 单测钉死）；
+  前端选项面板在输入区上方常驻自由输入框，点选 = gist 作为走向续写下一段
+  （与自由输入同构，模型无感区别）
+- **F4 小说化导出**：`export_novel` 命令——事件流 → `sessions/<id>/novel.md`
+  单文件 Markdown（章节 = 场景，编年体），**只读导出不写回会话**；小说模式会话
+  散文直出（user 折叠为走向注记），台词体会话由 util 档按章批量转写，失败跳过
+  留原文标记
+- **DoD**：选项事件重放一致（编辑段落重放后选项不变、不重调——单测钉死）；
+  未配选项档 provider 时降级为纯自由输入（单测钉死）；全链路真机可玩与 200 轮
+  导出压测留待 dev 真机走查（M4 前统一回归）；`cargo test` 489 例全绿
+
 ## [Unreleased] · 增强计划 · 包 E 旁白声道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 E（narration 一等 voice，决断 8：旁白归宿主与模式所有）

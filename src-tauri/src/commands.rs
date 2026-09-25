@@ -1204,6 +1204,190 @@ fn rebuild_from(
     Ok(out)
 }
 
+// ---------- 增强 F：小说模式（互动式散文剧；决断 9/10）----------
+
+/// 小说模式开关（增强 F1 · 决断 9）：v1 仅 **1v1 单场景**可开——群聊/剧场/多场景
+/// 的组合矩阵留后续。关闭后回台词体渲染无残留（选项事件保留但面板不再显示）。
+#[tauri::command]
+pub fn set_novel_mode(session_id: String, novel: bool) -> Result<bool, String> {
+    let root = root();
+    let mut meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    if novel {
+        if meta.characters.len() > 1 {
+            return Err("小说模式 v1 仅支持 1v1 会话".to_string());
+        }
+    }
+    meta.novel_mode = novel;
+    store::save_session(&root, &meta).map_err(|e| e.to_string())?;
+    Ok(novel)
+}
+
+/// 小说化导出（增强 F4 · 决断 10：后处理的正确位置是导出）：会话事件流 →
+/// 单文件 Markdown 小说，存 `DataHub/sessions/<id>/novel.md`。**只读导出**，
+/// 不写回会话。
+///
+/// - 章节编年体 = 场景（消息的 scene_id 分段；无场景会话单章）；
+/// - 小说模式会话：char/narration 消息即散文正文，user 消息折叠为「走向」注记；
+/// - 台词体会话：转写由 util 档批量完成（每章一次调用，段级失败跳过留原文标记）。
+#[tauri::command]
+pub async fn export_novel(session_id: String) -> Result<String, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let log = store::EventLog::new();
+    let proj = project_session(&log, &root, &meta)?;
+
+    // 章节 = 场景（按消息 scene_id 归组，保持编年序）
+    let mut chapters: Vec<(String, Vec<&Message>)> = Vec::new();
+    for m in &proj.messages {
+        let key = scene::normalize(m.scene_id.as_deref()).to_string();
+        match chapters.last_mut() {
+            Some((k, msgs)) if *k == key => msgs.push(m),
+            _ => chapters.push((key.clone(), vec![m])),
+        }
+    }
+    let title = meta
+        .premise
+        .clone()
+        .unwrap_or_else(|| format!("{}的小说", cast_display_name_of(&meta)));
+    let mut md = format!("# {title}
+
+");
+    let novel_mode = meta.novel_mode;
+    let cast = Cast::load(&root, &meta)?;
+    let world = session_world(&meta);
+    let cx = load_codex(&root, None, &world);
+    for (idx, (scene_id, msgs)) in chapters.iter().enumerate() {
+        let scene_title = proj
+            .scenes
+            .get(scene_id)
+            .map(|sc| {
+                if sc.title.is_empty() {
+                    sc.place.clone()
+                } else {
+                    sc.title.clone()
+                }
+            })
+            .unwrap_or_else(|| "第一章".into());
+        let day = msgs.first().map(|m| m.turn).unwrap_or(0);
+        md.push_str(&format!("
+## 第{}章 · {}
+
+", idx + 1, scene_title));
+
+        if novel_mode {
+            // 散文直出：char/narration 是正文，user 折叠为走向注记
+            for m in msgs {
+                match m.role.as_str() {
+                    "narration" => md.push_str(&format!("*{}*
+
+", m.content.trim())),
+                    "user" => md.push_str(&format!(
+                        "> 〔走向〕{}
+
+",
+                        m.content.trim().chars().take(80).collect::<String>()
+                    )),
+                    _ => md.push_str(&format!("{}
+
+", m.content.trim())),
+                }
+            }
+        } else {
+            // 台词体 → 小说体转写：每章一次 util 档调用；失败跳过留原文标记
+            let lines: Vec<String> = msgs
+                .iter()
+                .filter(|m| m.role == "user" || m.role == "char")
+                .map(|m| {
+                    format!(
+                        "{}：{}",
+                        if m.role == "user" { "用户" } else { m.name.as_deref().unwrap_or("角色") },
+                        m.content.trim()
+                    )
+                })
+                .collect();
+            let chapter = match novelize_chapter(&root, &lines).await {
+                Some(text) => text,
+                None => format!(
+                    "{}
+
+> （本章转写失败，保留原文）
+
+{}",
+                    lines.join("
+
+"),
+                    ""
+                ),
+            };
+            let _ = cx;
+            md.push_str(&chapter);
+            md.push_str("
+
+");
+        }
+        let _ = day;
+    }
+    let dir = root.join("sessions").join(&meta.id);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("novel.md");
+    std::fs::write(&path, md).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+/// 单章台词体 → 小说体转写（F4）：util 档一次调用；未配/失败返回 None（调用方留原文）
+async fn novelize_chapter(root: &std::path::Path, lines: &[String]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    let provider = pick_util_provider(root).ok()?;
+    let prompt = format!(
+        "把下面的角色扮演对话转写成小说体散文：第三人称叙述、对话织在段落里、保留全部剧情事实，两三段以内。直接输出正文。
+
+{}",
+        lines.join("
+")
+    );
+    let proxy = proxy_of(root);
+    let raw = llm::chat_complete(
+        &provider,
+        &[llm::ChatMessage::text("user", prompt)],
+        2048,
+        0.5,
+        proxy.as_deref(),
+    )
+    .await
+    .ok()?;
+    let text = raw.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn cast_display_name_of(meta: &store::SessionMeta) -> String {
+    meta.characters
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "角色".into())
+}
+
+/// 某轮的段末走向选项（增强 F2）：前端选项面板的数据源（None = 该轮没有选项）
+#[tauri::command]
+pub fn latest_options(
+    session_id: String,
+    turn: Option<u64>,
+    log: State<'_, store::EventLog>,
+) -> Result<Option<event::OptionsEvent>, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let proj = project_session(&log, &root, &meta)?;
+    match turn {
+        Some(t) => Ok(proj.options.get(&t).cloned()),
+        None => Ok(proj.options.values().next_back().cloned()),
+    }
+}
+
 /// 场景感知的黑板快照（M3.2）：场景分区事件的 extra 必须只装场景 flags——
 /// 折叠时它整体替换分区 flags，混入世界层实体键会把实体状态误记成场景事实。
 fn scene_board_value(
@@ -2565,6 +2749,7 @@ fn assemble_prompt_core(
         summary: summary_text.as_deref(),
         cast_note: cast_note.as_deref(),
         tools_contract: tools_contract.as_deref(),
+        novel_mode: meta.novel_mode,
         history,
         user_content,
     };
@@ -4489,7 +4674,183 @@ async fn send_message_inner(
             break; // 出错或被中断：保留已说出的部分，不再往下排
         }
     }
+    // 增强 F2：小说模式的段末选项生成（一段 = 主演一次响应；段落已可读，
+    // 选项异步补齐——util 档生成，未配则整段降级为纯自由输入，不阻塞主链路）
+    if meta.novel_mode {
+        if let Ok(StreamEvent::Done { cancelled: false, .. }) = &last {
+            spawn_options_generation(
+                root.clone(),
+                session_id.clone(),
+                turn,
+                scene.clone(),
+            );
+        }
+    }
     last
+}
+
+/// 段末选项生成的提示词（F2 · 纯函数便于单测）：现状 B1 + 活跃线清单 + 心理意图
+/// + 最近一段正文；要求 3–4 个选项、至少一个关联活跃线、不每段开新坑。
+fn build_options_prompt(
+    scene_line: &str,
+    active_threads: &[String],
+    intents: &[String],
+    last_passage: &str,
+) -> String {
+    let mut s = String::from(
+        "你是互动小说的走向设计者。根据刚写完的一段正文，给出 3–4 个读者可能的下一步走向。要求：每个选项 = {{ \"label\": 界面短语(≤12字), \"gist\": 走向梗概(一句话) }}；至少一个选项接住上文悬置的线（如果有）；不要每段都开新坑；不替读者做道德判断。只输出一个 JSON 数组，不要任何解释。
+
+【现状】",
+    );
+    s.push_str(scene_line);
+    if !active_threads.is_empty() {
+        s.push_str("
+【活跃线】");
+        s.push_str(&active_threads.join("；"));
+    }
+    if !intents.is_empty() {
+        s.push_str("
+【她的心思】");
+        s.push_str(&intents.join("；"));
+    }
+    s.push_str("
+【最近一段】");
+    s.push_str(&last_passage.chars().take(1200).collect::<String>());
+    s
+}
+
+/// 解析选项生成的回复（F2 · 纯函数）：容忍 Markdown 围栏与前后杂讯；
+/// 少于 2 个或多于 6 个选项视作坏产出（None = 降级为纯自由输入）。
+fn parse_options(raw: &str) -> Option<Vec<event::StoryOption>> {
+    let trimmed = raw.trim();
+    let json_text = if trimmed.starts_with('[') {
+        trimmed
+    } else {
+        let start = trimmed.find('[')?;
+        let end = trimmed.rfind(']')?;
+        &trimmed[start..=end]
+    };
+    let parsed: serde_json::Value = serde_json::from_str(json_text).ok()?;
+    let arr = parsed.as_array()?;
+    let options: Vec<event::StoryOption> = arr
+        .iter()
+        .filter_map(|v| {
+            let label = v.get("label")?.as_str()?.trim().to_string();
+            let gist = v.get("gist")?.as_str()?.trim().to_string();
+            if label.is_empty() || gist.is_empty() {
+                return None;
+            }
+            Some(event::StoryOption { label, gist })
+        })
+        .collect();
+    if (2..=6).contains(&options.len()) {
+        Some(options)
+    } else {
+        None
+    }
+}
+
+/// 段末选项生成的异步任务（F2）：util 档（总结便宜档）非流式调用，max_tokens 300；
+/// 未配 util 档 / 失败 / 坏产出 → 不落任何选项事件（选项区降级为纯自由输入）。
+/// 产出经会话闸门落 Options 事件（模型产物，重放不重调）。
+fn spawn_options_generation(
+    root: std::path::PathBuf,
+    session_id: String,
+    turn: u64,
+    scene: Option<String>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let Ok(meta) = store::load_session(&root, &session_id) else {
+            return;
+        };
+        let log = store::EventLog::new();
+        let Ok(proj) = project_session(&log, &root, &meta) else {
+            return;
+        };
+        // 上下文：现状卡（B1 投影）+ 活跃线 + psyche 意图 + 最近一段正文
+        let board = proj.effective_board(scene.as_deref());
+        let snapshot = prompt::SceneSnapshot::from_blackboard(&board).render();
+        let active_threads: Vec<String> = proj
+            .threads
+            .values()
+            .filter_map(|v| threads::Thread::from_value(v).ok())
+            .filter(|t| t.is_active())
+            .map(|t| format!("{}（重要度 {:.1}）", t.title, t.importance))
+            .collect();
+        let intents: Vec<String> = proj
+            .states
+            .values()
+            .map(|st| psyche::Psyche::from_state(st))
+            .flat_map(|p| p.intents.iter().map(|i| format!("{}（{:.2}）", i.name, i.strength)).collect::<Vec<_>>())
+            .collect();
+        let last_passage = proj
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "char")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let prompt_text = build_options_prompt(&snapshot, &active_threads, &intents, &last_passage);
+
+        // util 档（便宜档）未配 → 降级为纯自由输入
+        let Ok(provider) = pick_util_provider(&root) else {
+            crate::diag::record("options", "未配 util 档，第 {turn} 段不生成选项（纯自由输入）");
+            return;
+        };
+        let proxy = proxy_of(&root);
+        let raw = match llm::chat_complete(
+            &provider,
+            &[llm::ChatMessage::text("user", prompt_text)],
+            300,
+            0.6,
+            proxy.as_deref(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::diag::record("options", format!("选项生成失败（降级自由输入）：{e}"));
+                return;
+            }
+        };
+        let Some(options) = parse_options(&raw) else {
+            crate::diag::record("options", format!("选项产出不可解析（降级自由输入）：{}", truncate_chars(&raw, 200)));
+            return;
+        };
+        // 闸门内落 Options 事件
+        if !gate().try_acquire(&session_id) {
+            crate::diag::record("options", "会话写入中，选项落盘放弃");
+            return;
+        }
+        let result = (|| -> Result<(), String> {
+            let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+            commit(
+                &log,
+                &root,
+                &meta,
+                LogBody::Options(event::OptionsEvent {
+                    turn,
+                    options,
+                    origin: "model".into(),
+                    ts: store::unix_now(),
+                }),
+            )?;
+            Ok(())
+        })();
+        gate().release(&session_id);
+        match result {
+            Ok(()) => crate::diag::record("options", "段末选项已落盘"),
+            Err(e) => crate::diag::record("options", format!("选项落盘失败：{e}")),
+        }
+    });
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
 }
 
 /// 重roll 的截断（regenerate 与单测共用）：丢掉 turn 起的**派生事件**，
@@ -5585,6 +5946,14 @@ fn timeline_brief(record: &event::LogRecord) -> String {
             };
             format!("剧情：{} → {}（{}）", from, t.to.last().cloned().unwrap_or_default(), clip(&t.reason, 40))
         }
+        LogBody::Options(o) => format!(
+            "走向选项 ×{}（{}）",
+            o.options.len(),
+            o.options
+                .first()
+                .map(|op| op.label.as_str())
+                .unwrap_or("")
+        ),
         LogBody::Worldline(t) => {
             let from = if t.from.is_empty() {
                 "承袭世界".to_string()
@@ -6645,6 +7014,120 @@ return {
             transitions2,
             "重放后的转移与首次一致"
         );
+    }
+
+    /// 增强 F2：选项产出解析（纯函数）——容忍围栏与杂讯；坏产出降级自由输入
+    #[test]
+    fn parse_options_tolerates_fences_and_rejects_garbage() {
+        let good = r#"[{"label":"追问工作牌","gist":"问她工作牌的事"},{"label":"回图书馆","gist":"一起回图书馆"},{"label":"沉默","gist":"保持沉默看着窗外"}]"#;
+        let opts = parse_options(good).expect("合法数组");
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].label, "追问工作牌");
+
+        let fenced = format!("```json\n{good}\n```");
+        assert_eq!(parse_options(&fenced).unwrap().len(), 3, "围栏剥掉");
+
+        let noisy = format!("好的，以下是选项：\n{good}\n希望有帮助");
+        assert_eq!(parse_options(&noisy).unwrap().len(), 3, "前后杂讯剥掉");
+
+        assert!(parse_options("这不是 JSON").is_none(), "坏产出 → None");
+        assert!(parse_options(r#"[{"label":"只有短语"}]"#).is_none(), "缺 gist 的不完整条目整组拒绝");
+        assert!(
+            parse_options(r#"[{"label":"a","gist":"g"}]"#).is_none(),
+            "只有 1 个选项 = 坏产出（要求 3–4 个）"
+        );
+    }
+
+    /// 增强 F2 DoD：选项事件随事件流重放——编辑段落重放后选项不变、不重调模型
+    /// （Options 不是派生事件；选项生成只发生在 live 路径）。
+    #[test]
+    fn options_event_survives_replay_without_regeneration() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let log = store::EventLog::new();
+        let cast = Cast::load(&root, &meta).unwrap();
+
+        log.append(&root, &meta.id, LogBody::Message(user_msg(1, "第一段")))
+            .unwrap();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Options(event::OptionsEvent {
+                turn: 1,
+                options: vec![
+                    event::StoryOption { label: "追问".into(), gist: "追问她工作牌的事".into() },
+                    event::StoryOption { label: "沉默".into(), gist: "保持沉默".into() },
+                    event::StoryOption { label: "离开".into(), gist: "起身离开图书馆".into() },
+                ],
+                origin: "model".into(),
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+
+        let records = log.read(&root, &meta.id).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &records, 1).unwrap();
+        let options_events = rebuilt
+            .iter()
+            .filter(|r| matches!(&r.body, LogBody::Options(_)))
+            .count();
+        assert_eq!(options_events, 1, "选项事件是模型产物，重放保留且不重复");
+        // 投影可见（前端面板的数据源）
+        let proj = event::project_over(&rebuilt, &event::Base::default());
+        assert_eq!(proj.options[&1].options.len(), 3);
+        assert_eq!(proj.options[&1].origin, "model");
+    }
+
+    /// 增强 F2 DoD：未配 util 档 provider → 选项管线降级为纯自由输入
+    /// （不落任何 Options 事件，段落照常）。
+    #[test]
+    fn options_generation_degrades_without_util_provider() {
+        let (_dir, meta, root) = setup(HOOK_CARD);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            // 临时 DataHub 没有任何 provider：spawn 后绝不能落 Options 事件
+            spawn_options_generation(root.clone(), meta.id.clone(), 1, None);
+            // 给异步任务一点时间（若实现错误地落了事件，这里会抓到）
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+                loop {
+                    let log = store::EventLog::new();
+                    let proj = project_session(&log, &root, &meta).unwrap();
+                    assert!(
+                        proj.options.is_empty(),
+                        "未配 provider 不该落选项事件：{:?}",
+                        proj.options
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            })
+            .await; // 超时即通过（整段时间内没有任何选项事件出现）
+        });
+    }
+
+    /// 增强 F1：小说模式开关 v1 仅 1v1 可开（多角色阵容拒绝），开关可持久化
+    #[test]
+    fn novel_mode_toggle_persists_and_guards_multi_cast() {
+        let (_dir, mut meta, root) = setup(HOOK_CARD);
+        // 单角色：可开
+        meta.novel_mode = true;
+        store::save_session(&root, &meta).unwrap();
+        let reloaded = store::load_session(&root, &meta.id).unwrap();
+        assert!(reloaded.novel_mode, "开关持久化");
+        // 多角色阵容的守卫在 set_novel_mode 命令里（需要 Tauri State，命令级单测
+        // 覆盖在 scenes 集成里）；这里钉住元数据语义：缺省 false
+        let fresh = store::new_session(&root, &store::NewSessionRequest {
+            characters: Vec::new(),
+            character: "小雨".into(),
+            persona: None,
+            day: Some(1),
+            clock: Some("20:00".into()),
+            place: None,
+            premise: None,
+        })
+        .unwrap();
+        assert!(!fresh.novel_mode, "缺省关");
     }
 
     /// 增强 E DoD：旁白（narration）进摘要批次、不触发 on_message 钩子——

@@ -287,12 +287,17 @@ pub struct BuildInputs<'a> {
     /// [`crate::toolcall::contract_text`]，注入在 A1 契约区尾部（独立 T 层记账）；
     /// None = 本轮不发工具（请求体同样不带 tools）
     pub tools_contract: Option<&'a str>,
+    /// 小说模式（增强 F1 · 决断 9）：叙事锁小说体 + 段落基调 + 用户输入定位
+    /// （走向描述 + 引号直语两用）
+    pub novel_mode: bool,
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
     pub user_content: Option<&'a str>,
 }
 
+/// 小说模式条款（增强 F1/F3 · 决断 9：用户输入重新定位为走向 + 引号直语）
+const NOVEL_CONTRACT: &str = "\n\n【小说模式】\n- 你写的是互动小说：第三人称叙述、允许直陈心理；台词织在段落里，不要逐句气泡式对话。\n- 每段 300–800 字；段落结尾留钩子，但不替读者做决定，不得在正文里罗列「你可以……」（那是选项卡的职责）。\n- 用户消息是下一段剧情的走向：引号内的文字是角色的直接引语，须织入剧情；其余文字是走向指令，不得作为角色台词念出。";
 /// 双槽位组装（设计 §4.1）+ 预算与确定性降级（设计 §4.2）。
 ///
 /// 降级顺序（确定、可回放）：
@@ -320,10 +325,14 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     //    （§4.1「示例对话……截断至预算」）。
     let a_limit = budget.limit("A");
     // A1 = 全局契约 + 隔离提示（多角色时「你只扮演 X」，设计 §10.2；单角色无追加）
-    let a1_text = match inputs.cast_note {
+    let mut a1_text = match inputs.cast_note {
         Some(note) => format!("{}\n\n{}", global_contract(&inputs.settings.narrative_mode), note),
         None => global_contract(&inputs.settings.narrative_mode),
     };
+    // 增强 F1/F3：小说模式条款——叙事锁小说体、段落基调、用户输入重新定位
+    if inputs.novel_mode {
+        a1_text.push_str(NOVEL_CONTRACT);
+    }
     let mut a_parts: Vec<(&'static str, &'static str, String)> = vec![(
         "A1",
         "全局契约",
@@ -1345,6 +1354,7 @@ mod tests {
         BuildInputs {
         cast_note: None,
             tools_contract: None,
+            novel_mode: false,
             settings,
             persona,
             card,

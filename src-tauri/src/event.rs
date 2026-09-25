@@ -299,6 +299,29 @@ pub struct WorldlineEvent {
     pub ts: u64,
 }
 
+/// 段末走向选项（增强 F2 · 小说模式）：一段（主演模型一次响应）落盘后，
+/// 选项生成调用的产物。与摘要/提案同理是**模型产物**——随事件流重放，
+/// 编辑历史重放**不重调模型**；同轮后写覆盖（重roll 段落后选项整组替换）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptionsEvent {
+    pub turn: u64,
+    /// 3–4 个走向选项：界面短语 + 走向梗概
+    pub options: Vec<StoryOption>,
+    /// 生成来源（model = 选项管线）
+    #[serde(default = "default_origin")]
+    pub origin: String,
+    pub ts: u64,
+}
+
+/// 一个走向选项（F2）：点选后 gist 作为走向注入下一段（user 通道）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoryOption {
+    /// 界面短语（如「追问工作牌的事」）
+    pub label: String,
+    /// 走向梗概（注入下一段的正文）
+    pub gist: String,
+}
+
 /// 事件体（messages.jsonl 一行去掉 seq 与 kind 之后的部分）
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogBody {
@@ -315,6 +338,7 @@ pub enum LogBody {
     Director(DirectorEvent),
     DirectorTree(DirectorTreeEvent),
     Worldline(WorldlineEvent),
+    Options(OptionsEvent),
 }
 
 impl From<Message> for LogBody {
@@ -345,6 +369,7 @@ impl LogBody {
             LogBody::Director(_) => "director",
             LogBody::DirectorTree(_) => "director_tree",
             LogBody::Worldline(_) => "worldline",
+            LogBody::Options(_) => "options",
         }
     }
 
@@ -364,6 +389,7 @@ impl LogBody {
             LogBody::Director(d) => d.turn,
             LogBody::DirectorTree(d) => d.turn,
             LogBody::Worldline(d) => d.turn,
+            LogBody::Options(o) => o.turn,
         }
     }
 
@@ -383,6 +409,7 @@ impl LogBody {
             LogBody::Director(d) => serde_json::to_value(d),
             LogBody::DirectorTree(d) => serde_json::to_value(d),
             LogBody::Worldline(d) => serde_json::to_value(d),
+            LogBody::Options(o) => serde_json::to_value(o),
         }
         .map_err(|e| format!("事件序列化失败：{e}"))?;
         if let Some(obj) = v.as_object_mut() {
@@ -419,6 +446,7 @@ impl LogBody {
                 serde_json::from_value(v).map(LogBody::DirectorTree).map_err(bad)
             }
             "worldline" => serde_json::from_value(v).map(LogBody::Worldline).map_err(bad),
+            "options" => serde_json::from_value(v).map(LogBody::Options).map_err(bad),
             other => Err(format!("未知事件类型：{other}")),
         }
     }
@@ -480,7 +508,9 @@ impl LogRecord {
             | LogBody::Scene(_)
             | LogBody::Director(_)
             | LogBody::DirectorTree(_)
-            | LogBody::Worldline(_) => false,
+            | LogBody::Worldline(_)
+            // 增强 F2：走向选项是模型产物，重放不重调模型，编辑历史不丢
+            | LogBody::Options(_) => false,
         }
     }
 
@@ -622,6 +652,8 @@ pub struct Projection {
     /// 已发射的定时器标记（增强 B1/B2：一次性发射的确定性依据；
     /// 键同上，静态定时器也用它防重复发射）
     pub timers_fired: std::collections::BTreeSet<String>,
+    /// 段末走向选项（增强 F2）：轮次 → 选项组（同轮后写覆盖）
+    pub options: BTreeMap<u64, OptionsEvent>,
     pub last_seq: Seq,
 }
 
@@ -1015,6 +1047,10 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
         // 世界主线阶段转移（M3.7）：按序追加——当前活跃路径 = 最后一条的 to，
         // 走位史即世界大势的演变记录（B1 时代行 / B2 世界 directive 的数据源）
         LogBody::Worldline(t) => p.worldline.push(t.clone()),
+        // 段末走向选项（增强 F2）：同轮后写覆盖（重roll 段落后选项整组替换）
+        LogBody::Options(o) => {
+            p.options.insert(o.turn, o.clone());
+        }
     }
 }
 

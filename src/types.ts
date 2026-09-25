@@ -71,6 +71,20 @@ export interface Settings {
   stage_narration?: boolean;
 }
 
+/** 段末走向选项（增强 F2 · 小说模式） */
+export interface StoryOption {
+  label: string;
+  gist: string;
+}
+
+/** 某一轮的走向选项组（Options 事件的投影） */
+export interface OptionsEvent {
+  turn: number;
+  options: StoryOption[];
+  origin: string;
+  ts: number;
+}
+
 /** 用户人格（personas/*.json） */
 export interface Persona {
   name: string;
@@ -92,6 +106,8 @@ export interface SessionMeta {
   theater?: TheaterConfig | null;
   /** 即兴模式（M3.8 · §6.8-4：薄实体现场补「设定·暂定」；缺省关） */
   improv?: boolean;
+  /** 小说模式（增强 F1 · 决断 9：互动式散文剧；v1 仅 1v1 单场景可开） */
+  novel_mode?: boolean;
   /** 语义源嵌入模型（M3.10 · §6.13：首次启用语义召回时记录「provider/模型」） */
   embed_model?: string | null;
 }

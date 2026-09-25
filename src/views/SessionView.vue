@@ -9,6 +9,7 @@ import type {
   Scene,
   SceneView,
   SessionMeta,
+  StoryOption,
 } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import EmptyState from "../components/EmptyState.vue";
@@ -108,6 +109,42 @@ async function setImprov(on: boolean) {
   } catch (e) {
     error.value = String(e);
   }
+}
+
+// ---------- 小说模式（增强 F：互动式散文剧；v1 仅 1v1 单场景可开） ----------
+const novelMode = ref(props.meta.novel_mode ?? false);
+const singleCast = computed(() => props.meta.characters.length === 1);
+async function setNovel(on: boolean) {
+  try {
+    novelMode.value = await api.setNovelMode(props.meta.id, on);
+  } catch (e) {
+    novelMode.value = !on;
+    error.value = String(e);
+  }
+}
+/** 段末走向选项（F2）：每轮消息变化后向投影要最新一组；空 = 降级纯自由输入 */
+const storyOptions = ref<StoryOption[]>([]);
+const optionsBusy = ref(false);
+watch(
+  () => messages.value.length,
+  async () => {
+    if (!novelMode.value) return;
+    optionsBusy.value = true;
+    try {
+      const opts = await api.latestOptions(props.meta.id);
+      storyOptions.value = opts?.options ?? [];
+    } catch {
+      storyOptions.value = [];
+    } finally {
+      optionsBusy.value = false;
+    }
+  },
+);
+/** 点选走向：gist 作为走向注入下一段（与自由输入同构，模型无感区别） */
+async function chooseOption(o: StoryOption) {
+  if (generating.value) return;
+  storyOptions.value = [];
+  await sendText(o.gist);
 }
 
 // ---------- M3.2 场景与多线（设计 §10.3）：场景条 + 消息按场景分段 ----------
@@ -686,6 +723,18 @@ watch(cardGeneration, () => {
             <li v-if="m.role === 'system' || m.role === 'narration'" class="list-none">
               <NarrationLine :content="m.content" />
             </li>
+            <li
+              v-else-if="novelMode && m.role === 'char'"
+              class="list-none border-l-2 border-base-content/10 pl-4 font-serif text-[15px] leading-relaxed text-base-content/90"
+            >
+              <p class="mb-0 whitespace-pre-wrap">{{ m.content }}</p>
+            </li>
+            <li v-else-if="novelMode && m.role === 'user'" class="list-none">
+              <div class="mx-auto flex max-w-[80%] items-center justify-center gap-2 rounded-full bg-base-200 px-4 py-1 text-xs text-base-content/55">
+                <Icon name="arrow" :size="12" />
+                <span class="truncate">{{ m.content }}</span>
+              </div>
+            </li>
             <li v-else class="chat group msg-in" :class="m.role === 'user' ? 'chat-end' : 'chat-start'">
             <div class="chat-image avatar avatar-placeholder">
               <div
@@ -868,6 +917,23 @@ watch(cardGeneration, () => {
         </div>
 
         <!-- 输入区：daisyUI textarea + 圆形发送键；多角色时带发言权选择（M3.4 · 设计 §10.5） -->
+        <!-- 段末走向选项（增强 F2）：点选 gist 作为走向续写下一段；面板常驻自由输入 -->
+        <div
+          v-if="novelMode && (storyOptions.length || optionsBusy)"
+          class="flex flex-none flex-wrap items-center gap-2 border-t border-base-300 bg-base-200/40 px-3 py-2"
+        >
+          <span class="flex-none text-[11px] text-base-content/45">{{ optionsBusy ? "走向生成中…" : "接下来：" }}</span>
+          <button
+            v-for="o in storyOptions"
+            :key="o.label"
+            class="btn btn-outline btn-xs rounded-full"
+            :disabled="generating"
+            :title="o.gist"
+            @click="chooseOption(o)"
+          >
+            {{ o.label }}
+          </button>
+        </div>
         <form class="flex-none border-t border-base-300 p-3" @submit.prevent="send">
           <div v-if="speakers.length > 1" class="mb-2 flex flex-wrap items-center gap-1.5">
             <span class="text-[11px] text-base-content/45">发言权</span>
@@ -893,6 +959,20 @@ watch(cardGeneration, () => {
                 点名 {{ dir }}
               </button>
             </div>
+            <label
+              v-if="singleCast"
+              class="flex items-center gap-1 text-[11px] text-base-content/45"
+              data-tip="小说模式（增强 F）：互动式散文剧——散文排版 + 段末走向选项；v1 仅 1v1 单场景"
+            >
+              <input
+                type="checkbox"
+                class="toggle toggle-xs"
+                :checked="novelMode"
+                aria-label="小说模式"
+                @change="setNovel(($event.target as HTMLInputElement).checked)"
+              />
+              小说
+            </label>
             <label
               class="flex items-center gap-1 text-[11px] text-base-content/45"
               data-tip="即兴模式（默认关）：被提及的实体太薄时，便宜模型现场补一条「设定·暂定」；会话结束进收件箱确认"
