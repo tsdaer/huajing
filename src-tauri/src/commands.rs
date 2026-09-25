@@ -2430,6 +2430,59 @@ fn acquire_flag(flags: &CancelFlags, session_id: &str) -> Result<Arc<AtomicBool>
     Ok(flag)
 }
 
+/// B1：生成互斥标记的 RAII 守卫——**命令入口获取，全程持有**（含回复落盘与轮末推进），
+/// Drop 时从 map 摘除。生成中 stop_generation 会先摘走并置位，Drop 的摘除是 no-op。
+/// 修复：标记原先在流式结束时就释放，而 commit_reply（回复落盘/时钟/钩子/状态树）
+/// 在释放之后才跑——期间剧场/下一条命令能拿到标记，事件顺序错乱。
+struct FlagGuard<'a> {
+    flags: &'a CancelFlags,
+    session: String,
+    flag: Arc<AtomicBool>,
+}
+
+impl std::ops::Deref for FlagGuard<'_> {
+    type Target = AtomicBool;
+    fn deref(&self) -> &AtomicBool {
+        &self.flag
+    }
+}
+
+impl Drop for FlagGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.flags.0.lock() {
+            // 只摘自己的位置：stop 先摘走后这里 no-op
+            if map
+                .get(&self.session)
+                .map(|f| Arc::ptr_eq(f, &self.flag))
+                .unwrap_or(false)
+            {
+                map.remove(&self.session);
+            }
+        }
+    }
+}
+
+/// 命令入口获取生成互斥标记（B1）：拿到再动事件流，拿不到直接拒绝
+fn acquire_flag_guard<'a>(flags: &'a CancelFlags, session_id: &str) -> Result<FlagGuard<'a>, String> {
+    let mut map = flags
+        .0
+        .lock()
+        .map_err(|_| "内部状态锁 poisoned".to_string())?;
+    if let Some(f) = map.get(session_id) {
+        if !f.load(Ordering::Relaxed) {
+            return Err("上一条消息还在生成中".to_string());
+        }
+        map.remove(session_id);
+    }
+    let flag = Arc::new(AtomicBool::new(false));
+    map.insert(session_id.to_string(), Arc::clone(&flag));
+    Ok(FlagGuard {
+        flags,
+        session: session_id.to_string(),
+        flag,
+    })
+}
+
 /// 轮末异步总结（设计 §5.3：不阻塞对话；同一会话并发时跳过）。
 /// `active` = 当轮激活的实体 id（M3.10 关联审计的对照表；空 = 没有记录）。
 fn spawn_summary(
@@ -2460,9 +2513,10 @@ fn spawn_summary(
 }
 
 /// 流式生成的后半程（send_message 与 regenerate 共用）：
-/// 中断标记 → 流式补全 → 回复落盘 → 时钟步进 → on_message → 记录组装（记忆检查器）。
+/// 流式补全 → 回复落盘 → 时钟步进 → on_message → 记录组装（记忆检查器）。
 /// `finalize`（M3.4 群聊）：是否在这一步做轮末推进——一轮的最后一位发言人
 /// 才做（心理/状态树/总结每轮一次）；中间发言人只落回复。
+/// B1：中断标记由调用方在命令入口获取后传入，本函数不再自行 acquire/release。
 #[allow(clippy::too_many_arguments)]
 async fn stream_reply(
     app: &AppHandle,
@@ -2474,7 +2528,8 @@ async fn stream_reply(
     provider: &Provider,
     assembly: prompt::PromptAssembly,
     on_event: &Channel<StreamEvent>,
-    flags: &CancelFlags,
+    // 生成互斥/中断标记（命令入口获取，生命周期覆盖到轮末推进结束）
+    flag: &AtomicBool,
     log: &store::EventLog,
     assemblies: &LastAssemblies,
     // 轮末状态树求值要用：上一轮激活的实体（codex.active 判据）与状态树结构缓存
@@ -2490,10 +2545,6 @@ async fn stream_reply(
     finalize: bool,
 ) -> Result<StreamEvent, String> {
     let session_id = meta.id.as_str();
-    let flag = match acquire_flag(flags, session_id) {
-        Ok(f) => f,
-        Err(e) => return Ok(e),
-    };
     // 流式气泡带署名（M3.4）：前端据此区分一轮里的多位发言人
     let speaker_name = cast.display_name(speaker);
 
@@ -2508,13 +2559,11 @@ async fn stream_reply(
             text: delta.to_string(),
             name: Some(speaker_name.clone()),
         });
-    }, &flag, proxy.as_deref())
+    }, flag, proxy.as_deref())
     .await;
 
-    // 清标记；记录本次组装（记忆检查器）
-    if let Ok(mut map) = flags.0.lock() {
-        map.remove(session_id);
-    }
+    // 记录本次组装（记忆检查器）。中断标记不在这里清——B1：它的生命周期
+    // 覆盖到 commit_reply/轮末推进结束（命令收尾由 FlagGuard 摘除）
     if let Ok(mut map) = assemblies.0.lock() {
         map.insert(session_id.to_string(), assembly);
     }
@@ -4955,6 +5004,9 @@ async fn send_message_inner(
     summary_flags: State<'_, SummaryFlags>,
     embed_cache: State<'_, EmbedCache>,
 ) -> Result<StreamEvent, String> {
+    // B1：入口拿生成互斥标记，全程持有（含回复落盘与轮末推进）——并发生成在
+    // 动事件流之前就被拒，不会再留下「无回复的用户消息 + 好感度多算一次」
+    let flag = acquire_flag_guard(&flags, &session_id)?;
     let root = root();
 
     // 会话与角色阵容（M3.1 隔离模式：每轮发言 = 发言人独立的上下文组装与请求）
@@ -5214,7 +5266,7 @@ async fn send_message_inner(
             &provider,
             asm,
             &on_event,
-            &flags,
+            &flag,
             &log,
             &assemblies,
             Some(&runtime),
@@ -5314,6 +5366,8 @@ async fn regenerate_inner(
     summary_flags: State<'_, SummaryFlags>,
     embed_cache: State<'_, EmbedCache>,
 ) -> Result<StreamEvent, String> {
+    // B1：入口拿生成互斥标记，全程持有——生成中点重roll 在 truncate/rewrite 之前就被拒
+    let flag = acquire_flag_guard(&flags, &session_id)?;
     let root = root();
 
     let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
@@ -5417,7 +5471,7 @@ async fn regenerate_inner(
         &provider,
         run.assembly,
         &on_event,
-        &flags,
+        &flag,
         &log,
         &assemblies,
         Some(&runtime),
@@ -12493,5 +12547,34 @@ return { state_tree = {
         drop(guard);
         assert_eq!(flush_parked_summaries(&root, &session_id), 1, "释放后重放");
         assert!(!gate().has_pending(&session_id));
+    }
+
+    #[test]
+    fn cancel_flag_is_exclusive_and_survives_stop_removal() {
+        // B1：生成互斥标记入口独占；stop 摘走后旧守卫 Drop 不得误删新标记
+        let flags = CancelFlags::default();
+
+        let guard = acquire_flag_guard(&flags, "flag-test").expect("首取要成功");
+        let err = match acquire_flag_guard(&flags, "flag-test") {
+            Err(e) => e,
+            Ok(_) => panic!("持有期间要被拒"),
+        };
+        assert!(err.contains("生成中"), "{err}");
+        // 中断位可被置（stop_generation 的动作路径）
+        guard.store(true, Ordering::Relaxed);
+
+        // stop 摘走标记 → 旧守卫 Drop 不再摘；新来的命令拿到全新标记
+        if let Ok(mut map) = flags.0.lock() {
+            map.remove("flag-test");
+        }
+        drop(guard);
+        let fresh = acquire_flag_guard(&flags, "flag-test").expect("stop 后要能重新拿");
+        assert!(!fresh.load(Ordering::Relaxed), "新标记必须从未置位");
+        drop(fresh);
+
+        // 常规路径：守卫 Drop 即释放，可再次获取
+        let again = acquire_flag_guard(&flags, "flag-test").expect("Drop 后要能再拿");
+        drop(again);
+        acquire_flag_guard(&flags, "flag-test").expect("串行多轮不受影响");
     }
 }

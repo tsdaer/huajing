@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { api } from "../api";
 import { cardGeneration } from "../cards";
 import type {
@@ -33,6 +33,14 @@ import WorldPanel from "../components/inspector/WorldPanel.vue";
 // 黑板与记忆检查器收进右侧抽屉，聊天流为主。界面全部由 daisyUI 组件构成。
 
 const props = defineProps<{ meta: SessionMeta }>();
+
+// B6：组件卸载即断链——剧场自动轮次的 promise 链不再驱动下一轮，并中断可能在途的
+// 生成（旧实例的流回调由 B5 的世代守卫丢弃）。开着剧场切走页面不能再烧预算。
+let disposed = false;
+onUnmounted(() => {
+  disposed = true;
+  void api.stopGeneration(props.meta.id).catch(() => {});
+});
 
 const error = ref("");
 const messages = ref<Message[]>([]);
@@ -111,7 +119,8 @@ function ensureWorldline() {
 async function calibrateWorld(day: number) {
   worldlineBusy.value = true;
   try {
-    await api.worldSetClock("", day);
+    // B7：空 world 会被后端落到 "default"，而面板显示的是会话自己的世界——传对归属
+    await api.worldSetClock(props.meta.world ?? "", day);
     await loadWorldline();
   } catch (e) {
     worldlineError.value = String(e);
@@ -404,7 +413,7 @@ async function setTheater(on: boolean) {
 
 /** 剧场自动轮次：导演调度接话。导演可能刚切场，先对齐聚焦场景再推进 */
 async function autoAdvance() {
-  if (generating.value) return;
+  if (disposed || generating.value) return;
   const t = theater.value;
   if (!t?.on || t.used >= t.budget) return;
   await loadScenes();
@@ -467,8 +476,10 @@ const pageNumbers = computed(() => {
 });
 
 async function loadScenes() {
+  const id = props.meta.id;
   try {
-    const view: SceneView = await api.listScenes(props.meta.id);
+    const view: SceneView = await api.listScenes(id);
+    if (id !== props.meta.id) return; // B4：快速切换会话时，迟到响应不得覆盖新会话
     scenes.value = view.scenes;
     if (view.active && view.active !== activeScene.value) {
       activeScene.value = view.active;
@@ -497,6 +508,7 @@ async function switchTo(sc: Scene) {
     scenes.value = view.scenes;
     activeScene.value = view.active ?? sc.id;
     messages.value = await api.readMessages(props.meta.id);
+    editingIndex.value = -1; // B3：messages 被外部替换，编辑框的旧下标不再可信
     void jumpToLastPage();
   } catch (e) {
     error.value = String(e);
@@ -543,6 +555,7 @@ async function onSceneSubmit(p: SceneSubmit) {
     // merge 不换聚焦；create/split 后端会把聚焦切到新场景
     activeScene.value = view.active ?? activeScene.value;
     messages.value = await api.readMessages(props.meta.id);
+    editingIndex.value = -1; // B3：messages 被外部替换，编辑框的旧下标不再可信
     void jumpToLastPage();
   } catch (e) {
     error.value = String(e);
@@ -640,6 +653,7 @@ async function loadAll() {
   const id = props.meta.id;
   try {
     const [bb, msgs] = await Promise.all([api.getBlackboard(id), api.readMessages(id)]);
+    if (id !== props.meta.id) return; // B4：快速切换会话时，迟到响应不得覆盖新会话
     blackboard.value = bb;
     Object.assign(bbForm, {
       day: bb.day,
@@ -722,6 +736,10 @@ async function saveBlackboard() {
 
 // ---------- 发送 / 重roll / 停止 ----------
 
+/** B5：流式世代号——sendText/reroll 每次开流自增；增量与收尾回调校验会话 id + 世代号，
+ *  生成中切会话/开新流后旧流一律丢弃（不串台、旧流收尾不掐灭新会话的流式区） */
+let streamGen = 0;
+
 async function send() {
   const content = draft.value.trim();
   if (!content || generating.value) return;
@@ -733,6 +751,8 @@ async function send() {
 /** 发送一段文本并流式接收（手动输入与剧场自动轮次共用） */
 async function sendText(content: string) {
   if (!content || generating.value) return;
+  const sid = props.meta.id;
+  const gen = ++streamGen; // B5：本轮流式的世代
   error.value = "";
   resetComposerHeight();
   generating.value = true;
@@ -747,15 +767,17 @@ async function sendText(content: string) {
   let final: StreamEvent;
   try {
     // speaker 为空 = 导演调度（多角色自动选人）；点名则直通该角色
-    final = await api.sendMessage(props.meta.id, content, onDelta, speaker.value || undefined);
+    final = await api.sendMessage(sid, content, (e) => onDelta(e, sid, gen), speaker.value || undefined);
   } catch (e) {
     final = { event: "error", message: String(e) };
   }
-  await finishGeneration(final);
+  await finishGeneration(final, sid, gen);
 }
 
 async function reroll() {
   if (generating.value) return;
+  const sid = props.meta.id;
+  const gen = ++streamGen; // B5：本轮流式的世代
   error.value = "";
   generating.value = true;
   streams.value = [];
@@ -763,14 +785,16 @@ async function reroll() {
   void jumpToLastPage();
   let final: StreamEvent;
   try {
-    final = await api.regenerate(props.meta.id, onDelta);
+    final = await api.regenerate(sid, (e) => onDelta(e, sid, gen));
   } catch (e) {
     final = { event: "error", message: String(e) };
   }
-  await finishGeneration(final);
+  await finishGeneration(final, sid, gen);
 }
 
-function onDelta(e: StreamEvent) {
+function onDelta(e: StreamEvent, sid: string, gen: number) {
+  // B5：旧流（会话已切/世代已换代）的增量一律丢弃
+  if (sid !== props.meta.id || gen !== streamGen) return;
   if (e.event === "delta") {
     // 换人了就开新气泡（M3.4 群聊：先发言者的话落定后，下一位接着流式）
     const last = streams.value[streams.value.length - 1];
@@ -825,7 +849,9 @@ async function refreshCard() {
 }
 
 /** 生成收尾：错误上报、消息与黑板重读（时钟已步进）、检查器刷新 */
-async function finishGeneration(final: StreamEvent) {
+async function finishGeneration(final: StreamEvent, sid: string, gen: number) {
+  // B5：旧流收尾不落地——组件已换会话/换代时，它自己的 generating 已由 loadAll 或新流重置
+  if (sid !== props.meta.id || gen !== streamGen) return;
   if (final.event === "error") error.value = final.message;
   if (final.event === "done" && final.report) applyReport(final.report);
   try {
@@ -844,6 +870,7 @@ async function finishGeneration(final: StreamEvent) {
   } catch (e) {
     error.value = String(e);
   }
+  editingIndex.value = -1; // B3：消息以磁盘为准重读，编辑框的旧下标不再可信
   generating.value = false;
   streams.value = [];
   scheduleNote.value = "";
@@ -854,7 +881,8 @@ async function finishGeneration(final: StreamEvent) {
   if (theater.value?.on) {
     await refreshTheater();
     const t = theater.value;
-    if (!error.value && !cancelled && t?.on && t.used < t.budget) void autoAdvance();
+    // B6：组件卸载后 promise 链就地断掉，不再驱动下一轮
+    if (!disposed && !error.value && !cancelled && t?.on && t.used < t.budget) void autoAdvance();
   }
   // 刚聊完一轮：状态树/剧情线/心理/宫殿多半都变了，抽屉开着就顺手重拉（设计 §8/§9 的「面板可查」）
   if (panel.value === "inspector") {
@@ -892,7 +920,7 @@ async function removeMsg(i: number) {
   if (!window.confirm("删除这条消息？")) return;
   try {
     messages.value = await api.deleteMessage(props.meta.id, i);
-    if (editingIndex.value === i) editingIndex.value = -1;
+    editingIndex.value = -1; // B3：删除使其后所有下标前移，编辑框一律关闭
     void refreshInspector();
   } catch (e) {
     error.value = String(e);

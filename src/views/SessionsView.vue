@@ -101,7 +101,8 @@ async function create() {
     <ErrorToast :message="error" @dismiss="error = ''" />
 
     <div class="mx-auto flex h-full min-h-0 w-full max-w-[1400px] flex-col">
-      <SessionView v-if="selectedSession" :meta="selectedSession" />
+      <!-- B4：:key 强制按会话重建组件，快速切换时旧实例的迟到写入不可能串台 -->
+      <SessionView v-if="selectedSession" :key="selectedSession.id" :meta="selectedSession" />
 
       <div
         v-else

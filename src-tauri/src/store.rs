@@ -514,13 +514,20 @@ pub fn session_dir(root: &Path, id: &str) -> PathBuf {
 pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionMeta> {
     ensure_layout(root)?;
     let now_secs = unix_now();
-    // 角色阵容：显式给的全量用（去重、保序、主角色在前），没给就退回单角色
-    let mut cast: Vec<String> = if req.characters.is_empty() {
+    // 角色阵容：显式给的全量用（去重、保序、主角色在前），没给就退回单角色。
+    // 加固 B2：dedup() 只去相邻重复——`["b","a","b"]` 会让同一角色每轮跑两次钩子、
+    // 双份记忆写入、黑板 actors 重复；改全量保序去重。
+    let cast: Vec<String> = if req.characters.is_empty() {
         vec![req.character.clone()]
     } else {
-        req.characters.clone()
+        let mut seen: Vec<String> = Vec::with_capacity(req.characters.len());
+        for c in &req.characters {
+            if !seen.contains(c) {
+                seen.push(c.clone());
+            }
+        }
+        seen
     };
-    cast.dedup();
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1853,6 +1860,29 @@ mod tests {
         assert!(second.ends_with("-484"), "顺延毫秒尾数：{second}");
         // 空目录无碰撞：原样返回
         assert_eq!(unique_session_id_at(root.path(), secs, 700), session_id_at(secs, 700));
+    }
+
+    #[test]
+    fn new_session_cast_dedups_non_adjacent_duplicates() {
+        // B2：`["b","a","b"]` 曾让同一角色每轮跑两次钩子、双份记忆写入
+        let root = tempfile::tempdir().unwrap();
+        ensure_layout(root.path()).unwrap();
+        let meta = new_session(
+            root.path(),
+            &NewSessionRequest {
+                characters: vec!["b".into(), "a".into(), "b".into(), "a".into(), "b".into()],
+                character: "b".into(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(meta.characters, vec!["b", "a"], "保序去重：{meta:?}");
+        let bb = load_blackboard(root.path(), &meta.id).unwrap();
+        assert_eq!(bb.actors, vec!["b", "a"], "黑板 actors 同样无重复");
     }
 
     #[test]
