@@ -147,6 +147,24 @@ function flattenFacts(obj: Record<string, unknown>, prefix = ""): Array<{ path: 
   return out;
 }
 
+/** 事实按顶层键分组：审阅页从 JSON dump 变成按主题分组的小卡 */
+const factGroups = computed(() => {
+  if (!pack.value) return [];
+  const groups = new Map<string, Array<{ path: string; value: unknown }>>();
+  for (const f of flattenFacts(pack.value.entity.facts)) {
+    const top = f.path.split(".")[0] ?? f.path;
+    if (!groups.has(top)) groups.set(top, []);
+    groups.get(top)!.push(f);
+  }
+  return [...groups.entries()];
+});
+
+/** 组内显示用短路径（顶层前缀已在分组标题上） */
+function shortPath(path: string): string {
+  const i = path.indexOf(".");
+  return i === -1 ? path : path.slice(i + 1);
+}
+
 function fmtValue(v: unknown): string {
   if (Array.isArray(v)) return v.map((x) => String(x)).join("；");
   if (v === null || v === undefined) return "";
@@ -318,12 +336,30 @@ async function copyPrompts() {
             语义归纳
           </h2>
           <ul class="m-0 flex list-none flex-col gap-1.5 p-0 text-xs text-base-content/60">
-            <li>✓ 分节完成（{{ tagCount }} 节已标）</li>
-            <li>· 秘密与生命周期（P3）——从经历/关系/对话场景提取</li>
-            <li>· 描写四法（P4）——台词与叙述归纳语言/外貌/动作/心理外化</li>
-            <li>· 倾向性（P5）——动机/需要/价值观/气质</li>
-            <li>· 事件年表与世界线（P6）——经历章节 → 事件实体 + 阶段弧</li>
-            <li>· 关系网（P7）· 示例对话（P8）</li>
+            <li class="flex items-center gap-1.5">
+              <Icon name="check" :size="13" class="flex-none text-success" />
+              分节完成（{{ tagCount }} 节已标）
+            </li>
+            <li class="flex items-center gap-1.5">
+              <Icon name="dot" :size="13" class="flex-none text-base-content/30" />
+              秘密与生命周期（P3）——从经历/关系/对话场景提取
+            </li>
+            <li class="flex items-center gap-1.5">
+              <Icon name="dot" :size="13" class="flex-none text-base-content/30" />
+              描写四法（P4）——台词与叙述归纳语言/外貌/动作/心理外化
+            </li>
+            <li class="flex items-center gap-1.5">
+              <Icon name="dot" :size="13" class="flex-none text-base-content/30" />
+              倾向性（P5）——动机/需要/价值观/气质
+            </li>
+            <li class="flex items-center gap-1.5">
+              <Icon name="dot" :size="13" class="flex-none text-base-content/30" />
+              事件年表与世界线（P6）——经历章节 → 事件实体 + 阶段弧
+            </li>
+            <li class="flex items-center gap-1.5">
+              <Icon name="dot" :size="13" class="flex-none text-base-content/30" />
+              关系网（P7）· 示例对话（P8）
+            </li>
           </ul>
           <div class="flex justify-between">
             <button class="btn btn-ghost btn-sm" @click="step = 2">上一步</button>
@@ -354,21 +390,36 @@ async function copyPrompts() {
                 <span class="rounded-box border border-base-200 px-2 py-1.5">{{ pack.entity.aliases.join("、") || "—" }}</span>
               </div>
             </div>
-            <div class="flex flex-col gap-1.5">
+            <div class="flex flex-col gap-2.5">
               <div
-                v-for="f in flattenFacts(pack.entity.facts)"
-                :key="f.path"
-                class="flex items-start gap-2 rounded-box border border-base-200 px-3 py-1.5 text-xs"
+                v-for="[group, facts] in factGroups"
+                :key="group"
+                class="overflow-hidden rounded-box border border-base-200"
               >
-                <span class="w-36 flex-none font-mono text-[10px] text-base-content/45">{{ f.path }}</span>
-                <span class="min-w-0 flex-1">{{ fmtValue(f.value) || "—" }}</span>
-                <span
-                  v-if="pack.entity.sources[f.path]"
-                  class="flex-none text-[10px] text-info/70"
-                  :title="pack.entity.sources[f.path].quote"
-                >
-                  {{ sectionTitle(pack.entity.sources[f.path].section) }}
-                </span>
+                <div class="flex items-center gap-2 border-b border-base-200 bg-base-200/50 px-3 py-1.5">
+                  <span class="badge badge-xs badge-soft font-mono">{{ group }}</span>
+                  <span class="text-[10px] text-base-content/40">{{ facts.length }} 条</span>
+                </div>
+                <div class="flex flex-col divide-y divide-base-200/70">
+                  <div
+                    v-for="f in facts"
+                    :key="f.path"
+                    class="flex items-start gap-2 px-3 py-1.5 text-xs"
+                  >
+                    <span
+                      class="w-28 flex-none truncate font-mono text-[10px] text-base-content/45"
+                      :title="f.path"
+                    >{{ shortPath(f.path) }}</span>
+                    <span class="min-w-0 flex-1 break-words">{{ fmtValue(f.value) || "—" }}</span>
+                    <span
+                      v-if="pack.entity.sources[f.path]"
+                      class="flex-none text-[10px] text-info/70"
+                      :title="pack.entity.sources[f.path].quote"
+                    >
+                      {{ sectionTitle(pack.entity.sources[f.path].section) }}
+                    </span>
+                  </div>
+                </div>
               </div>
             </div>
             <div v-if="pack.entity.relations.length" class="text-xs">
@@ -507,10 +558,11 @@ async function copyPrompts() {
             <div
               v-for="(q, i) in pack.qc"
               :key="`q${i}`"
-              class="rounded-box px-2 py-1 text-xs"
+              class="flex items-start gap-1.5 rounded-box px-2 py-1 text-xs"
               :class="q.severity === 'warn' ? 'bg-warning/10 text-warning' : 'text-base-content/60'"
             >
-              {{ q.severity === "warn" ? "⚠" : "ℹ" }} {{ q.at }}：{{ q.problem }}
+              <Icon :name="q.severity === 'warn' ? 'warning' : 'info'" :size="13" class="mt-0.5 flex-none" />
+              <span>{{ q.at }}：{{ q.problem }}</span>
             </div>
           </div>
         </section>
@@ -581,10 +633,16 @@ async function copyPrompts() {
             <li>切入点：第 {{ report.canonDay }} 天——新建会话时「第几天」填这个数</li>
           </ul>
           <div v-if="report.skipped.length" class="rounded-box border border-warning/40 bg-warning/5 p-3 text-xs">
-            <div v-for="(s, i) in report.skipped" :key="i">⏭ {{ s }}</div>
+            <div v-for="(s, i) in report.skipped" :key="i" class="flex items-start gap-1.5">
+              <Icon name="skip" :size="13" class="mt-0.5 flex-none text-warning" />
+              <span>{{ s }}</span>
+            </div>
           </div>
           <div v-if="report.warnings.length" class="rounded-box border border-base-200 p-3 text-xs text-base-content/60">
-            <div v-for="(w, i) in report.warnings" :key="i">ℹ {{ w }}</div>
+            <div v-for="(w, i) in report.warnings" :key="i" class="flex items-start gap-1.5">
+              <Icon name="info" :size="13" class="mt-0.5 flex-none" />
+              <span>{{ w }}</span>
+            </div>
           </div>
           <div class="flex gap-2">
             <button class="btn btn-primary btn-sm" @click="reset">再导入一份</button>
