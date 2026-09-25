@@ -483,3 +483,8 @@
 - D 包验收仪表：`event::FULL_FOLD_COUNT`（全量投影计数）——批量落盘一轮零全量
   折叠、rewrite 后恰一次重建，有单测钉死。
 - E1 余量的物理拆分建议：单独开批次做，每步 `cargo test` + `pnpm build` 双绿再动下一步。
+- **CDP 真机回归（收口 DoD）**：debug exe（custom-protocol 内嵌前端）+ M3.11 夹具数据
+  + CDP 驱动（temp/m3/regression.mjs），8 项全过——夹具三卡就位 / 新建会话（A7 路径）/
+  **真实 send_message 往返×2**（写入闸门 + FlagGuard + commit_batch + 增量投影 + 时钟
+  步进全链）/ **edit_message 两次**（D3 async 命令 + A2 原子写 + 重放语义）/ 无 .tmp
+  残留 + 派生文件齐 / 读回完整。stderr 无 panic。驱动脚本与日志在 temp/m3/（不入库）。
