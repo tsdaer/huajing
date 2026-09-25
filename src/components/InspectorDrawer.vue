@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { api } from "../api";
 import Icon from "./Icon.vue";
+import EmptyState from "./EmptyState.vue";
 import CardStatePanel from "./inspector/CardStatePanel.vue";
 import StatePathPanel from "./inspector/StatePathPanel.vue";
 import ThreadsPanel from "./inspector/ThreadsPanel.vue";
@@ -286,10 +287,11 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
         v-for="t in INSP_TABS"
         :key="t.id"
         role="tab"
-        class="tab"
+        class="tab gap-1"
         :class="{ 'tab-active': inspTab === t.id }"
         @click="inspTab = t.id"
       >
+        <Icon :name="t.icon" :size="12" class="opacity-70" />
         {{ t.label }}
       </button>
     </div>
@@ -335,7 +337,7 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
         <div v-if="assembly.budget" class="rounded-box bg-base-200 px-3 py-2.5">
           <div class="flex items-center justify-between gap-2">
             <span class="text-[11px] text-base-content/45">输入预算（上下文 × 75%）</span>
-            <span class="font-mono text-[11px] text-base-content/60">
+            <span class="font-mono text-[11px] tabular-nums text-base-content/60">
               {{ assembly.budget.used_tokens }} / {{ assembly.budget.input_tokens }}
             </span>
           </div>
@@ -354,7 +356,7 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
                 >
                 <span class="flex-1 truncate text-base-content/60">{{ u.name }}</span>
                 <span v-if="u.trimmed" class="badge badge-xs badge-soft badge-warning">被裁</span>
-                <span class="font-mono text-base-content/45">{{ u.tokens }} / {{ u.limit }}</span>
+                <span class="font-mono text-[11px] tabular-nums text-base-content/45">{{ u.tokens }} / {{ u.limit }}</span>
               </div>
               <progress
                 class="progress h-1 w-full"
@@ -398,7 +400,7 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
               :title="layerTrimmed(l.id, l.name)"
               >被裁</span
             >
-            <span class="font-mono text-[11px] text-base-content/45">≈{{ l.tokens }}</span>
+            <span class="font-mono text-[11px] tabular-nums text-base-content/45">≈{{ l.tokens }}</span>
           </div>
           <div class="collapse-content px-3">
             <pre class="m-0 rounded-box border border-base-300 bg-base-100 p-2.5 text-xs leading-relaxed break-words whitespace-pre-wrap">{{ l.content }}</pre>
@@ -415,7 +417,12 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
           </div>
         </div>
       </template>
-      <p v-else class="m-0 text-xs text-base-content/50">尚无组装数据。</p>
+      <EmptyState
+        v-else
+        icon="layers"
+        title="尚无组装数据"
+        desc="发一轮消息后，这里就有「这轮注入了什么」的完整预览。"
+      />
     </template>
 
     <!-- M2.8 记忆检查器面板组：一份 inspectorData 喂六个页签（设计 §14） -->
@@ -434,10 +441,22 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
       <div v-if="inspError" role="alert" class="alert alert-error alert-soft py-2 text-xs break-words">
         {{ inspError }}
       </div>
-      <p v-else-if="!inspector" class="m-0 flex items-center gap-2 text-xs text-base-content/50">
-        <span v-if="inspLoading" class="loading loading-spinner loading-xs"></span>
-        {{ inspLoading ? "正在读记忆检查器…" : "还没有检查器数据，点「刷新」重拉。" }}
-      </p>
+      <div v-if="inspLoading" class="flex flex-col gap-3 rounded-box bg-base-200 p-4">
+        <div class="skeleton h-3.5 w-40"></div>
+        <div class="skeleton h-3 w-full"></div>
+        <div class="skeleton h-3 w-4/5"></div>
+        <div class="skeleton h-3 w-3/5"></div>
+      </div>
+      <EmptyState
+        v-else-if="!inspector"
+        icon="cpu"
+        title="还没有检查器数据"
+        desc="聊过一轮之后这里就有货；也可以点下面的按钮重拉。"
+      >
+        <button class="btn btn-primary btn-sm" :disabled="inspLoading" @click="loadInspector">
+          <Icon name="refresh" :size="14" />重新读取
+        </button>
+      </EmptyState>
 
       <template v-else>
         <StatePathPanel
@@ -490,10 +509,16 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
       <div v-if="worldlineError" role="alert" class="alert alert-error alert-soft py-2 text-xs break-words">
         {{ worldlineError }}
       </div>
-      <p v-else-if="!worldline" class="m-0 flex items-center gap-2 text-xs text-base-content/50">
-        <span v-if="worldlineBusy" class="loading loading-spinner loading-xs"></span>
-        {{ worldlineBusy ? "正在读世界…" : "还没有数据，点「刷新」重拉。" }}
-      </p>
+      <div v-if="worldlineBusy" class="flex flex-col gap-3 rounded-box bg-base-200 p-4">
+        <div class="skeleton h-3.5 w-36"></div>
+        <div class="skeleton h-3 w-full"></div>
+        <div class="skeleton h-3 w-2/3"></div>
+      </div>
+      <EmptyState v-else-if="!worldline" icon="globe" title="还没有世界数据" desc="聊过一轮或点「刷新」重拉就有。">
+        <button class="btn btn-primary btn-sm" :disabled="worldlineBusy" @click="loadWorldline">
+          <Icon name="refresh" :size="14" />重新读取
+        </button>
+      </EmptyState>
       <WorldPanel v-else :world="worldline" :busy="worldlineBusy" @calibrate="calibrateWorld" />
     </template>
 
@@ -512,10 +537,16 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
       <div v-if="timelineError" role="alert" class="alert alert-error alert-soft py-2 text-xs break-words">
         {{ timelineError }}
       </div>
-      <p v-else-if="!timeline" class="m-0 flex items-center gap-2 text-xs text-base-content/50">
-        <span v-if="timelineLoading" class="loading loading-spinner loading-xs"></span>
-        {{ timelineLoading ? "正在读调度史…" : "还没有数据，点「刷新」重拉。" }}
-      </p>
+      <div v-if="timelineLoading" class="flex flex-col gap-2 rounded-box bg-base-200 p-4">
+        <div class="skeleton h-3 w-full"></div>
+        <div class="skeleton h-3 w-4/5"></div>
+        <div class="skeleton h-3 w-3/5"></div>
+      </div>
+      <EmptyState v-else-if="!timeline" icon="film" title="还没有调度史" desc="用「导演调度」发一轮，这里就逐条可查「为何轮到她」。">
+        <button class="btn btn-primary btn-sm" :disabled="timelineLoading" @click="loadTimeline">
+          <Icon name="refresh" :size="14" />重新读取
+        </button>
+      </EmptyState>
       <ul v-else-if="directorHistory.length" class="m-0 flex list-none flex-col gap-1.5 p-0">
         <li
           v-for="e in directorHistory"
@@ -528,9 +559,12 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
           </span>
         </li>
       </ul>
-      <p v-else class="m-0 text-xs text-base-content/50">
-        还没有调度记录——多角色会话用「导演调度」发一轮就有了。
-      </p>
+      <EmptyState
+        v-else
+        icon="film"
+        title="还没有调度记录"
+        desc="多角色会话用「导演调度」发一轮就有了。"
+      />
     </template>
 
     <!-- 卡内状态 / 卡内记忆 / 事件流（M1.6 可观测面，数据在聊天流侧） -->

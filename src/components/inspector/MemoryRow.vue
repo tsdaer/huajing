@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 记忆条目的统一画法（房间图 / 时间线 / 最近记忆共用）
 // 点击 → 发 jump(turn)：跳回产生这条记忆的原文轮次（M3.0 ② 溯源跳转）
+import Icon from "../Icon.vue";
 import type { InspectorMemory } from "../../types";
 import { fixed2, pct, storyStamp } from "./util";
 
@@ -19,7 +20,9 @@ const emit = defineEmits<{ jump: [turn: number] }>();
   >
     <p class="m-0 text-left text-xs leading-relaxed break-words">{{ m.content }}</p>
     <div class="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[10px] text-base-content/45">
-      <span class="badge badge-xs badge-ghost font-mono">第 {{ m.turn }} 轮 ↩</span>
+      <span class="badge badge-xs badge-ghost gap-0.5 font-mono">
+        第 {{ m.turn }} 轮<Icon name="undo" :size="10" class="opacity-60" />
+      </span>
       <span>{{ storyStamp(m) }}</span>
       <span v-if="m.place" class="truncate">· {{ m.place }}</span>
       <span v-if="m.emotion" class="badge badge-xs badge-soft badge-secondary">{{ m.emotion }}</span>

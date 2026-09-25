@@ -93,7 +93,7 @@ function submitResolve(t: InspectorThread) {
           窗口内 {{ threads.inWindow.length }} · 事件 {{ threads.eventCount }}
         </span>
         <button
-          class="btn btn-xs btn-soft"
+          class="btn btn-primary btn-soft btn-xs"
           :disabled="busy"
           @click="showOpen = !showOpen"
         >
@@ -198,16 +198,25 @@ function submitResolve(t: InspectorThread) {
 
       <div class="flex flex-col gap-1">
         <p class="m-0 text-[11px] text-base-content/45">经过（{{ t.progress.length }} 个节点）</p>
-        <ul v-if="t.progress.length" class="m-0 flex list-none flex-col gap-1 p-0">
+        <!-- 竖线圆点 timeline：一段线的来龙去脉一眼可读 -->
+        <ol v-if="t.progress.length" class="m-0 flex list-none flex-col p-0">
           <li
             v-for="(n, i) in t.progress"
             :key="n.turn + '-' + i"
-            class="flex items-start gap-1.5 text-[11px] text-base-content/60"
+            class="relative flex gap-2 pb-2.5 pl-5 text-[11px] text-base-content/60 last:pb-0"
           >
-            <Icon name="chevron" :size="10" class="mt-0.5 flex-none text-base-content/30" />
+            <span
+              v-if="i < t.progress.length - 1"
+              class="absolute top-3 bottom-0 left-[5px] w-px bg-base-content/15"
+              aria-hidden="true"
+            ></span>
+            <span
+              class="absolute top-1 left-0 size-2.5 rounded-full border-2 border-primary/50 bg-base-200"
+              aria-hidden="true"
+            ></span>
             <span class="min-w-0 break-words">第 {{ n.turn }} 轮 · {{ n.note || "（无说明）" }}</span>
           </li>
-        </ul>
+        </ol>
         <p v-else class="m-0 text-[11px] text-base-content/40">还没有经过节点。</p>
       </div>
 
