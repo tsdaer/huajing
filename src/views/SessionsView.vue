@@ -7,6 +7,7 @@ import {
   loadSessions,
   newSessionOpen,
   openNewSession,
+  preferredCard,
   selectedSession,
   selectSession,
 } from "../sessions";
@@ -38,16 +39,23 @@ const form = reactive({
 onMounted(async () => {
   void loadSessions();
   await loadCardsAndPersonas();
+  // 从别处（资产页「用它开一场」等）带着打开标记进来：dialog 引用此刻才就绪，补一次打开
+  if (newSessionOpen.value && !newEl.value?.open) newEl.value?.showModal();
 });
 
 async function loadCardsAndPersonas() {
   try {
     [cards.value, personas.value] = await Promise.all([api.listCards(), api.listPersonas()]);
-    if (!form.character && cards.value.length > 0) {
+    // 指定卡的优先级高于缺省第一张（资产页「用它开一场」直达）
+    if (preferredCard.value && cards.value.some((c) => c.dir_name === preferredCard.value)) {
+      form.character = preferredCard.value;
+    } else if (!form.character && cards.value.length > 0) {
       form.character = cards.value[0].dir_name;
     }
   } catch {
     /* 卡/人格读取失败不阻塞弹窗 */
+  } finally {
+    preferredCard.value = "";
   }
 }
 

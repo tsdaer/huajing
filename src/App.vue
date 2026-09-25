@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue";
 import { api } from "./api";
+import { assetTab, type AssetTab } from "./assets";
 import { CARD_FILE_RE, cardGeneration, importNotice, importOpen, requestImport, startCardWatch, stopCardWatch } from "./cards";
 import Icon from "./components/Icon.vue";
 import TitleBar from "./components/TitleBar.vue";
 import { loadSessions, openNewSession, selectedId, selectSession, sessions } from "./sessions";
 import type { SessionMeta } from "./types";
 import ImportCardDialog from "./components/ImportCardDialog.vue";
+import AssetsView from "./views/AssetsView.vue";
 import HomeView from "./views/HomeView.vue";
 import IngestView from "./views/IngestView.vue";
 import SessionsView from "./views/SessionsView.vue";
@@ -17,22 +19,30 @@ const ThemeView = defineAsyncComponent(() => import("./views/ThemeView.vue"));
 
 // 应用外壳：自定义标题栏（无边框窗口）+ drawer 侧栏 + navbar 顶栏 + 视图区。
 // 路由细化（单会话地址等）随 M1.5 评估，此处先分页切换；地址片段可直达。
-type ViewId = "home" | "sessions" | "ingest" | "theme" | "settings";
+type ViewId = "home" | "sessions" | "ingest" | "assets" | "theme" | "settings";
 
-const HASH_VIEWS: ViewId[] = ["home", "sessions", "ingest", "theme", "settings"];
+const HASH_VIEWS: ViewId[] = ["home", "sessions", "ingest", "assets", "theme", "settings"];
 const view = ref<ViewId>(HASH_VIEWS.find((v) => location.hash === `#${v}`) ?? "home");
 watch(view, (v) => {
   location.hash = v;
 });
 
-const NAV: ViewId[] = ["home", "sessions", "ingest", "theme", "settings"];
+// 主导航只放高频入口；设置是低频项，单独落在侧栏底部（本地模式卡之上）
+const NAV: ViewId[] = ["home", "sessions", "ingest", "assets", "theme"];
 const PAGES: Record<ViewId, { label: string; icon: string; title: string; desc: string }> = {
-  home: { label: "概览", icon: "home", title: "概览", desc: "运行时状态与本机数据一览" },
+  home: { label: "概览", icon: "home", title: "概览", desc: "运行时状态与快速入口" },
   sessions: { label: "会话", icon: "chat", title: "会话", desc: "挑一场戏，接着往下演" },
   ingest: { label: "素材导入", icon: "database", title: "素材导入", desc: "wiki 角色页十分钟成卡（素材规格化）" },
+  assets: { label: "资产", icon: "book", title: "资产", desc: "角色卡与世界设定集" },
   theme: { label: "主题", icon: "palette", title: "主题", desc: "预设、配色与形状令牌" },
   settings: { label: "设置", icon: "settings", title: "设置", desc: "接入点、人格与全局项" },
 };
+
+/** 资产子条目 → 跳资产页并落到对应页签 */
+function goAssets(tab: AssetTab) {
+  assetTab.value = tab;
+  go("assets");
+}
 
 // 侧栏：大屏默认展开，窄屏默认收起（收起时只留图标栏）
 const drawerOpen = ref(window.matchMedia("(min-width: 1024px)").matches);
@@ -196,6 +206,7 @@ onUnmounted(() => {
           <HomeView v-if="view === 'home'" @go="view = $event" />
           <SessionsView v-else-if="view === 'sessions'" />
           <IngestView v-else-if="view === 'ingest'" />
+          <AssetsView v-else-if="view === 'assets'" @go="view = $event" />
           <ThemeView v-else-if="view === 'theme'" />
           <SettingsView v-else />
         </main>
@@ -218,7 +229,7 @@ onUnmounted(() => {
               导航
             </li>
 
-            <!-- 会话项是「可折叠子菜单」，其余是普通入口 -->
+            <!-- 会话与资产是「可折叠子菜单」，其余是普通入口 -->
             <template v-for="id in NAV" :key="id">
               <li v-if="id === 'sessions' && drawerOpen">
                 <details :open="view === 'sessions'">
@@ -247,6 +258,35 @@ onUnmounted(() => {
                 </details>
               </li>
 
+              <li v-else-if="id === 'assets' && drawerOpen">
+                <details :open="view === 'assets'">
+                  <summary :class="{ 'menu-active': view === 'assets' }" @click="go('assets')">
+                    <Icon name="book" :size="17" />
+                    <span class="flex-1">{{ PAGES.assets.label }}</span>
+                  </summary>
+                  <ul>
+                    <li>
+                      <button
+                        :class="{ 'menu-active': view === 'assets' && assetTab === 'characters' }"
+                        @click="goAssets('characters')"
+                      >
+                        <Icon name="users" :size="15" />
+                        <span class="truncate">角色</span>
+                      </button>
+                    </li>
+                    <li>
+                      <button
+                        :class="{ 'menu-active': view === 'assets' && assetTab === 'codex' }"
+                        @click="goAssets('codex')"
+                      >
+                        <Icon name="globe" :size="15" />
+                        <span class="truncate">设定集</span>
+                      </button>
+                    </li>
+                  </ul>
+                </details>
+              </li>
+
               <li v-else>
                 <button
                   class="is-drawer-close:justify-center is-drawer-close:tooltip is-drawer-close:tooltip-right"
@@ -261,7 +301,22 @@ onUnmounted(() => {
             </template>
           </ul>
 
-          <div class="border-t border-base-300 p-2">
+          <!-- 底部区：低频入口与身份信息（设置 + 本地模式卡） -->
+          <div class="flex flex-none flex-col gap-1 border-t border-base-300 p-2">
+            <ul class="menu w-full gap-0.5 px-0">
+              <li>
+                <button
+                  class="is-drawer-close:justify-center is-drawer-close:tooltip is-drawer-close:tooltip-right"
+                  :class="{ 'menu-active': view === 'settings' }"
+                  data-tip="设置"
+                  @click="go('settings')"
+                >
+                  <Icon name="settings" :size="17" />
+                  <span class="is-drawer-close:hidden">设置</span>
+                </button>
+              </li>
+            </ul>
+
             <div
               class="flex items-center gap-3 rounded-box bg-base-200 p-2 is-drawer-close:tooltip is-drawer-close:tooltip-right"
               :data-tip="`v${info?.version ?? '0.1.0'}${buildLabel ? ' · 构建 ' + buildLabel : ''}`"

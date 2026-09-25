@@ -34,6 +34,9 @@ export function selectSession(id: string): void {
 /** 「新建会话」弹窗开关：顶栏按钮负责开，会话页负责承载弹窗 */
 export const newSessionOpen = ref(false);
 
+/** 「用它开一场」的指定卡：资产页等地设置后跳会话页，新建弹窗落到该卡并清空 */
+export const preferredCard = ref("");
+
 export function openNewSession(): void {
   newSessionOpen.value = true;
 }
