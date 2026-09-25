@@ -2,6 +2,27 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [Unreleased] · 增强计划 · 包 B 故事时钟定时器（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+
+### Added · 包 B（on_timer 落地，决断 5：只用故事时钟）
+
+- **B1 静态定时器**：状态节点可声明 `timers = { { name, after_days, event } }`
+  （糖，归一进树）——进入状态即注册、离开注销，全部由树投影推导，**不落新事件
+  类型**；轮末（dispatch 之后、心理 tick 之前）统一求值：进入路径的故事天
+  （StoryTimeline 按最近一次转移到该路径的轮次折出；从未转移 = 开局面）距今 ≥
+  after_days → 向该角色的状态树求值喂 `event` 字段的事件（`when = "event:<名>"`
+  命中即转移，on_enter/on_exit 钩子随转移收到同一事件），并落一条
+  `timer.fired.<角色>.<名>` 标记效果事件（一次性发射的确定性依据）。
+  校验：名字重复 / after_days ≤0 / 缺字段 → 坏条目跳过 + timer_warnings 留痕
+- **B2 动态定时器**：hooks/状态钩子新增 `api.after(n, "event:名")`（数字 = 按故事
+  天，`{ turns = m }` = 按轮次；事件名即定时器名）与 `api.cancel_timer(名)`（注销
+  不存在的名字静默）。登记/注销经 EffectEvent 的 trigger 串编码落流
+  （`timer.after/cancel.` 前缀），投影折叠成 `Projection.timers`（同名覆盖、每会话
+  活跃 ≤32）与 `timers_fired`——重放丢弃后由钩子重收集重落流，登记/注销/发射必然一致
+- **DoD 钉死**：「3 天后」构造用例跨轮触发转移（故事时钟经手写黑板事件注入，
+  全求值路径无系统时间）；同轮重复求值不重复发射；编辑历史重放后触发标记与
+  转移一致；线 deadline 行为不变（既有单测不改通过）；`cargo test` 483 例全绿
+
 ## [Unreleased] · 增强计划 · 包 C 卡 Lua API 对齐（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 C（设计 §3.1 清偿，API 表实现态全绿）

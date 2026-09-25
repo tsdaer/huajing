@@ -173,6 +173,11 @@ pub struct HookRun {
     pub psyche_intents: Vec<(String, f32)>,
     /// 增强 C2：api.trigger_event 的收集（宿主排队到本轮末统一派发）
     pub triggers: Vec<TriggerEvent>,
+    /// 增强 B2：api.after 的收集（名字/单位/数量/事件名，已剥 event: 前缀；
+    /// 宿主经 EffectEvent trigger 串落流，投影折叠成活跃定时器）
+    pub timers_after: Vec<(String, String, i64, String)>,
+    /// 增强 B2：api.cancel_timer 的收集（注销不存在的名字静默）
+    pub timers_cancel: Vec<String>,
 }
 
 impl HookRun {
@@ -675,6 +680,9 @@ pub fn run_hook_full(
     let psyche_feels = Rc::new(RefCell::new(Vec::new()));
     let psyche_intents = Rc::new(RefCell::new(Vec::new()));
     let triggers = Rc::new(RefCell::new(Vec::new()));
+    // 增强 B2：动态定时器收集（登记/注销）
+    let timers_after = Rc::new(RefCell::new(Vec::new()));
+    let timers_cancel = Rc::new(RefCell::new(Vec::new()));
 
     let state_value = match lua.to_value(&env.state) {
         Ok(v) => v,
@@ -697,6 +705,8 @@ pub fn run_hook_full(
                 &psyche_feels,
                 &psyche_intents,
                 &triggers,
+                &timers_after,
+                &timers_cancel,
                 on_ui,
             );
             hook.call::<()>((state_value.clone(), api))
@@ -718,6 +728,8 @@ pub fn run_hook_full(
                 &psyche_feels,
                 &psyche_intents,
                 &triggers,
+                &timers_after,
+                &timers_cancel,
                 on_ui,
             );
             hook.call::<()>((msg_table, state_value.clone(), api))
@@ -785,6 +797,9 @@ pub fn run_hook_full(
     }
     // 增强 C2：trigger_event 的排队原样交出——派发时机在宿主（本轮末统一广播）
     run.triggers = triggers.borrow().clone();
+    // 增强 B2：动态定时器的登记/注销交出（宿主经 EffectEvent trigger 串落流）
+    run.timers_after = timers_after.borrow().clone();
+    run.timers_cancel = timers_cancel.borrow().clone();
 
     run.result.injections = injections.borrow().clone();
     run.result.ui_events = ui_events.borrow().clone();
@@ -892,6 +907,8 @@ fn make_api(
     psyche_feels: &Rc<RefCell<Vec<(String, f32, String)>>>,
     psyche_intents: &Rc<RefCell<Vec<(String, f32)>>>,
     triggers: &Rc<RefCell<Vec<TriggerEvent>>>,
+    timers_after: &Rc<RefCell<Vec<(String, String, i64, String)>>>,
+    timers_cancel: &Rc<RefCell<Vec<String>>>,
     on_ui: &UiSink,
 ) -> Table {
     let api = lua.create_table().expect("create api");
@@ -920,6 +937,62 @@ fn make_api(
         })
         .expect("api.schedule_say");
     let _ = api.set("schedule_say", schedule_fn);
+
+    // api.after(n, "event:名") / api.cancel_timer(名)（增强 B2 · 故事时钟定时器）：
+    // n 为数字 = 按故事天、{ turns = m } = 按轮次；只收集不落盘——宿主经
+    // EffectEvent trigger 串落流，投影折叠成活跃定时器（同名覆盖、每会话 ≤32）
+    let after_log = Rc::clone(timers_after);
+    let after_fn = lua
+        .create_function(move |lua, (n, spec): (Value, String)| {
+            let (unit, count) = match &n {
+                Value::Integer(i) => ("days".to_string(), *i),
+                Value::Number(f) => ("days".to_string(), *f as i64),
+                Value::Table(t) => match t.get::<i64>("turns") {
+                    Ok(m) => ("turns".to_string(), m),
+                    Err(_) => {
+                        return Err(mlua::Error::runtime(
+                            "api.after 的 { turns = m } 需要正整数 turns",
+                        ))
+                    }
+                },
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "api.after 第一个参数要求数字（故事天）或 { turns = m }",
+                    ))
+                }
+            };
+            if count <= 0 {
+                return Err(mlua::Error::runtime("api.after 的时长必须 > 0"));
+            }
+            let spec_raw = spec.trim();
+            let name = spec_raw
+                .strip_prefix("event:")
+                .unwrap_or(spec_raw)
+                .trim()
+                .to_string();
+            if name.is_empty() || name.contains('.') {
+                return Err(mlua::Error::runtime(
+                    "api.after 的事件名不能为空且不能含点号（它同时是定时器的名字）",
+                ));
+            }
+            after_log.borrow_mut().push((name.clone(), unit, count, name));
+            Ok(())
+        })
+        .expect("api.after");
+    let _ = api.set("after", after_fn);
+
+    let cancel_log = Rc::clone(timers_cancel);
+    let cancel_fn = lua
+        .create_function(move |_, name: String| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err(mlua::Error::runtime("api.cancel_timer 需要非空的名字"));
+            }
+            cancel_log.borrow_mut().push(name);
+            Ok(())
+        })
+        .expect("api.cancel_timer");
+    let _ = api.set("cancel_timer", cancel_fn);
 
     // ---------- 增强 C：读侧三件（回调式只读，非整库快照）＋ 心理 ＋ 事件广播 ----------
     // 视角过滤在宿主组装镜像时已完成（M3.1 硬约束）：镜像里只有当前角色
@@ -1397,6 +1470,8 @@ pub fn run_state_hook_full(
     let psyche_feels = Rc::new(RefCell::new(Vec::new()));
     let psyche_intents = Rc::new(RefCell::new(Vec::new()));
     let triggers = Rc::new(RefCell::new(Vec::new()));
+    let timers_after = Rc::new(RefCell::new(Vec::new()));
+    let timers_cancel = Rc::new(RefCell::new(Vec::new()));
     let api = make_api(
         &lua,
         seed,
@@ -1408,6 +1483,8 @@ pub fn run_state_hook_full(
         &psyche_feels,
         &psyche_intents,
         &triggers,
+        &timers_after,
+        &timers_cancel,
         on_ui,
     );
     if let Err(e) = hook.call::<()>((api, state_value.clone())) {
@@ -1457,6 +1534,8 @@ pub fn run_state_hook_full(
         }
     }
     run.triggers = triggers.borrow().clone();
+    run.timers_after = timers_after.borrow().clone();
+    run.timers_cancel = timers_cancel.borrow().clone();
     run.result.ui_events = ui_events.borrow().clone();
     run.result.memory = memory_log.borrow().clone();
     run.result.blackboard = blackboard_log.borrow().clone();
@@ -1870,6 +1949,23 @@ fn shape_from_pure(pure: &Table) -> Result<serde_json::Value, String> {
                 transitions.push(serde_json::Value::Object(t));
             }
         }
+        // 增强 B1：定时器声明透传（坏条目由 statetree::from_value 校验 + 警告）
+        let mut timers: Vec<serde_json::Value> = Vec::new();
+        if let Ok(raw) = item.get::<Table>("timers") {
+            for tm in raw.sequence_values::<Table>().flatten() {
+                let name: String = tm.get("name").unwrap_or_default();
+                let event: String = tm.get("event").unwrap_or_default();
+                let after_days: i64 = tm.get("after_days").unwrap_or(0);
+                if name.trim().is_empty() || event.trim().is_empty() {
+                    continue;
+                }
+                timers.push(serde_json::json!({
+                    "name": name.trim(),
+                    "after_days": after_days,
+                    "event": event.trim(),
+                }));
+            }
+        }
         states.insert(
             id,
             serde_json::json!({
@@ -1888,6 +1984,7 @@ fn shape_from_pure(pure: &Table) -> Result<serde_json::Value, String> {
                 "has_enter": flag("has_enter"),
                 "has_exit": flag("has_exit"),
                 "transitions": transitions,
+                "timers": timers,
             }),
         );
     }
@@ -2092,6 +2189,25 @@ return function(tree)
           end
         end
       end
+      local timers = {}
+      if st.timers ~= nil then
+        if type(st.timers) ~= "table" then
+          out.warnings[#out.warnings + 1] = "状态「" .. id .. "」的 timers 不是数组"
+        else
+          for _, tm in ipairs(st.timers) do
+            if type(tm) ~= "table" or type(tm.name) ~= "string" or tm.name == ""
+               or type(tm.event) ~= "string" or tm.event == "" or tonumber(tm.after_days) == nil then
+              out.warnings[#out.warnings + 1] = "状态「" .. id .. "」有一条无效的定时器声明"
+            else
+              timers[#timers + 1] = {
+                name = tm.name,
+                after_days = tonumber(tm.after_days),
+                event = tm.event,
+              }
+            end
+          end
+        end
+      end
       if st.parent ~= nil and type(st.parent) ~= "string" then
         out.warnings[#out.warnings + 1] = "状态「" .. id .. "」的 parent 不是字符串"
       end
@@ -2107,6 +2223,7 @@ return function(tree)
         has_enter = type(st.on_enter) == "function",
         has_exit = type(st.on_exit) == "function",
         transitions = transitions,
+        timers = timers,
       }
     end
   end

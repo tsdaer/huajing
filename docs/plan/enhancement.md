@@ -393,3 +393,4 @@ A 触发的事件进 B 的状态树求值，A 的私有 state 不出现在 B 的
 | 2026-09-26 | 追加 E 包（旁白声道）、F 包（小说模式：段末选项管线 + 小说化导出），决断 8–10 |
 | 2026-09-26 | **包 A 完成**（A1–A7 全量）：477 例单测全绿（新增 49）、`pnpm build` 双绿。实现要点：工具 id 用 `m<调用序>` 后缀与管线序号永不撞号；ui_emit 走报告转推（轮末生效，效果不入事件流、重放按消息存档重推导）；重放一致性 DoD 由 `model_tool_calls_replay_identically_after_edit` 钉死。真实 FC 接入点（deepseek）的「剧情即兴发明新事实当轮进收件箱」验收留待 dev 真机走查（M4 前统一回归） |
 | 2026-09-26 | **包 C 完成**（C1–C3）：481 例单测全绿。实现要点：读侧三件走宿主只读镜像（视角过滤在镜像组装侧完成，卡不用则零成本）；trigger_event 轮级队列经 HookReport 链收集、finalize 轮首派发，重放对齐靠「每轮最后一条 char 消息的轮末段重派发」；判据约定确认为 when 剥 `event:` 前缀比对裸事件名（与收线触发器同约定） |
+| 2026-09-26 | **包 B 完成**（B1–B2）：483 例单测全绿。实现要点：登记/注销/发射走 EffectEvent trigger 串编码（`timer.after/cancel/fired.` 前缀），Projection 增 timers/timers_fired 折影；喂事件用裸事件名（与 C2 同约定）；发射标记保证一次性；rebuild 在每轮最后一条 char 消息的轮末段求值（与 finalize 同口径）。计划原文「reason=timer:<名>」的实际形态：转移 reason 沿用 when 文案（含事件名），发射溯源走 timer.fired 标记 |

@@ -661,6 +661,11 @@ fn apply_load_hook(
         Some(body) => commit(log, root, meta, body)?,
         None => sync_now(log, root, meta)?,
     };
+    // 增强 B2：on_load 里的动态定时器登记
+    let mut proj = proj;
+    for body in timer_effect_bodies(run, &character, 0, scene) {
+        proj = commit(log, root, meta, body)?;
+    }
     Ok(llm::HookReport {
         turn: 0,
         ran: run.ran(),
@@ -846,6 +851,8 @@ fn rebuild_from(
     // 增强 C2：重放区的 trigger_event 队列（④ 段收集、⑤⁻ 派发；换轮清空）
     let mut replay_triggers: Vec<card::TriggerEvent> = Vec::new();
     let mut replay_triggers_turn: Option<u64> = None;
+    // 增强 B：故事时间前缀表（定时器求值用，一次构建全程复用）
+    let timeline = summary::StoryTimeline::build(records);
     if !genesis {
         // 老会话补 genesis：初始黑板取当前文件里的那份（M1 没留下更早的黑板）
         let board = blackboard_of(&project(records, root, meta));
@@ -972,6 +979,12 @@ fn rebuild_from(
                     out.push(rec.clone());
                     event::fold(&mut proj, &rec);
                 }
+                // 增强 B2：动态定时器登记/注销随重放重落流
+                for body in timer_effect_bodies(&run, &m.dir, msg.turn, msg_scene.as_deref()) {
+                    let rec = LogRecord::new(0, body);
+                    out.push(rec.clone());
+                    event::fold(&mut proj, &rec);
+                }
             }
         }
         // ② 消息本身
@@ -1083,6 +1096,12 @@ fn rebuild_from(
                     out.push(rec.clone());
                     event::fold(&mut proj, &rec);
                 }
+                // 增强 B2：动态定时器登记/注销随重放重落流
+                for body in timer_effect_bodies(&run, &m.dir, msg.turn, msg_scene.as_deref()) {
+                    let rec = LogRecord::new(0, body);
+                    out.push(rec.clone());
+                    event::fold(&mut proj, &rec);
+                }
             }
         }
         // ⑤⁻ 增强 C2：trigger_event 轮末统一派发（在 tick/树求值之前；队列跨
@@ -1117,6 +1136,30 @@ fn rebuild_from(
                     out.push(rec.clone());
                     event::fold(&mut proj, &rec);
                 }
+            }
+        }
+        // ⑤ᵝ 增强 B：到期定时器求值（与 finalize_turn 同一内核；仅在每轮最后
+        //     一条 char 消息处跑——与「finalize 只跑一次」同口径）。发射标记、
+        //     转移与派发一样由重放重推导，落流即回放一致。
+        if msg.role == "char"
+            && last_char_seq_of_turn.get(&msg.turn) == Some(&rec.seq)
+        {
+            let today = proj.effective_board(msg_scene.as_deref()).day;
+            let mut timer_report = llm::HookReport::default();
+            for body in fire_due_timers_core(
+                meta,
+                cast,
+                msg.turn,
+                msg_scene.as_deref(),
+                None,
+                &timeline,
+                today,
+                &mut proj,
+                &mut timer_report,
+            ) {
+                let fired = LogRecord::new(0, body);
+                out.push(fired.clone());
+                event::fold(&mut proj, &fired);
             }
         }
         // ⑤⑥ 轮末：心理推进 + 状态树转移（与 commit_reply 同一份代码 → 重放同一条路径，
@@ -3066,6 +3109,12 @@ fn apply_message_hook(
             report.logs.push(e);
         }
     }
+    // 增强 B2：动态定时器的登记/注销落流
+    for body in timer_effect_bodies(run, character, turn, scene) {
+        if let Err(e) = commit(log, root, meta, body) {
+            report.logs.push(e);
+        }
+    }
     report
 }
 
@@ -3394,6 +3443,10 @@ fn finalize_turn(
             report.logs.push(e);
         }
     }
+    // 轮末：故事时钟定时器求值（增强 B；「今天」已随本轮 clock 步进事件推进）
+    if let Err(e) = fire_due_timers(log, root, meta, cast, turn, scene, tree_cache, report) {
+        report.logs.push(format!("定时器求值失败：{e}"));
+    }
     // 轮末：心理运行时推进（情绪衰减/意图慢衰减）——在场成员各自推进，结果同样是事件。
     // 加固 D1-1：全成员的 psyche 补丁一批落盘（一次投影 + 一次派生同步）
     if let Ok(proj) = project_session(log, root, meta) {
@@ -3644,6 +3697,204 @@ fn dispatch_trigger_events(
         }
     }
     out
+}
+
+/// 增强 B2：api.after / api.cancel_timer 的收集 → EffectEvent（trigger 串编码，
+/// 决断 5「不落新事件类型」）。事件无副作用组、照常走派生事件通道——
+/// 重放丢弃后由钩子重收集重落流，登记/注销的投影必然一致。
+fn timer_effect_bodies(
+    run: &card::HookRun,
+    character: &str,
+    turn: u64,
+    scene: Option<&str>,
+) -> Vec<LogBody> {
+    let ts = store::unix_now();
+    let mut out = Vec::new();
+    for (name, unit, n, spec) in &run.timers_after {
+        out.push(LogBody::Effect(event::EffectEvent {
+            turn,
+            trigger: format!("timer.after.{name}.{unit}.{n}.{spec}"),
+            character: character.to_string(),
+            state_set: Vec::new(),
+            blackboard: Vec::new(),
+            memory: Vec::new(),
+            scene_id: scene.map(str::to_string),
+            ts,
+        }));
+    }
+    for name in &run.timers_cancel {
+        out.push(LogBody::Effect(event::EffectEvent {
+            turn,
+            trigger: format!("timer.cancel.{name}"),
+            character: character.to_string(),
+            state_set: Vec::new(),
+            blackboard: Vec::new(),
+            memory: Vec::new(),
+            scene_id: scene.map(str::to_string),
+            ts,
+        }));
+    }
+    out
+}
+
+/// 增强 B：到期定时器的一次发射（喂事件 → 状态树求值 → 发射标记）。
+/// 「喂事件」与 [`dispatch_trigger_events`] 同约定：裸事件名进判据，
+/// 卡侧 `when = "event:<名>"` 命中即转移；on_enter/on_exit 随转移收到同一事件。
+#[allow(clippy::too_many_arguments)]
+fn fire_timer(
+    loaded: &card::LoadedCard,
+    character: &str,
+    spec: &str,
+    key: String,
+    turn: u64,
+    scene: Option<&str>,
+    seed: u64,
+    tree_cache: Option<&TreeCache>,
+    proj: &mut event::Projection,
+    bodies: &mut Vec<LogBody>,
+    report: &mut llm::HookReport,
+) {
+    crate::diag::record("timer", format!("定时器「{key}」到期，喂事件「{spec}」"));
+    if let Some(tree) = load_tree(loaded, tree_cache) {
+        let (events, emits) = advance_state_tree(
+            proj, character, loaded, &tree, turn, spec, None, seed, scene, tree_cache,
+        );
+        report.ui_events.extend(emits);
+        for body in events {
+            event::fold(proj, &LogRecord::new(0, body.clone()));
+            bodies.push(body);
+        }
+    }
+    bodies.push(LogBody::Effect(event::EffectEvent {
+        turn,
+        trigger: format!("timer.fired.{key}"),
+        character: character.to_string(),
+        state_set: Vec::new(),
+        blackboard: Vec::new(),
+        memory: Vec::new(),
+        scene_id: scene.map(str::to_string),
+        ts: store::unix_now(),
+    }));
+}
+
+/// 增强 B：故事时钟定时器的轮末求值内核（决断 5：只用故事时钟——「今天」来自
+/// 事件流的黑板投影，「登记于哪天/进入状态于哪天」来自 StoryTimeline，
+/// 全程无系统时间，重放必然一致）。纯产出：事件交调用方落盘。
+///
+/// - 静态（B1）：活跃路径上的 `timers` 声明，进入状态即注册；进入日 = 最近一次
+///   转移到该路径的轮次对应的故事天（从未转移 = 会话开局面）；
+/// - 动态（B2）：api.after 的投影表（按角色过滤），登记日 = 登记轮次的故事天；
+/// - 一次性发射：`timers_fired` 标记（投影字段，重放重推导）。
+#[allow(clippy::too_many_arguments)]
+fn fire_due_timers_core(
+    meta: &store::SessionMeta,
+    cast: &Cast,
+    turn: u64,
+    scene: Option<&str>,
+    tree_cache: Option<&TreeCache>,
+    timeline: &summary::StoryTimeline,
+    today: i64,
+    proj: &mut event::Projection,
+    report: &mut llm::HookReport,
+) -> Vec<LogBody> {
+    let mut bodies: Vec<LogBody> = Vec::new();
+    for m in present_members(cast, proj, scene) {
+        // 静态定时器（B1）：活跃路径上的声明
+        if let Some(tree) = load_tree(&m.loaded, tree_cache) {
+            let path = active_path_of(proj, &tree, &m.dir);
+            for (_, t) in tree.timers_of(&path) {
+                let key = event::timer_key(&m.dir, &t.name);
+                if proj.timers_fired.contains(&key) {
+                    continue;
+                }
+                // 进入该路径的轮次：最近一次 to == path 的转移；没有 = 开局（turn 0）
+                let entry_turn = proj
+                    .transitions
+                    .iter()
+                    .rev()
+                    .find(|tr| {
+                        tr.character.as_deref().map(|c| c == m.dir).unwrap_or(true)
+                            && tr.to == path
+                    })
+                    .map(|tr| tr.turn)
+                    .unwrap_or(0);
+                let entry_day = timeline.at(entry_turn).map(|(d, _)| d).unwrap_or(today);
+                if today.saturating_sub(entry_day) >= t.after_days {
+                    fire_timer(
+                        &m.loaded,
+                        &m.dir,
+                        &t.event,
+                        key,
+                        turn,
+                        scene,
+                        meta.seed,
+                        tree_cache,
+                        proj,
+                        &mut bodies,
+                        report,
+                    );
+                }
+            }
+        }
+        // 动态定时器（B2）：api.after 的投影表
+        let snapshot: Vec<(String, event::FoldedTimer)> =
+            proj.timers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (key, t) in snapshot {
+            if t.character != m.dir || proj.timers_fired.contains(&key) {
+                continue;
+            }
+            let due = match t.unit.as_str() {
+                "days" => {
+                    let reg_day =
+                        timeline.at(t.registered_turn).map(|(d, _)| d).unwrap_or(today);
+                    today.saturating_sub(reg_day) >= t.n
+                }
+                "turns" => turn.saturating_sub(t.registered_turn) as i64 >= t.n,
+                _ => false,
+            };
+            if due {
+                fire_timer(
+                    &m.loaded,
+                    &m.dir,
+                    &t.spec,
+                    key,
+                    turn,
+                    scene,
+                    meta.seed,
+                    tree_cache,
+                    proj,
+                    &mut bodies,
+                    report,
+                );
+            }
+        }
+    }
+    bodies
+}
+
+/// [`fire_due_timers_core`] 的落盘包装（finalize 用）
+#[allow(clippy::too_many_arguments)]
+fn fire_due_timers(
+    log: &store::EventLog,
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    cast: &Cast,
+    turn: u64,
+    scene: Option<&str>,
+    tree_cache: Option<&TreeCache>,
+    report: &mut llm::HookReport,
+) -> Result<(), String> {
+    let records = log.read(root, &meta.id).map_err(|e| e.to_string())?;
+    let timeline = summary::StoryTimeline::build(&records);
+    let mut proj = (*project_session(log, root, meta)?).clone();
+    let today = proj.effective_board(scene).day;
+    let bodies = fire_due_timers_core(
+        meta, cast, turn, scene, tree_cache, &timeline, today, &mut proj, report,
+    );
+    if !bodies.is_empty() {
+        commit_batch(log, root, meta, bodies)?;
+    }
+    Ok(())
 }
 
 /// 把钩子推来的界面事件转推前端（用户消息一步与回复一步共用）
@@ -6277,6 +6528,227 @@ return {
             transitions.iter().map(|t| t.to.clone()).collect::<Vec<_>>(),
             transitions2,
             "重放后的转移与首次一致"
+        );
+    }
+
+    /// 增强 B DoD：「3 天后」构造用例——静态定时器跨轮触发 on_timer 转移；
+    /// 故事时钟由事件流推导（手写 day 4 的黑板事件注入，无系统时间参与）；
+    /// 编辑历史重放后触发时刻与转移一致。
+    #[test]
+    fn static_timer_fires_after_story_days_and_replays_identically() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = '图书馆', personality = '温柔', first_mes = '（开场）',
+  state = {},
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '日常。',
+        timers = { { name = '三天之约', after_days = 3, event = '三天之约到了' } },
+        transitions = {
+          { to = '日常.赴约', priority = 10, when = 'event:三天之约到了' },
+        },
+      },
+      ['日常.赴约'] = {
+        parent = '日常',
+        directive = '赴约。',
+        on_enter = function(api, state)
+          state.kept_promise = true
+        end,
+      },
+    },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let log = store::EventLog::new();
+        let cast = Cast::load(&root, &meta).unwrap();
+        let speaker = cast.first().dir.clone();
+
+        // 第 1 轮：故事第 1 天——定时器登记（进入日常），不触发
+        let mut queue: Vec<card::TriggerEvent> = Vec::new();
+        log.append(&root, &meta.id, LogBody::Message(user_msg(1, "在吗")))
+            .unwrap();
+        let _ = run_message_hook_core(&root, &meta, &cast.first().loaded, &speaker, 1, None, &log);
+        commit_reply(
+            &root, &meta, &cast, &speaker, 1, "（回复）", &[], None, &log, None, None, None, None,
+            &mut queue,
+        )
+        .unwrap();
+        let records = log.read(&root, &meta.id).unwrap();
+        let transitions: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.body, LogBody::Transition(_)))
+            .collect();
+        assert!(transitions.is_empty(), "第 1 天不触发：{transitions:?}");
+
+        // 快进故事时钟到第 4 天（手写黑板事件 = 手动事件，重放保留；
+        // 「今天」由此注入——全求值路径无系统时间）
+        let mut board = blackboard_of(&project_session(&log, &root, &meta).unwrap());
+        board.day = 4;
+        board.clock = "21:00".into();
+        log.append(
+            &root,
+            &meta.id,
+            LogBody::Blackboard(event::BlackboardEvent {
+                turn: 1,
+                reason: "manual".into(),
+                scene_id: Some(scene::DEFAULT_SCENE_ID.into()),
+                board,
+                ts: store::unix_now(),
+            }),
+        )
+        .unwrap();
+
+        // 第 2 轮：故事第 4 天——1(登记日) + 3 = 4 ≤ 4，触发转移
+        log.append(&root, &meta.id, LogBody::Message(user_msg(2, "还没到吗")))
+            .unwrap();
+        let _ = run_message_hook_core(&root, &meta, &cast.first().loaded, &speaker, 2, None, &log);
+        commit_reply(
+            &root, &meta, &cast, &speaker, 2, "（赴约）", &[], None, &log, None, None, None, None,
+            &mut queue,
+        )
+        .unwrap();
+        let records = log.read(&root, &meta.id).unwrap();
+        let fired: Vec<_> = records
+            .iter()
+            .filter_map(|r| match &r.body {
+                LogBody::Effect(e) if e.trigger.starts_with("timer.fired.") => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fired
+                .iter()
+                .any(|e| e.trigger == "timer.fired.小雨.三天之约"),
+            "应有发射标记：{fired:?}"
+        );
+        let transitioned = records.iter().any(|r| {
+            matches!(&r.body, LogBody::Transition(t) if t.to.last().map(|p| p.contains("赴约")).unwrap_or(false))
+        });
+        assert!(transitioned, "on_timer 事件应驱动状态树转移到赴约");
+        // 一次性：同一天再来一轮（第 3 轮，故事天仍 4）不再发射
+        log.append(&root, &meta.id, LogBody::Message(user_msg(3, "到了")))
+            .unwrap();
+        let _ = run_message_hook_core(&root, &meta, &cast.first().loaded, &speaker, 3, None, &log);
+        commit_reply(
+            &root, &meta, &cast, &speaker, 3, "（已赴约）", &[], None, &log, None, None, None, None,
+            &mut queue,
+        )
+        .unwrap();
+        let fired_count = log
+            .read(&root, &meta.id)
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                matches!(&r.body, LogBody::Effect(e) if e.trigger == "timer.fired.小雨.三天之约")
+            })
+            .count();
+        assert_eq!(fired_count, 1, "一次性发射");
+
+        // 重放一致：编辑历史（丢弃派生）后，转移与发射标记重推导且位置一致
+        let records = log.read(&root, &meta.id).unwrap();
+        let rebuilt = rebuild_from(&log, &root, &meta, &cast, &records, 1).unwrap();
+        let fired2: Vec<String> = rebuilt
+            .iter()
+            .filter_map(|r| match &r.body {
+                LogBody::Effect(e) if e.trigger.starts_with("timer.fired.") => {
+                    Some(e.trigger.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fired2, vec!["timer.fired.小雨.三天之约".to_string()]);
+        let proj_live = event::project_over(&records, &event::Base::default());
+        let proj_replay = event::project_over(&rebuilt, &event::Base::default());
+        assert_eq!(
+            proj_live.state_of(&speaker),
+            proj_replay.state_of(&speaker),
+            "重放后的 state 与首次一致"
+        );
+    }
+
+    /// 增强 B2：api.after / cancel_timer——登记经 EffectEvent trigger 串落流、
+    /// 投影折叠成活跃定时器；按轮次的到期能触发；注销静默。
+    #[test]
+    fn dynamic_timer_after_and_cancel_flow_through_projection() {
+        let card = r#"
+return {
+  spec = 'charcard/1.0', name = '小雨', scenario = 's', personality = 'p', first_mes = 'f',
+  state = {},
+  hooks = {
+    on_message = function(msg, state, api)
+      if msg.content:find('约定') then
+        api.after({ turns = 1 }, 'event:回铃')
+      end
+      if msg.content:find('取消') then
+        api.cancel_timer('回铃')
+      end
+    end,
+  },
+  state_tree = {
+    root = '日常',
+    states = {
+      ['日常'] = {
+        directive = '日常。',
+        transitions = {
+          { to = '日常.响铃', priority = 10, when = 'event:回铃' },
+        },
+      },
+      ['日常.响铃'] = { parent = '日常', directive = '响了。' },
+    },
+  },
+}
+"#;
+        let (_dir, meta, root) = setup(card);
+        let log = store::EventLog::new();
+        let cast = Cast::load(&root, &meta).unwrap();
+        let speaker = cast.first().dir.clone();
+
+        // 第 1 轮：说「约定」→ on_message 登记 {turns=1} 的动态定时器
+        log.append(&root, &meta.id, LogBody::Message(user_msg(1, "约定好了")))
+            .unwrap();
+        let _ = run_message_hook_core(&root, &meta, &cast.first().loaded, &speaker, 1, None, &log);
+        let proj = project_session(&log, &root, &meta).unwrap();
+        let key = event::timer_key(&speaker, "回铃");
+        assert!(
+            proj.timers.contains_key(&key),
+            "登记进投影：{:?}",
+            proj.timers
+        );
+        assert_eq!(proj.timers[&key].unit, "turns");
+        assert_eq!(proj.timers[&key].spec, "回铃");
+
+        // 第 2 轮：{turns=1} 到期（1 → 2 轮）→ 转移
+        log.append(&root, &meta.id, LogBody::Message(user_msg(2, "还在吗")))
+            .unwrap();
+        let _ = run_message_hook_core(&root, &meta, &cast.first().loaded, &speaker, 2, None, &log);
+        commit_reply(
+            &root, &meta, &cast, &speaker, 2, "（回复）", &[], None, &log, None, None, None, None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let records = log.read(&root, &meta.id).unwrap();
+        assert!(records.iter().any(|r| {
+            matches!(&r.body, LogBody::Transition(t) if t.to.last().map(|p| p.contains("响铃")).unwrap_or(false))
+        }));
+        assert!(project_session(&log, &root, &meta)
+            .unwrap()
+            .timers_fired
+            .contains(&key));
+
+        // 注销静默：再登记后取消，不报错、投影表清空
+        log.append(&root, &meta.id, LogBody::Message(user_msg(3, "约定")))
+            .unwrap();
+        let _ = run_message_hook_core(&root, &meta, &cast.first().loaded, &speaker, 3, None, &log);
+        assert!(project_session(&log, &root, &meta).unwrap().timers.contains_key(&key));
+        log.append(&root, &meta.id, LogBody::Message(user_msg(4, "取消")))
+            .unwrap();
+        let _ = run_message_hook_core(&root, &meta, &cast.first().loaded, &speaker, 4, None, &log);
+        assert!(
+            !project_session(&log, &root, &meta).unwrap().timers.contains_key(&key),
+            "注销后投影表清空"
         );
     }
 

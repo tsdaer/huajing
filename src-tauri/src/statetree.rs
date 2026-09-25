@@ -39,6 +39,18 @@ pub struct StateTransition {
     pub when_is_fn: bool,
 }
 
+/// 状态节点上的定时器声明（增强包 B1 ·「糖，归一进树」）。
+/// 进入该状态时注册、离开时注销——都由树投影推导，不落新事件类型（决断 5）；
+/// 到期向该角色的状态树求值喂 `event` 字段的事件（一次性发射）。
+/// 真实世界时钟不参与任何求值（决断 5：「3 天后」按故事天）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimerDecl {
+    pub name: String,
+    pub after_days: i64,
+    /// 到期喂给状态树求值的事件名（可带 `event:` 前缀，宿主剥掉）
+    pub event: String,
+}
+
 /// 一个剧情状态节点（设计 §7.1 的 States 一行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateNode {
@@ -55,6 +67,8 @@ pub struct StateNode {
     pub has_exit: bool,
     /// 声明式转移（函数式 when 只留 [`StateTransition::when_is_fn`] 一个布尔位）
     pub transitions: Vec<StateTransition>,
+    /// 定时器声明（增强包 B1）：进入该状态注册、离开注销（树投影推导）
+    pub timers: Vec<TimerDecl>,
 }
 
 /// 一整棵状态树。`from_value` 吃的是 card::state_tree_shape 产出的 JSON 形态
@@ -66,6 +80,9 @@ pub struct StateTree {
     /// 解析时输入里重复出现的状态 id（BTreeMap 表达不了重复，单独记一笔供 `validate` 诊断；
     /// 只有 `states` 写成数组形态时才可能出现）
     pub duplicate_ids: Vec<String>,
+    /// 定时器声明的校验诊断（增强 B1：名字重复、after_days ≤0、缺字段——
+    /// 坏条目跳过不挡树，留痕供面板/诊断可查）
+    pub timer_warnings: Vec<String>,
 }
 
 impl StateTree {
@@ -87,6 +104,7 @@ impl StateTree {
             .ok_or_else(|| "状态树缺少 states 表".to_string())?;
         let mut states = BTreeMap::new();
         let mut duplicate_ids = Vec::new();
+        let mut timer_warnings = Vec::new();
         match raw {
             Value::Object(map) => {
                 for (id, sv) in map {
@@ -94,7 +112,7 @@ impl StateTree {
                     if id.is_empty() {
                         return Err("状态树里有一个空 id 的状态".to_string());
                     }
-                    states.insert(id.to_string(), node_from_value(id, sv)?);
+                    states.insert(id.to_string(), node_from_value(id, sv, &mut timer_warnings)?);
                 }
             }
             Value::Array(items) => {
@@ -103,7 +121,7 @@ impl StateTree {
                         Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
                         _ => return Err("states 数组里的状态缺少非空 id".to_string()),
                     };
-                    let node = node_from_value(&id, item)?;
+                    let node = node_from_value(&id, item, &mut timer_warnings)?;
                     if states.insert(id.clone(), node).is_some() {
                         duplicate_ids.push(id);
                     }
@@ -117,6 +135,7 @@ impl StateTree {
             root,
             states,
             duplicate_ids,
+            timer_warnings,
         })
     }
 
@@ -173,6 +192,20 @@ impl StateTree {
                 .flat_map(|n| n.recall.iter().cloned())
                 .collect(),
         )
+    }
+
+    /// 活跃路径上的定时器声明（增强 B1）：**沿路径全部生效**——进入子状态
+    /// 也算进入了它的祖先。返回 (状态 id, 声明) 列表，根→叶序。
+    pub fn timers_of<'a>(&'a self, path: &'a [String]) -> Vec<(&'a str, &'a TimerDecl)> {
+        let mut out = Vec::new();
+        for id in path {
+            if let Some(node) = self.states.get(id) {
+                for t in &node.timers {
+                    out.push((id.as_str(), t));
+                }
+            }
+        }
+        out
     }
 
     /// 活跃路径要揭示的设定键（根→叶，去重保序）
@@ -279,7 +312,11 @@ fn dedupe_in_order(items: Vec<String>) -> Vec<String> {
 }
 
 /// 解析一个状态节点
-fn node_from_value(id: &str, v: &Value) -> Result<StateNode, String> {
+fn node_from_value(
+    id: &str,
+    v: &Value,
+    timer_warnings: &mut Vec<String>,
+) -> Result<StateNode, String> {
     let obj = v
         .as_object()
         .ok_or_else(|| format!("状态「{id}」不是 JSON 对象"))?;
@@ -315,6 +352,38 @@ fn node_from_value(id: &str, v: &Value) -> Result<StateNode, String> {
         }
         Some(_) => return Err(format!("状态「{id}」的 transitions 不是数组")),
     };
+    // 增强 B1：定时器声明（坏条目跳过 + 留痕：名字重复 / after_days ≤0 / 缺字段）
+    let mut timers = Vec::new();
+    match obj.get("timers") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for item in items {
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let after_days = item.get("after_days").and_then(|v| v.as_i64()).unwrap_or(0);
+                let event = item
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().trim_start_matches("event:").trim().to_string())
+                    .unwrap_or_default();
+                if name.is_empty() || event.is_empty() || after_days <= 0 {
+                    timer_warnings.push(format!(
+                        "状态「{id}」有一条无效定时器（name/after_days/event 必须齐全且 after_days > 0）"
+                    ));
+                    continue;
+                }
+                if timers.iter().any(|t: &TimerDecl| t.name == name) {
+                    timer_warnings.push(format!("状态「{id}」的定时器「{name}」名字重复，后一条跳过"));
+                    continue;
+                }
+                timers.push(TimerDecl { name, after_days, event });
+            }
+        }
+        Some(_) => timer_warnings.push(format!("状态「{id}」的 timers 不是数组")),
+    }
     Ok(StateNode {
         id: id.to_string(),
         parent,
@@ -324,6 +393,7 @@ fn node_from_value(id: &str, v: &Value) -> Result<StateNode, String> {
         has_enter,
         has_exit,
         transitions,
+        timers,
     })
 }
 

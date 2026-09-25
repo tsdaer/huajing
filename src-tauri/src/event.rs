@@ -54,6 +54,26 @@ pub struct EffectEvent {
     pub ts: u64,
 }
 
+/// 活跃的动态定时器（增强包 B2 · api.after 的折叠形态）。
+/// 走 EffectEvent 的 trigger 串编码（`timer.after.<名>.<单位>.<n>.<spec…>`，
+/// 不新增事件类型——决断 5），登记/注销/发射全部由事件流重放推导。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoldedTimer {
+    /// 到期喂给状态树求值的事件名（已剥 `event:` 前缀）
+    pub spec: String,
+    /// "days"（按故事天）| "turns"（按轮次）
+    pub unit: String,
+    pub n: i64,
+    pub registered_turn: u64,
+    /// 登记者（api.after 所在 hook 的角色）
+    pub character: String,
+}
+
+/// 动态定时器的折叠键（角色 + 名字，唯一定位一次注销/发射）
+pub fn timer_key(character: &str, name: &str) -> String {
+    format!("{character}.{name}")
+}
+
 /// 黑板变更（全量快照，折叠时后写覆盖）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlackboardEvent {
@@ -596,6 +616,12 @@ pub struct Projection {
     /// 世界主线走位史（M3.7 · 设计 §6.6）：本会话见证的世界阶段转移按序追加；
     /// 当前活跃路径 = 最后一条的 to（空 = 开局承袭 world.json 的世界进度）
     pub worldline: Vec<WorldlineEvent>,
+    /// 活跃的动态定时器（增强 B2）：`timer_key(角色, 名字)` → 声明（同名后写覆盖；
+    /// 每会话活跃上限 32，超限的新登记被折叠忽略）
+    pub timers: BTreeMap<String, FoldedTimer>,
+    /// 已发射的定时器标记（增强 B1/B2：一次性发射的确定性依据；
+    /// 键同上，静态定时器也用它防重复发射）
+    pub timers_fired: std::collections::BTreeSet<String>,
     pub last_seq: Seq,
 }
 
@@ -810,6 +836,31 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
     match &rec.body {
         LogBody::Message(m) => p.messages.push(m.clone()),
         LogBody::Effect(e) => {
+            // 增强 B：动态定时器的登记/注销/发射标记（trigger 串编码，决断 5
+            // 「不落新事件类型」；三类都是折叠 no-op 之外的小账本）
+            if let Some(rest) = e.trigger.strip_prefix("timer.after.") {
+                let parts: Vec<&str> = rest.splitn(4, '.').collect();
+                if let [name, unit, n, spec] = parts[..] {
+                    let key = timer_key(&e.character, name);
+                    let capped = p.timers.len() >= 32 && !p.timers.contains_key(&key);
+                    if !capped {
+                        p.timers.insert(
+                            key,
+                            FoldedTimer {
+                                spec: (*spec).to_string(),
+                                unit: (*unit).to_string(),
+                                n: n.parse().unwrap_or(0),
+                                registered_turn: e.turn,
+                                character: e.character.clone(),
+                            },
+                        );
+                    }
+                }
+            } else if let Some(name) = e.trigger.strip_prefix("timer.cancel.") {
+                p.timers.remove(&timer_key(&e.character, name));
+            } else if let Some(name) = e.trigger.strip_prefix("timer.fired.") {
+                p.timers_fired.insert(name.to_string());
+            }
             if !e.state_set.is_empty() {
                 let entry = p
                     .states
