@@ -998,9 +998,8 @@ fn mirror_active_scene(p: &mut Projection) {
 }
 
 /// api.blackboard.set 的写入合并进黑板（只认黑板 v0 字段；类型不符即忽略）。
-/// 返回是否有实际改动。宿主与投影共用，避免两处白名单漂移。
-pub fn apply_blackboard_sets(bb: &mut Blackboard, sets: &[KvSet]) -> bool {
-    let before = format!("{bb:?}");
+/// 宿主与投影共用，避免两处白名单漂移。（E5：原先的 Debug 串整体比对无人消费，删）
+pub fn apply_blackboard_sets(bb: &mut Blackboard, sets: &[KvSet]) {
     for kv in sets {
         match (kv.key.as_str(), &kv.value) {
             ("day", v) => {
@@ -1037,7 +1036,6 @@ pub fn apply_blackboard_sets(bb: &mut Blackboard, sets: &[KvSet]) -> bool {
             _ => {} // 其余未知键兜底忽略（沙箱侧还有一层白名单）
         }
     }
-    format!("{bb:?}") != before
 }
 
 /// 场景感知的黑板写入路由（M3.2 · 设计 §10.3）：
@@ -1052,8 +1050,7 @@ pub fn apply_blackboard_sets_scoped(
     world: &mut Blackboard,
     mut scene: Option<&mut Scene>,
     sets: &[KvSet],
-) -> bool {
-    let before = format!("{world:?}");
+) {
     for kv in sets {
         let value = &kv.value;
         match (kv.key.as_str(), value, scene.as_deref_mut()) {
@@ -1096,7 +1093,6 @@ pub fn apply_blackboard_sets_scoped(
             _ => {}
         }
     }
-    format!("{world:?}") != before
 }
 
 /// state 的**顶层键补丁**：钩子原地改的是嵌套表，顶层键比对足以完整表达变化

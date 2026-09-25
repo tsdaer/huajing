@@ -831,6 +831,11 @@ function onDelta(e: StreamEvent, sid: string, gen: number) {
 /** 界面事件进列表；轮次缺省时从消息流推算（乐观消息 turn=-1 不算数，M3.0 ③） */
 function pushHookEvent(kind: string, value: string, turn = -1) {
   const hint = turn >= 0 ? turn : currentTurnHint();
+  // E4：实时推送（on_delta）与报告落地（applyReport 的 ui_events）会带同一条事件
+  // ——按 turn+kind+value 去重，事件流页签里每条只出现一次
+  if (hookEvents.value.some((h) => h.turn === hint && h.kind === kind && h.value === value)) {
+    return;
+  }
   hookEvents.value = [{ kind, value, turn: hint }, ...hookEvents.value].slice(0, 50);
 }
 
@@ -911,7 +916,12 @@ async function finishGeneration(final: StreamEvent, sid: string, gen: number) {
 }
 
 async function stop() {
-  await api.stopGeneration(props.meta.id);
+  try {
+    await api.stopGeneration(props.meta.id);
+  } catch (e) {
+    // E4：中断失败不该是未处理的 promise 拒绝
+    error.value = String(e);
+  }
 }
 
 // ---------- 消息编辑 / 删除 ----------
@@ -933,8 +943,17 @@ async function saveEdit() {
   }
 }
 
-async function removeMsg(i: number) {
-  if (!window.confirm("删除这条消息？")) return;
+// E4：删除确认收进应用内对话框（替换 window.confirm，与 M3.11 场景向导同一惯用式）
+const pendingDelete = ref<number | null>(null);
+
+function removeMsg(i: number) {
+  pendingDelete.value = i;
+}
+
+async function confirmRemove() {
+  const i = pendingDelete.value;
+  pendingDelete.value = null;
+  if (i === null) return;
   try {
     messages.value = await api.deleteMessage(props.meta.id, i);
     editingIndex.value = -1; // B3：删除使其后所有下标前移，编辑框一律关闭
@@ -1242,7 +1261,7 @@ watch(cardGeneration, () => {
           class="flex flex-none flex-wrap items-center justify-between gap-2 border-t border-base-300 px-3 py-2"
         >
           <span class="text-[11px] text-base-content/45">
-            第 {{ page }}/{{ pageCount }} 页 · 共 {{ messages.length }} 条 · 每页 {{ PAGE_SIZE }} 条
+            第 {{ page }}/{{ pageCount }} 页 · 共 {{ sceneMessagesView.length }} 条 · 每页 {{ PAGE_SIZE }} 条
           </span>
           <div class="join">
             <button class="btn join-item btn-xs" :disabled="page <= 1" @click="goPage(page - 1)">
@@ -1829,6 +1848,18 @@ watch(cardGeneration, () => {
     </div>
 
     <!-- M3.11 场景操作向导：新建 / 分场 / 合场 / 编辑 -->
+    <!-- E4：删除消息的应用内确认 -->
+    <div v-if="pendingDelete !== null" class="modal modal-open">
+      <div class="modal-box max-w-sm text-sm">
+        <p class="m-0">删除这条消息？它之后轮次的派生效果（好感度、状态树、时钟）会一并重算。</p>
+        <div class="modal-action">
+          <button class="btn btn-ghost btn-sm" @click="pendingDelete = null">取消</button>
+          <button class="btn btn-error btn-sm" @click="confirmRemove">删除</button>
+        </div>
+      </div>
+      <div class="modal-backdrop" @click="pendingDelete = null"></div>
+    </div>
+
     <SceneDialog
       v-model="sceneDlgOpen"
       :kind="sceneDlgKind"

@@ -643,6 +643,8 @@ pub fn save_card_draft(
     if loaded.degraded {
         let reason = loaded.degrade_reason.clone().unwrap_or_default();
         let _ = std::fs::remove_file(&card_path);
+        // E5：连带删掉刚建的目录（校验失败不留空壳；目录非空时 remove_dir 失败被忽略）
+        let _ = std::fs::remove_dir(&dir);
         return Err(format!("生成的卡无法被解析（已回滚）：{reason}"));
     }
 

@@ -36,18 +36,29 @@ export const CARD_FILE_RE = /\.(png|json)$/i;
 export const importNotice = ref("");
 
 let started = false;
+// E4：监听句柄保存下来，卸载时解除（原来直接丢弃）
+let unlistenCardChanged: (() => void) | null = null;
 
 /** 启动监听（应用挂载时调一次；浏览器 mock 下静默降级） */
 export async function startCardWatch(): Promise<void> {
   if (started) return;
   started = true;
   try {
-    await listen<{ dir_name: string | null; path: string }>("card_changed", (e) => {
-      lastCardChange.value = e.payload?.path ?? "";
-      cardGeneration.value += 1;
-    });
+    unlistenCardChanged = await listen<{ dir_name: string | null; path: string }>(
+      "card_changed",
+      (e) => {
+        lastCardChange.value = e.payload?.path ?? "";
+        cardGeneration.value += 1;
+      },
+    );
     await api.watchCards();
   } catch {
     /* 无 Tauri 运行时（浏览器 mock）：不监听也不报错 */
   }
+}
+
+/** 解除卡片变更监听（应用卸载时调一次） */
+export function stopCardWatch(): void {
+  unlistenCardChanged?.();
+  unlistenCardChanged = null;
 }

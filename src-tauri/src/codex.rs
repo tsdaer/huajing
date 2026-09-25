@@ -888,7 +888,7 @@ fn clock_hit(expect: &Value, clock: &str) -> bool {
 }
 
 /// HH:MM → 分钟数；允许 24:00 作区间终点
-fn parse_hhmm(s: &str) -> Option<i64> {
+pub(crate) fn parse_hhmm(s: &str) -> Option<i64> {
     let (h, m) = s.trim().split_once(':')?;
     let h: i64 = h.trim().parse().ok()?;
     let m: i64 = m.trim().parse().ok()?;

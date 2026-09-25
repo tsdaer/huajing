@@ -134,6 +134,35 @@
   自动跟随——逐 token 强制贴底与强制布局不再掉帧，回看历史不被拽走视线。
   （流式气泡子组件拆分随 E1 做）
 
+### Fixed · 包 E 结构与边缘（P3，行为不变）
+
+- **E2 死代码与重复加载**：手动收线不再白读一次卡（`resolve_thread_at` 的
+  `loaded` 加载即弃）；删掉素材管线里无操作的 `let _ = &name`；检查器对同一
+  世界只 `load_codex` 一次（原来 mentions 与实体清单各 load 一遍）；状态钩子的
+  「有没有」问题改走 TreeCache 缓存的 shape 布尔位（`has_enter`/`has_exit` 随树
+  一起缓存），不再每条转移重跑整卡；TreeCache 未命中（重放路径）回退原行为
+- **E3 watch pusher 线程泄漏**：`unwatch_cards` 置终止信号让推送线程退出，
+  不再持 `Arc<Queue>` 死循环；推送循环抽成可测的 `pusher_loop` 并钉终止行为
+- **E4 前端小项五件**：界面事件双份入列改按 turn+kind+value 去重（页签每条
+  只出现一次）；`stop()` 补 catch 进错误提示；删消息换应用内确认对话框
+  （替换 window.confirm，M3.11 同一惯用式）；分页页脚计数改用场景视图条数；
+  导入切入点 `:key` 改按名（同天多切入点不再撞键）；App.vue 拖放与 cards.ts
+  卡片变更的监听句柄保存并在卸载时解除（TitleBar 的正确范例推广）
+- **E5 Rust 小项八件**：合场时钟按当天分钟数比较（手写 "9:00" vs "10:00" 的
+  字典序判错）；A 组子层全空时省略空 system 消息；`current_affects` 全量保序
+  去重；卡 default_state 先剥函数值再转（函数值不再把整份 state 清空）；state
+  读回失败补诊断（不再静默整体回退）；黑板写入的 Debug 串整体比对删除
+  （返回值无人消费）；stimport 校验失败回滚连带删空目录；素材管线的 stage
+  判定按意图改 `contains_key`（原左支恒不起作用，LLM 编的阶段名全放行）
+
+### Changed · 包 E（E1，部分）
+
+- **E1 零风险提取（部分完成）**：`proxy_of(root)` 收敛 8 处代理设置读取块；
+  `proposal_event(...)` 构造器换写 9 处规整的 Proposal 事件骨架。**余量**：
+  `session_ctx(id)` 的 ~20 处命令前奏三连换写、commands.rs 按域物理拆分、
+  SessionView.vue 的五个组件/composable 抽取——属纯代码搬移，留作后续
+  「分批小步、每步双绿」的独立批次（见 hardening.md 进度区备注）
+
 ## [0.3.0] - 2026-09-25
 
 > M3「热闹、会长大、有节奏、不串台」完成定版（代码侧 M3.0–M3.11 全部落地，

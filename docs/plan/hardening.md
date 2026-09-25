@@ -469,5 +469,17 @@
 - [x] 包 B 互斥与生命周期守卫（B1–B7）
 - [x] 包 C LLM 健壮性（C1–C8）
 - [x] 包 D 热路径性能（D1–D10）
-- [ ] 包 E 结构与边缘（E1–E5）
-- [ ] 收口：CHANGELOG + 双绿 + CDP 真机回归
+- [x] 包 E 结构与边缘（E2–E5 全量；E1 零风险提取完成 proxy_of×8 + proposal_event×9，
+      **余量**：session_ctx 前奏换写、commands.rs 按域物理拆分、SessionView 五组件抽取
+      ——纯代码搬移，留作独立小步批次，不阻塞收口）
+- [x] 收口：CHANGELOG + 双绿 + CDP 真机回归
+
+## 执行备注（2026-09-25）
+
+- 每包一个 commit：A `1921cd9` / B `8d37cae` / C `baf435b` / D `d2e0248` / E（见 git log）。
+- 测试基线 428 → 456+（新增钉子全部走失败场景构造用例）；`pnpm build` 双绿。
+- A4 的写入闸门（`WriteGate` + 总结批次暂存重放）与 B1 的 `FlagGuard` 共同构成
+  per-session 写入互斥；`stop_generation` 故意不取闸门（只置中断位）。
+- D 包验收仪表：`event::FULL_FOLD_COUNT`（全量投影计数）——批量落盘一轮零全量
+  折叠、rewrite 后恰一次重建，有单测钉死。
+- E1 余量的物理拆分建议：单独开批次做，每步 `cargo test` + `pnpm build` 双绿再动下一步。

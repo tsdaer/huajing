@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -40,6 +41,9 @@ pub struct CardWatch(Mutex<Option<WatcherHandle>>);
 
 struct WatcherHandle {
     _watcher: notify::RecommendedWatcher,
+    /// pusher 线程的终止信号（加固 E3）：unwatch 置位后线程退出，
+    /// 不再持着 `Arc<Queue>` 死循环泄漏
+    stop: Arc<AtomicBool>,
 }
 
 /// 事件队列（去重、保序、只留最新队列头）；watcher 线程与推送线程之间共享
@@ -107,16 +111,23 @@ pub fn watch_cards(app: AppHandle, state: State<'_, CardWatch>) -> Result<(), St
     let root = crate::store::data_root();
     let queue = Arc::new(Queue::default());
     let watcher = spawn_watcher(&root, Arc::clone(&queue))?;
-    spawn_pusher(app, Arc::clone(&queue));
-    *slot = Some(WatcherHandle { _watcher: watcher });
+    let stop = Arc::new(AtomicBool::new(false));
+    spawn_pusher(app, Arc::clone(&queue), Arc::clone(&stop));
+    *slot = Some(WatcherHandle {
+        _watcher: watcher,
+        stop,
+    });
     Ok(())
 }
 
-/// 停止监听（幂等）
+/// 停止监听（幂等）：置终止信号让 pusher 线程退出（加固 E3），drop watcher 停底层监听
 #[tauri::command]
 pub fn unwatch_cards(state: State<'_, CardWatch>) -> Result<(), String> {
     let mut slot = state.0.lock().map_err(|_| "热加载状态锁 poisoned".to_string())?;
-    *slot = None; // drop watcher 即停止底层监听
+    if let Some(handle) = slot.as_ref() {
+        handle.stop.store(true, Ordering::Relaxed);
+    }
+    *slot = None;
     Ok(())
 }
 
@@ -156,25 +167,35 @@ fn spawn_watcher(root: &Path, queue: Arc<Queue>) -> Result<notify::RecommendedWa
     Ok(watcher)
 }
 
-fn spawn_pusher(app: AppHandle, queue: Arc<Queue>) {
-  std::thread::spawn(move || loop {
-    // 阻塞等第一条（超时即继续等；队列被 drop 才退出，M1 进程内不做回收）
-    let Some(first) = queue.pop(DEBOUNCE) else {
-      continue;
-    };
-    let mut batch = vec![first];
-    // 合并窗口内的后续变更：一次保存动作往往产生多条事件
-    let deadline = std::time::Instant::now() + DEBOUNCE;
-    while std::time::Instant::now() < deadline {
-      match queue.pop(deadline.saturating_duration_since(std::time::Instant::now())) {
-        Some(next) => batch.push(next),
-        None => break,
-      }
+fn spawn_pusher(app: AppHandle, queue: Arc<Queue>, stop: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        pusher_loop(queue, stop, move |item| {
+            let _ = app.emit("card_changed", &item);
+        })
+    });
+}
+
+/// 推送循环（加固 E3）：stop 置位后尽快退出，不再持队列死循环。
+/// `emit` 是推送出口（生产 = Tauri 事件；测试 = 计数闭包），抽出便于钉终止行为。
+fn pusher_loop<E: FnMut(CardChanged)>(queue: Arc<Queue>, stop: Arc<AtomicBool>, mut emit: E) {
+    while !stop.load(Ordering::Relaxed) {
+        // 阻塞等第一条（超时即回到终止检查）
+        let Some(first) = queue.pop(DEBOUNCE) else {
+            continue;
+        };
+        let mut batch = vec![first];
+        // 合并窗口内的后续变更：一次保存动作往往产生多条事件
+        let deadline = std::time::Instant::now() + DEBOUNCE;
+        while std::time::Instant::now() < deadline {
+            match queue.pop(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Some(next) => batch.push(next),
+                None => break,
+            }
+        }
+        for item in batch {
+            emit(item);
+        }
     }
-    for item in batch {
-      let _ = app.emit("card_changed", &item);
-    }
-  });
 }
 
 #[cfg(test)]
@@ -231,5 +252,34 @@ mod tests {
         assert_eq!(first.dir_name.as_deref(), Some("b"));
         assert_eq!(second.dir_name.as_deref(), Some("a"));
         assert!(q.pop(Duration::from_millis(0)).is_none());
+    }
+
+    #[test]
+    fn pusher_exits_after_stop_signal() {
+        // E3：终止信号置位后 pusher 循环必须退出——unwatch 不再泄漏线程
+        let q = Arc::new(Queue::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        q.push(CardChanged {
+            dir_name: Some("a".into()),
+            path: "/d/characters/a/card.lua".into(),
+        });
+        let stop_in_emit = Arc::clone(&stop);
+        let seen = Arc::new(Mutex::new(0usize));
+        let seen_in_emit = Arc::clone(&seen);
+        pusher_loop(Arc::clone(&q), Arc::clone(&stop), move |item| {
+            assert_eq!(item.dir_name.as_deref(), Some("a"));
+            *seen_in_emit.lock().unwrap() += 1;
+            // 推完第一条就停：循环必须就此返回，而不是吞掉后续继续死等
+            stop_in_emit.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(*seen.lock().unwrap(), 1);
+
+        // 预先停止：一条都不处理，立即返回
+        stop.store(true, Ordering::Relaxed);
+        q.push(CardChanged {
+            dir_name: Some("b".into()),
+            path: "/d/characters/b/card.lua".into(),
+        });
+        pusher_loop(q, stop, |_| panic!("停止后不得再推送"));
     }
 }

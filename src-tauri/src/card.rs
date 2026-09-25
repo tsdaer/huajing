@@ -248,6 +248,37 @@ fn lua_value_depth_exceeds(root: &Value, limit: u32) -> bool {
     walk(root, 0, limit)
 }
 
+/// 剥掉 Lua 表里的函数/userdata/thread 值（加固 E5）：default_state 只该是数据，
+/// 卡作者混进的函数值曾让整份 state 清空。Lua 侧递归 + seen 表防环。
+fn strip_nondatable(lua: &Lua, v: Value) -> Value {
+    let strip_fn: Function = match lua
+        .load(
+            r#"
+local function strip(t, seen)
+  seen = seen or {}
+  if type(t) ~= 'table' then return t end
+  if seen[t] then return nil end
+  seen[t] = true
+  local out = {}
+  for k, v in pairs(t) do
+    local tv = type(v)
+    if tv ~= 'function' and tv ~= 'userdata' and tv ~= 'thread' then
+      out[k] = strip(v, seen)
+    end
+  end
+  return out
+end
+return strip
+"#,
+        )
+        .eval()
+    {
+        Ok(f) => f,
+        Err(_) => return v, // 剥取脚本失败：按原值走既有转换（行为同旧版）
+    };
+    strip_fn.call::<Value>(v).unwrap_or(Value::Nil)
+}
+
 /// hook 改写后的 state 读回（加固 A6）：超深的本次写入整体丢弃，回落旧 state 并记诊断
 fn state_from_value(lua: &Lua, v: Value, fallback: serde_json::Value, where_: &str) -> serde_json::Value {
     if lua_value_depth_exceeds(&v, LUA_VALUE_DEPTH_LIMIT) {
@@ -257,7 +288,17 @@ fn state_from_value(lua: &Lua, v: Value, fallback: serde_json::Value, where_: &s
         );
         return fallback;
     }
-    lua.from_value(v).unwrap_or(fallback)
+    // E5：整体回退不再是静默的——卡作者要在诊断里看到为什么写入没生效
+    match lua.from_value(v) {
+        Ok(json) => json,
+        Err(e) => {
+            crate::diag::record(
+                "card.state",
+                format!("{where_}：state 读回失败，整体回退旧值：{e}"),
+            );
+            fallback
+        }
+    }
 }
 
 /// 解析 card.lua 源码（沙箱内执行；任何失败返回错误原因）
@@ -287,6 +328,9 @@ pub fn parse_card(source: &str) -> Result<CardSource, String> {
     }
     let default_state = match table.get::<Value>("state") {
         Ok(v @ Value::Table(_)) => {
+            // E5：state 里的函数值（调试残留/笔误）曾让 from_value 整体失败、
+            // default_state 清空——先剥掉非数据值再转
+            let v = strip_nondatable(&lua, v);
             if lua_value_depth_exceeds(&v, LUA_VALUE_DEPTH_LIMIT) {
                 // 加固 A6：卡 state 超深会让 from_value 打穿宿主栈——回落空表
                 crate::diag::record(

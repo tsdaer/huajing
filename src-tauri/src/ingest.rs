@@ -1594,7 +1594,9 @@ pub fn assemble_pack(input: &AssembleInputs<'_>) -> IngestPack {
         }
         efacts.insert("outcome".into(), Value::String(ev.outcome.clone()));
         if let Some(stage) = &ev.stage {
-            if input.stage_days.contains_key(stage) || !input.stage_days.is_empty() {
+            // E5：意图是「stage 名必须是已知的阶段」（stage_days 的键）——
+            // 原来的 `|| 非空` 让任何 LLM 编的阶段名都通过
+            if input.stage_days.contains_key(stage) {
                 efacts.insert("stage".into(), Value::String(stage.clone()));
             }
         }

@@ -527,9 +527,10 @@ async function copyPrompts() {
               「记忆体/残留」前提开场。之后新建会话时「第几天」填这个数即可从这里开局。
             </p>
             <div class="flex flex-col gap-2">
+              <!-- E4：同一天可以有多个切入点（收束点/死亡点），按名取键 -->
               <label
                 v-for="p in pack.canon_points"
-                :key="p.day"
+                :key="p.name"
                 class="flex cursor-pointer items-start gap-3 rounded-box border bg-base-100 px-3 py-2.5 text-xs"
                 :class="chosenDay === p.day ? 'border-primary' : 'border-base-200'"
               >

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, ref, watch } from "vue";
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue";
 import { api } from "./api";
-import { CARD_FILE_RE, cardGeneration, importNotice, importOpen, requestImport, startCardWatch } from "./cards";
+import { CARD_FILE_RE, cardGeneration, importNotice, importOpen, requestImport, startCardWatch, stopCardWatch } from "./cards";
 import Icon from "./components/Icon.vue";
 import TitleBar from "./components/TitleBar.vue";
 import { loadSessions, openNewSession, selectedId, selectSession, sessions } from "./sessions";
@@ -84,10 +84,13 @@ onMounted(async () => {
 // WebView 的 File API 拿不到本地路径，拖放的路径只能从 Tauri 的窗口事件取。
 const dragging = ref(false);
 
+// E4：拖放监听句柄保存下来，卸载时解除（原来直接丢弃）
+let unlistenDrag: (() => void) | null = null;
+
 async function startDropWatch() {
   try {
     const { getCurrentWebview } = await import("@tauri-apps/api/webview");
-    await getCurrentWebview().onDragDropEvent((event) => {
+    unlistenDrag = await getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "enter" || event.payload.type === "over") {
         dragging.value = true;
         return;
@@ -109,6 +112,12 @@ async function startDropWatch() {
     /* 浏览器 mock 下没有 Tauri 窗口事件 */
   }
 }
+
+// E4：卸载时解除拖放与卡片变更监听（句柄不再丢弃）
+onUnmounted(() => {
+  unlistenDrag?.();
+  stopCardWatch();
+});
 </script>
 
 <template>

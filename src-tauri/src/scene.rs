@@ -142,7 +142,11 @@ impl Scene {
             for (k, v) in &src.flags {
                 merged.flags.entry(k.clone()).or_insert_with(|| v.clone());
             }
-            if (src.day, src.clock.as_str()) > (merged.day, merged.clock.as_str()) {
+            // E5：时钟按「当天分钟数」比较——手写 "9:00" vs "10:00" 的字典序
+            // 会判错（'9' > '1'）；解析失败的时钟排在最前（None < Some）
+            if (src.day, crate::codex::parse_hhmm(&src.clock))
+                > (merged.day, crate::codex::parse_hhmm(&merged.clock))
+            {
                 merged.day = src.day;
                 merged.clock = src.clock.clone();
             }

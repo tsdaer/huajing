@@ -631,12 +631,17 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
         );
     }
 
-    // ---- 最终消息序列：A(1) + C1(0..1) + C3(n) + B(n) + user(0..1) ----
+    // ---- 最终消息序列：A(0..1) + C1(0..1) + C3(n) + B(n) + user(0..1) ----
     let mut messages = Vec::with_capacity(4 + keep + b_messages.len());
-    messages.push(ChatMessage {
-        role: "system".into(),
-        content: head_parts.join("\n\n"),
-    });
+    // E5：A 组子层全空时省略这条 system 消息（B 层已这么做；join 出的空串
+    // 发给模型只会白占一条消息）
+    let head = head_parts.join("\n\n");
+    if !head.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".into(),
+            content: head,
+        });
+    }
     if !c1.is_empty() {
         messages.push(ChatMessage {
             role: "system".into(),
@@ -1171,7 +1176,9 @@ fn current_affects(card_state: &serde_json::Value) -> Vec<String> {
             }
         }
     }
-    out.dedup();
+    // E5：全量保序去重（dedup() 只去相邻——affects/affect 两键拼接时跨键重复漏掉）
+    let mut seen = std::collections::BTreeSet::new();
+    out.retain(|s| seen.insert(s.clone()));
     out
 }
 

@@ -112,7 +112,7 @@ pub struct ProviderTest {
 pub async fn test_provider(provider: Provider) -> Result<ProviderTest, String> {
     // 与真实发送走同一份地址与代理规则，自检结果才对得上真实请求
     let url = llm::endpoint(&provider);
-    let proxy = store::load_settings(&root()).ok().and_then(|s| s.proxy);
+    let proxy = proxy_of(&root());
     let proxy_used = llm::build_client(proxy.as_deref())
         .await
         .map(|(_, used)| used)
@@ -532,6 +532,39 @@ fn blackboard_of(proj: &event::Projection) -> store::Blackboard {
         .unwrap_or_else(store::Blackboard::default_board)
 }
 
+/// 代理设置读取（E1 提取）：设置页手填的代理（空串视同未填）
+fn proxy_of(root: &std::path::Path) -> Option<String> {
+    store::load_settings(root)
+        .ok()
+        .and_then(|s| s.proxy)
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// 提案事件构造器（E1 提取）：`commit(.., LogBody::Proposal(ProposalEvent { .. }))`
+/// 的骨架在总结管线/收件箱/剧场里重复十余处，各处只差字段值。
+#[allow(clippy::too_many_arguments)]
+fn proposal_event(
+    turn: u64,
+    id: String,
+    op: &str,
+    kind: &str,
+    origin: &str,
+    payload: Option<serde_json::Value>,
+    note: Option<String>,
+    ts: u64,
+) -> LogBody {
+    LogBody::Proposal(event::ProposalEvent {
+        turn,
+        id,
+        op: op.into(),
+        kind: kind.into(),
+        origin: origin.into(),
+        payload,
+        note,
+        ts,
+    })
+}
+
 /// 会话当前的聚焦场景（多场景会话才有；单场景/老会话 = None，一切读侧退化为世界层）
 fn scene_ctx(proj: &event::Projection) -> Option<String> {
     proj.active_scene_id().map(str::to_string)
@@ -908,6 +941,7 @@ fn rebuild_from(
                                     None,
                                     meta.seed,
                                     None,
+                                    None,
                                 )
                                 .0
                                 {
@@ -1069,6 +1103,7 @@ fn rebuild_from(
                     None,
                     meta.seed,
                     msg_scene.as_deref(),
+                    None,
                 )
                 .0
                 {
@@ -1336,10 +1371,7 @@ async fn semantic_hits_for(
         Ok(Some(p)) => p,
         _ => return Vec::new(),
     };
-    let proxy = store::load_settings(root)
-        .ok()
-        .and_then(|s| s.proxy)
-        .filter(|p| !p.trim().is_empty());
+    let proxy = proxy_of(root);
     let query_text = query_text.trim();
     if query_text.is_empty() {
         return Vec::new();
@@ -1503,10 +1535,12 @@ fn display_role(role: &str, card_name: &str) -> String {
     }
 }
 
-/// 状态树结构缓存（Tauri State）：卡目录名 → (源码指纹, 解析出的树)。
+/// 状态树结构缓存（Tauri State）：卡目录名 → (源码指纹, 解析出的树, shape JSON)。
 /// 卡源每轮从磁盘重读（热加载的前提），所以指纹就是源码本身。
+/// shape 里有 has_enter/has_exit 布尔位——状态钩子的「有没有」问题从此走缓存
+///（加固 E2），不再每问一次重跑整卡。
 #[derive(Default)]
-pub struct TreeCache(Mutex<HashMap<String, (u64, Arc<statetree::StateTree>)>>);
+pub struct TreeCache(Mutex<HashMap<String, (u64, Arc<statetree::StateTree>, serde_json::Value)>>);
 
 fn source_fingerprint(source: &str) -> u64 {
     let mut fp: u64 = 1469598103934665603;
@@ -1524,13 +1558,14 @@ fn load_tree(
     let fp = source_fingerprint(&loaded.source);
     if let Some(cache) = cache {
         if let Ok(map) = cache.0.lock() {
-            if let Some((cached, tree)) = map.get(&loaded.dir_name) {
+            if let Some((cached, tree, _shape)) = map.get(&loaded.dir_name) {
                 if *cached == fp {
                     return Some(tree.clone());
                 }
             }
         }
     }
+    let cached_fp = fp;
     let shape = match card::state_tree_shape(&loaded.source) {
         Ok(s) => s,
         Err(e) => {
@@ -1558,10 +1593,42 @@ fn load_tree(
     }
     if let Some(cache) = cache {
         if let Ok(mut map) = cache.0.lock() {
-            map.insert(loaded.dir_name.clone(), (fp, tree.clone()));
+            map.insert(loaded.dir_name.clone(), (cached_fp, tree.clone(), shape));
         }
     }
     Some(tree)
+}
+
+/// 该状态有没有可执行的 on_enter/on_exit 钩子（加固 E2）：has_enter/has_exit
+/// 布尔位随树一起缓存在 TreeCache；缓存未命中（重放等无缓存路径）回退全卡
+/// 重跑，行为不变。
+fn has_state_hook(
+    loaded: &card::LoadedCard,
+    cache: Option<&TreeCache>,
+    state_id: &str,
+    kind: &str,
+) -> bool {
+    if let Some(cache) = cache {
+        let fp = source_fingerprint(&loaded.source);
+        if let Ok(map) = cache.0.lock() {
+            if let Some((cached, _, shape)) = map.get(&loaded.dir_name) {
+                if *cached == fp {
+                    let key = match kind {
+                        "on_enter" => "has_enter",
+                        "on_exit" => "has_exit",
+                        _ => return card::card_has_state_hook(&loaded.source, state_id, kind),
+                    };
+                    return shape
+                        .get("states")
+                        .and_then(|s| s.get(state_id))
+                        .and_then(|st| st.get(key))
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
+                }
+            }
+        }
+    }
+    card::card_has_state_hook(&loaded.source, state_id, kind)
 }
 
 /// 当前活跃路径：转移事件是权威（投影折叠出「最后一次转移的去向」），
@@ -1629,6 +1696,7 @@ fn advance_state_tree(
     seed: u64,
     // 转移发生的场景（M3.2）：判据环境读该场景分区，reveal 见证者 = 该场景在场者
     scene: Option<&str>,
+    tree_cache: Option<&TreeCache>,
 ) -> (Vec<LogBody>, Vec<llm::UiEmit>) {
     let mut emits: Vec<llm::UiEmit> = Vec::new();
     let path = active_path_of(proj, tree, character);
@@ -1659,7 +1727,7 @@ fn advance_state_tree(
 
     // ① on_exit（旧叶）
     let (exit_body, exit_emits) = run_state_hook(
-        loaded, &local, character, &leaf, "on_exit", event_name, turn, seed, scene,
+        loaded, &local, character, &leaf, "on_exit", event_name, turn, seed, scene, tree_cache,
     );
     emits.extend(exit_emits);
     if let Some(body) = exit_body {
@@ -1684,7 +1752,7 @@ fn advance_state_tree(
     // ③ on_enter（新叶）
     let to_leaf = to_path.last().cloned().unwrap_or_default();
     let (enter_body, enter_emits) = run_state_hook(
-        loaded, &local, character, &to_leaf, "on_enter", event_name, turn, seed, scene,
+        loaded, &local, character, &to_leaf, "on_enter", event_name, turn, seed, scene, tree_cache,
     );
     emits.extend(enter_emits);
     if let Some(body) = enter_body {
@@ -1731,8 +1799,9 @@ fn run_state_hook(
     turn: u64,
     seed: u64,
     scene: Option<&str>,
+    tree_cache: Option<&TreeCache>,
 ) -> (Option<LogBody>, Vec<llm::UiEmit>) {
-    if !card::card_has_state_hook(&loaded.source, state_id, kind) {
+    if !has_state_hook(loaded, tree_cache, state_id, kind) {
         return (None, Vec::new()); // 卡上没写这个钩子：不新建 Lua 实例
     }
     let env = tree_env(proj, character, loaded, event_name, None, scene);
@@ -2584,10 +2653,7 @@ async fn stream_reply(
     let speaker_name = cast.display_name(speaker);
 
     // 流式补全（取消检查在每个响应块之间）。代理跟随设置页：空则自动探测。
-    let proxy = store::load_settings(root)
-        .ok()
-        .and_then(|s| s.proxy)
-        .filter(|p| !p.trim().is_empty());
+    let proxy = proxy_of(root);
     let chat = assembly.messages.clone();
     // C3：带空正文棘轮——推理模型把服务端默认预算耗在思考上时（finish=length、
     // 正文空），自动带翻倍预算重试；C2：失败时已生成的增量在 failure.partial 里
@@ -3220,6 +3286,7 @@ fn finalize_turn(
                 active_entities.as_ref(),
                 meta.seed,
                 scene,
+                tree_cache,
             );
             // 转移的界面事件（on_enter 的 ui.emit）与本轮钩子事件一起回给前端
             report.ui_events.extend(emits);
@@ -4454,8 +4521,6 @@ pub async fn ingest_extract(
             tag_map.values().any(|t| t == w)
         })
     };
-    let _ = &name;
-
     // ---- ④ 机械映射（确定性）----
     let infobox_sections = pick(&["infobox"]);
     let infobox = ingest::parse_infobox(&infobox_sections);
@@ -4633,10 +4698,7 @@ async fn run_ingest_stage(
     max_tokens: u32,
 ) -> Result<String, String> {
     let provider = pick_util_provider(root)?;
-    let proxy = store::load_settings(root)
-        .ok()
-        .and_then(|s| s.proxy)
-        .filter(|p| !p.trim().is_empty());
+    let proxy = proxy_of(root);
     llm::chat_complete(
         &provider,
         &[llm::ChatMessage {
@@ -6113,10 +6175,7 @@ async fn maybe_improv(
         .collect();
     let prompt_text = complete::build_improv_prompt(entity, &world_lines, &seed);
     let provider = pick_util_provider(root)?;
-    let proxy = store::load_settings(root)
-        .ok()
-        .and_then(|s| s.proxy)
-        .filter(|p| !p.trim().is_empty());
+    let proxy = proxy_of(root);
     let raw = llm::chat_complete(
         &provider,
         &[llm::ChatMessage {
@@ -6223,10 +6282,7 @@ pub async fn codex_complete(
     };
     let prompt_text = complete::build_completion_prompt(&ctx);
     let provider = pick_util_provider(&root)?;
-    let proxy = store::load_settings(&root)
-        .ok()
-        .and_then(|s| s.proxy)
-        .filter(|p| !p.trim().is_empty());
+    let proxy = proxy_of(&root);
     let raw = llm::chat_complete(
         &provider,
         &[llm::ChatMessage {
@@ -6309,10 +6365,7 @@ pub async fn codex_semantic_check(
         .map_err(|e| e.to_string())?;
     let prompt_text = complete::build_semantic_check_prompt(&fact_brief, &proposal_brief);
     let provider = pick_util_provider(&root)?;
-    let proxy = store::load_settings(&root)
-        .ok()
-        .and_then(|s| s.proxy)
-        .filter(|p| !p.trim().is_empty());
+    let proxy = proxy_of(&root);
     let raw = llm::chat_complete(
         &provider,
         &[llm::ChatMessage {
@@ -6386,16 +6439,16 @@ fn codex_complete_apply_core(
             log,
             root,
             &meta,
-            LogBody::Proposal(event::ProposalEvent {
+            proposal_event(
                 turn,
                 id,
-                op: "accept".into(),
-                kind: "new_fact".into(),
-                origin: "manual".into(),
-                payload: None,
-                note: Some("补全卡片接受".into()),
-                ts: store::unix_now(),
-            }),
+                "accept",
+                "new_fact",
+                "manual",
+                None,
+                Some("补全卡片接受".into()),
+                store::unix_now(),
+            ),
         )?;
         materialize_accepted(root, &world, "new_fact", payload);
         applied += 1;
@@ -6586,7 +6639,7 @@ fn resolve_thread_at(
     origin: &str,
 ) -> Result<serde_json::Value, String> {
     let character = first_character(meta)?;
-    let loaded = card::load_card(root, &character).map_err(|e| e.to_string())?;
+    // E2：loaded（整卡 + Lua 解析）加载后从未用——手动收线不再白读一次卡
     let proj = project_session(log, root, meta)?;
     let board = blackboard_of(&proj);
     let turn = proj.last_message().map(|m| m.turn).unwrap_or(0);
@@ -6678,6 +6731,7 @@ fn resolve_thread_at(
             meta.seed,
             // 手动收线是全局事件：所有场景的角色树都要求值，不限定场景
             None,
+            Some(tree_cache),
         );
         for body in events {
             commit(log, root, meta, body)?;
@@ -6988,10 +7042,11 @@ fn inspector_payload(
             .collect()
     };
     let window_text = scan_window_text(&proj.messages, &loaded.card.name);
+    // E2：同一世界只 load 一次 codex（原来 mentions 与实体清单各 load 一次）
+    let world = session_world(meta);
+    let cx = load_codex(root, codex_cache, &world);
     let mut mentions: Vec<String> = Vec::new();
-    if let Some(cx) = codex_cache.map(|c| load_codex(root, Some(c), &session_world(meta))) {
-        mentions.extend(cx.scan_mentions(&window_text).into_iter().map(|m| m.id));
-    }
+    mentions.extend(cx.scan_mentions(&window_text).into_iter().map(|m| m.id));
     mentions.extend(
         proj.messages
             .iter()
@@ -7042,8 +7097,6 @@ fn inspector_payload(
 
     // 设定集：世界清单（草稿与正史都列，注入只认 canon）
     // M3.8：每个实体带缺失 facet 清单（实体编辑器高亮 +「补全」按钮的数据源）
-    let world = session_world(meta);
-    let cx = load_codex(root, codex_cache, &world);
     let entities: Vec<serde_json::Value> = cx
         .entities()
         .iter()
@@ -7150,16 +7203,16 @@ fn decide_proposal_core(
         log,
         root,
         &meta,
-        LogBody::Proposal(event::ProposalEvent {
+        proposal_event(
             turn,
-            id: id.clone(),
-            op: if accept { "accept" } else { "reject" }.into(),
-            kind: String::new(),
-            origin: "manual".into(),
-            payload: None,
+            id.clone(),
+            if accept { "accept" } else { "reject" },
+            "",
+            "manual",
+            None,
             note,
-            ts: store::unix_now(),
-        }),
+            store::unix_now(),
+        ),
     )?;
     if accept {
         if let Some(entry) = proj.proposals.get(&id) {
@@ -7803,23 +7856,21 @@ fn apply_summary_outcome_locked(
         if a.finding == summarize::AUDIT_FACT {
             continue; // 与 codex 合并处理，见下
         }
-        bodies.push(
-            LogBody::Proposal(event::ProposalEvent {
-                turn: to_turn,
-                id: format!("audit.{}.{}.{}", a.target, to_turn, i),
-                op: "propose".into(),
-                kind: "audit".into(),
-                origin: "pipeline".into(),
-                payload: Some(serde_json::json!({
-                    "finding": a.finding,
-                    "target": a.target,
-                    "facet": a.facet,
-                    "evidence": a.evidence,
-                })),
-                note: Some(a.evidence.clone()),
-                ts,
-            }),
-        );
+        bodies.push(proposal_event(
+            to_turn,
+            format!("audit.{}.{}.{}", a.target, to_turn, i),
+            "propose",
+            "audit",
+            "pipeline",
+            Some(serde_json::json!({
+                "finding": a.finding,
+                "target": a.target,
+                "facet": a.facet,
+                "evidence": a.evidence,
+            })),
+            Some(a.evidence.clone()),
+            ts,
+        ));
         applied += 1;
     }
     let mut codex_drafts: Vec<summarize::CodexDraft> = outcome.codex.clone();
@@ -7857,18 +7908,16 @@ fn apply_summary_outcome_locked(
                 "summary",
                 format!("设定提案与辨识点冲突，已驳回：{}（{}）", draft.target, reason),
             );
-            bodies.push(
-                LogBody::Proposal(event::ProposalEvent {
-                    turn: to_turn,
-                    id,
-                    op: "reject".into(),
-                    kind: draft.kind.clone(),
-                    origin: "pipeline".into(),
-                    payload: Some(payload),
-                    note: Some(format!("与辨识点冲突，自动驳回：{reason}")),
-                    ts,
-                }),
-            );
+            bodies.push(proposal_event(
+                to_turn,
+                id,
+                "reject",
+                &draft.kind,
+                "pipeline",
+                Some(payload),
+                Some(format!("与辨识点冲突，自动驳回：{reason}")),
+                ts,
+            ));
             applied += 1;
             continue;
         }
@@ -7907,46 +7956,40 @@ fn apply_summary_outcome_locked(
             grade if grade == complete::CaptureGrade::MinorFact && auto_minor => {
                 // 既有实体的小事实 + 用户开了自动接受：连落 propose 与 accept 两条事件
                 // （动作可溯源），物化与手动确认同一条路
-                bodies.push(
-                    LogBody::Proposal(event::ProposalEvent {
-                        turn: to_turn,
-                        id: id.clone(),
-                        op: "propose".into(),
-                        kind: draft.kind.clone(),
-                        origin: "pipeline".into(),
-                        payload: Some(payload.clone()),
-                        note: None,
-                        ts,
-                    }),
-                );
-                bodies.push(
-                    LogBody::Proposal(event::ProposalEvent {
-                        turn: to_turn,
-                        id,
-                        op: "accept".into(),
-                        kind: draft.kind.clone(),
-                        origin: "pipeline".into(),
-                        payload: None,
-                        note: Some("小事实自动接受（设置：运行期自动接受）".into()),
-                        ts,
-                    }),
-                );
+                bodies.push(proposal_event(
+                    to_turn,
+                    id.clone(),
+                    "propose",
+                    &draft.kind,
+                    "pipeline",
+                    Some(payload.clone()),
+                    None,
+                    ts,
+                ));
+                bodies.push(proposal_event(
+                    to_turn,
+                    id,
+                    "accept",
+                    &draft.kind,
+                    "pipeline",
+                    None,
+                    Some("小事实自动接受（设置：运行期自动接受）".into()),
+                    ts,
+                ));
                 materialize_accepted(root, &world, &draft.kind, payload);
                 applied += 2;
             }
             _ => {
-                bodies.push(
-                    LogBody::Proposal(event::ProposalEvent {
-                        turn: to_turn,
-                        id,
-                        op: "propose".into(),
-                        kind: draft.kind.clone(),
-                        origin: "pipeline".into(),
-                        payload: Some(payload),
-                        note: None,
-                        ts,
-                    }),
-                );
+                bodies.push(proposal_event(
+                    to_turn,
+                    id,
+                    "propose",
+                    &draft.kind,
+                    "pipeline",
+                    Some(payload),
+                    None,
+                    ts,
+                ));
                 applied += 1;
             }
         }
@@ -7961,18 +8004,16 @@ fn apply_summary_outcome_locked(
             "importance": draft.importance,
             "resurface": draft.resurface_value(),
         });
-        bodies.push(
-            LogBody::Proposal(event::ProposalEvent {
-                turn: to_turn,
-                id: format!("thread.{}.{}.{}", to_turn, i, draft.title),
-                op: "propose".into(),
-                kind: "thread".into(),
-                origin: "pipeline".into(),
-                payload: Some(payload),
-                note: Some(draft.framing.clone()),
-                ts,
-            }),
-        );
+        bodies.push(proposal_event(
+            to_turn,
+            format!("thread.{}.{}.{}", to_turn, i, draft.title),
+            "propose",
+            "thread",
+            "pipeline",
+            Some(payload),
+            Some(draft.framing.clone()),
+            ts,
+        ));
         applied += 1;
     }
 
@@ -7984,18 +8025,16 @@ fn apply_summary_outcome_locked(
             "intensity": draft.intensity,
             "source": draft.source,
         });
-        bodies.push(
-            LogBody::Proposal(event::ProposalEvent {
-                turn: to_turn,
-                id: format!("psyche.{}.{}.{}", to_turn, i, draft.name),
-                op: "propose".into(),
-                kind: "psyche".into(),
-                origin: "pipeline".into(),
-                payload: Some(payload),
-                note: None,
-                ts,
-            }),
-        );
+        bodies.push(proposal_event(
+            to_turn,
+            format!("psyche.{}.{}.{}", to_turn, i, draft.name),
+            "propose",
+            "psyche",
+            "pipeline",
+            Some(payload),
+            None,
+            ts,
+        ));
         applied += 1;
     }
 
@@ -8073,10 +8112,7 @@ async fn run_summary(
     };
     let prompt_text = summarize::build_prompt(&ctx, &batch);
 
-    let proxy = store::load_settings(&root)
-        .ok()
-        .and_then(|s| s.proxy)
-        .filter(|p| !p.trim().is_empty());
+    let proxy = proxy_of(&root);
     let raw = llm::chat_complete(
         &provider,
         &[llm::ChatMessage {
