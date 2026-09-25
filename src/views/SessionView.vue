@@ -11,6 +11,7 @@ import type {
   SessionMeta,
 } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
+import EmptyState from "../components/EmptyState.vue";
 import Icon from "../components/Icon.vue";
 import SceneDialog from "../components/SceneDialog.vue";
 import SceneBar from "../components/SceneBar.vue";
@@ -613,7 +614,7 @@ watch(cardGeneration, () => {
             >
               +{{ speakers.length - 1 }} 同台
             </span>
-            <span class="status status-xs status-success"></span>
+            <span class="status status-xs" :class="generating ? 'status-warning animate-pulse' : 'status-success'"></span>
             <span class="text-xs text-base-content/50">{{ generating ? "生成中" : "在场" }}</span>
             <!-- 表情位占位（M1.6）：卡片 api.ui.emit("emotion", …) 的结果 -->
             <span
@@ -685,7 +686,7 @@ watch(cardGeneration, () => {
               </span>
               <span class="h-px flex-1 bg-base-content/15"></span>
             </li>
-            <li v-else class="chat group" :class="m.role === 'user' ? 'chat-end' : 'chat-start'">
+            <li v-else class="chat group msg-in" :class="m.role === 'user' ? 'chat-end' : 'chat-start'">
             <div class="chat-image avatar avatar-placeholder">
               <div
                 class="w-9 rounded-full"
@@ -723,20 +724,33 @@ watch(cardGeneration, () => {
               >
                 {{ m.content }}
               </div>
-              <div class="chat-footer mt-1 flex items-center gap-2 text-[11px] text-base-content/40">
+              <div class="chat-footer mt-1 flex items-center gap-2 text-[11px] tabular-nums text-base-content/40">
                 <span v-if="fmtTime(m.ts)">{{ fmtTime(m.ts) }}</span>
                 <span
                   v-if="!generating"
-                  class="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 max-lg:opacity-70"
+                  class="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 max-lg:opacity-70"
                 >
-                  <button class="btn btn-ghost btn-xs" @click="startEdit(i)">
-                    <Icon name="edit" :size="13" />编辑
+                  <button
+                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-bottom"
+                    data-tip="编辑"
+                    @click="startEdit(i)"
+                  >
+                    <Icon name="edit" :size="13" />
                   </button>
-                  <button v-if="canReroll(i, m)" class="btn btn-ghost btn-xs" @click="reroll">
-                    <Icon name="refresh" :size="13" />{{ m.role === "char" ? "重roll" : "重试生成" }}
+                  <button
+                    v-if="canReroll(i, m)"
+                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-bottom"
+                    :data-tip="m.role === 'char' ? '重roll 这一轮' : '重试生成'"
+                    @click="reroll"
+                  >
+                    <Icon name="refresh" :size="13" />
                   </button>
-                  <button class="btn btn-ghost btn-xs text-error" @click="removeMsg(i)">
-                    <Icon name="trash" :size="13" />删除
+                  <button
+                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-bottom"
+                    data-tip="删除"
+                    @click="removeMsg(i)"
+                  >
+                    <Icon name="trash" :size="13" class="text-error" />
                   </button>
                 </span>
               </div>
@@ -751,7 +765,7 @@ watch(cardGeneration, () => {
               <span class="flex-none text-xs tracking-wide text-base-content/50">{{ scheduleNote }}</span>
               <span class="h-px flex-1 bg-base-content/15"></span>
             </li>
-            <li v-for="(s, si) in streams" :key="`stream-${si}-${s.name}`" class="chat chat-start">
+            <li v-for="(s, si) in streams" :key="`stream-${si}-${s.name}`" class="chat chat-start msg-in">
               <div class="chat-image avatar avatar-placeholder">
                 <div class="w-9 rounded-full" :style="avatarStyle(s.name)">
                   <span class="text-xs">{{ initial(s.name) }}</span>
@@ -768,24 +782,28 @@ watch(cardGeneration, () => {
                 正在写…
               </div>
             </li>
-            <!-- 第一位还没开口：先给一条生成中提示，气泡等第一个增量到了再出现 -->
-            <li v-if="streams.length === 0" class="chat chat-start">
-              <div class="chat-image avatar avatar-placeholder">
-                <div class="w-9 rounded-full bg-neutral text-neutral-content">
-                  <span class="text-xs">{{ initial(speaker || cardName) }}</span>
-                </div>
+            <!-- 第一位还没开口：骨架占位——等首字到了才换成真实流式气泡（导演调度插页在其上方） -->
+            <li v-if="streams.length === 0" class="chat chat-start msg-in">
+              <div class="chat-image">
+                <div class="size-9 rounded-full skeleton"></div>
               </div>
-              <div class="chat-bubble border border-primary/40 bg-base-300">
-                <span class="loading loading-dots loading-sm text-primary"></span>
+              <div class="chat-header">
+                <div class="skeleton h-2.5 w-14"></div>
+              </div>
+              <div class="chat-bubble flex flex-col gap-2 border border-base-300 bg-base-200">
+                <div class="skeleton h-3 w-52"></div>
+                <div class="skeleton h-3 w-40"></div>
+                <div class="skeleton h-3 w-28"></div>
               </div>
             </li>
           </template>
 
-          <li
-            v-if="sceneMessagesView.length === 0 && !generating"
-            class="mt-10 self-center text-sm text-base-content/45"
-          >
-            还没有消息。说点什么，把这场戏开起来。
+          <li v-if="sceneMessagesView.length === 0 && !generating" class="mt-8 self-stretch px-2">
+            <EmptyState
+              icon="sparkle"
+              title="这场戏还没开"
+              desc="说点什么，把这场戏开起来；或交给「剧场」，导演按起承转合自动跑一轮数预算。"
+            />
           </li>
         </ul>
 
@@ -794,7 +812,7 @@ watch(cardGeneration, () => {
           v-if="messages.length > 0"
           class="flex flex-none flex-wrap items-center justify-between gap-2 border-t border-base-300 px-3 py-2"
         >
-          <span class="text-[11px] text-base-content/45">
+          <span class="text-[11px] tabular-nums text-base-content/45">
             第 {{ page }}/{{ pageCount }} 页 · 共 {{ sceneMessagesView.length }} 条 · 每页 {{ PAGE_SIZE }} 条
           </span>
           <div class="join">
@@ -817,31 +835,36 @@ watch(cardGeneration, () => {
           </div>
         </div>
 
-        <!-- 剧场模式条（M3.6 · 设计 §10.5）：导演树阶段 + 轮数预算进度 -->
-        <div
-          v-if="theater?.on"
-          class="flex flex-none flex-wrap items-center gap-2 border-t border-base-300 px-3 py-1.5 text-xs"
-        >
-          <span class="flex-none font-medium tracking-wide text-primary">剧场</span>
-          <span class="flex-none text-base-content/80">「{{ theater?.path[theater?.path.length - 1] || "…" }}」</span>
-          <span class="min-w-0 flex-1 truncate text-base-content/45" :title="theater?.stage_directive">
-            {{ theater?.stage_directive }}
-          </span>
-          <progress
-            class="progress progress-primary w-24 flex-none"
-            :value="theater?.used"
-            :max="theater?.budget || 1"
-            aria-label="剧场进度"
-          ></progress>
-          <span class="flex-none text-base-content/45">{{ theater?.used }}/{{ theater?.budget }} 轮</span>
-          <button
-            class="btn btn-ghost btn-xs flex-none"
-            :disabled="generating"
-            data-tip="停掉自动轮次（已走到的阶段保留）"
-            @click="theaterCtl.setTheater(meta.id, false)"
+        <!-- 剧场模式条（M3.6 · 设计 §10.5）：导演树阶段 + 轮数预算进度；卡片化避免"日志行"观感 -->
+        <div v-if="theater?.on" class="flex-none px-3 pb-1">
+          <div
+            class="flex flex-wrap items-center gap-2 rounded-box border border-primary/25 bg-primary/8 px-3 py-2 text-xs"
           >
-            收棚
-          </button>
+            <span class="flex flex-none items-center gap-1.5 font-medium tracking-wide text-primary">
+              <Icon name="film" :size="14" />剧场
+            </span>
+            <span class="badge badge-sm badge-soft badge-primary flex-none">
+              {{ theater?.path[theater?.path.length - 1] || "…" }}
+            </span>
+            <span class="min-w-0 flex-1 truncate text-base-content/55" :title="theater?.stage_directive">
+              {{ theater?.stage_directive }}
+            </span>
+            <progress
+              class="progress progress-primary w-24 flex-none"
+              :value="theater?.used"
+              :max="theater?.budget || 1"
+              aria-label="剧场进度"
+            ></progress>
+            <span class="flex-none tabular-nums text-base-content/50">{{ theater?.used }}/{{ theater?.budget }} 轮</span>
+            <button
+              class="btn btn-ghost btn-xs tooltip tooltip-top flex-none"
+              :disabled="generating"
+              data-tip="停掉自动轮次（已走到的阶段保留）"
+              @click="theaterCtl.setTheater(meta.id, false)"
+            >
+              收棚
+            </button>
+          </div>
         </div>
 
         <!-- 输入区：daisyUI textarea + 圆形发送键；多角色时带发言权选择（M3.4 · 设计 §10.5） -->
@@ -928,11 +951,15 @@ watch(cardGeneration, () => {
             </button>
           </div>
           <p class="mt-2 mb-0 flex flex-wrap items-center gap-1.5 text-[11px] text-base-content/45">
-            <kbd class="kbd kbd-xs">Enter</kbd> 发送 ·
-            <kbd class="kbd kbd-xs">Shift</kbd>+<kbd class="kbd kbd-xs">Enter</kbd> 换行
+            <span class="flex items-center gap-1">
+              <kbd class="kbd kbd-xs">Enter</kbd>发送
+            </span>
+            <span class="flex items-center gap-1">
+              <kbd class="kbd kbd-xs">Shift</kbd>+<kbd class="kbd kbd-xs">Enter</kbd>换行
+            </span>
             <button
               v-if="!theater?.on"
-              class="btn btn-ghost btn-xs ml-auto"
+              class="btn btn-ghost btn-xs tooltip tooltip-top ml-auto"
               :disabled="generating"
               data-tip="剧场模式：导演树起承转合自动跑一轮数预算（缺省 20 轮），多场景时交叉剪辑"
               @click="theaterCtl.setTheater(meta.id, true)"
@@ -943,11 +970,12 @@ watch(cardGeneration, () => {
         </form>
       </section>
 
-      <!-- 右侧抽屉：黑板 / 记忆检查器 -->
-      <aside
-        v-if="panel"
-        class="card card-border flex w-80 flex-none flex-col overflow-hidden bg-base-100 max-[900px]:absolute max-[900px]:inset-y-0 max-[900px]:right-0 max-[900px]:z-10 max-[900px]:w-[min(340px,92vw)]"
-      >
+      <!-- 右侧抽屉：黑板 / 记忆检查器（开合滑入过渡；窄屏浮层化时加投影） -->
+      <Transition name="slide-left">
+        <aside
+          v-if="panel"
+          class="card card-border flex w-80 flex-none flex-col overflow-hidden bg-base-100 max-[900px]:absolute max-[900px]:inset-y-0 max-[900px]:right-0 max-[900px]:z-10 max-[900px]:w-[min(340px,92vw)] max-[900px]:shadow-2xl"
+        >
         <header class="flex flex-none items-center justify-between gap-2 border-b border-base-300 px-3 py-2">
           <div role="tablist" class="tabs tabs-box tabs-xs">
             <button role="tab" class="tab" :class="{ 'tab-active': panel === 'board' }" @click="panel = 'board'">
@@ -1021,7 +1049,8 @@ watch(cardGeneration, () => {
             @clear-events="clearHookEvents"
           />
         </KeepAlive>
-      </aside>
+        </aside>
+      </Transition>
     </div>
 
     <!-- M3.11 场景操作向导：新建 / 分场 / 合场 / 编辑 -->

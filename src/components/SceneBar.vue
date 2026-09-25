@@ -29,29 +29,43 @@ function sceneTip(sc: Scene): string {
 
 <template>
   <div class="card card-border flex-none bg-base-100">
-    <div class="flex items-center gap-1 overflow-x-auto p-2">
-      <button
-        v-for="sc in scenes"
-        :key="sc.id"
-        class="btn btn-sm h-auto min-h-0 flex-col items-start gap-0 px-3 py-1.5 text-left"
-        :class="[
-          sc.id === activeScene ? 'btn-primary' : 'btn-ghost',
-          sc.status === 'merged' ? 'btn-disabled opacity-50' : '',
-        ]"
-        :disabled="sc.status === 'merged' || busy"
-        :data-tip="sceneTip(sc)"
-        @click="emit('switch', sc)"
+    <div class="flex items-center gap-1 p-2">
+      <!-- 场景滚动带：多于一屏才出现右缘渐隐，暗示可横滑；滚动条隐藏（截断即暗示） -->
+      <div
+        class="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        :class="
+          scenes.length > 3
+            ? '[mask-image:linear-gradient(to_right,black_0%,black_calc(100%-28px),transparent_100%)]'
+            : ''
+        "
       >
-        <span class="flex items-center gap-1 text-xs font-semibold">
-          {{ sc.title || sc.place || sc.id }}
-          <span v-if="sc.status === 'frozen'" class="badge badge-xs badge-ghost">冻结</span>
-          <span v-else-if="sc.status === 'merged'" class="badge badge-xs badge-ghost">已并入</span>
-        </span>
-        <span class="text-[10px] font-normal opacity-70">
-          {{ sc.clock ? `第${sc.day}天 ${sc.clock}` : `第${sc.day}天` }} · {{ sc.place || "地点未定" }}
-        </span>
-      </button>
-      <div class="ml-auto flex flex-none items-center gap-1 pl-2">
+        <button
+          v-for="sc in scenes"
+          :key="sc.id"
+          class="btn btn-sm tooltip tooltip-bottom h-auto min-h-0 flex-col items-start gap-0 px-3 py-1.5 text-left"
+          :class="[
+            sc.id === activeScene ? 'btn-primary' : 'btn-ghost',
+            sc.status === 'merged' ? 'btn-disabled opacity-50' : '',
+          ]"
+          :disabled="sc.status === 'merged' || busy"
+          :data-tip="sceneTip(sc)"
+          @click="emit('switch', sc)"
+        >
+          <span class="flex items-center gap-1 text-xs font-semibold">
+            {{ sc.title || sc.place || sc.id }}
+            <span v-if="sc.status === 'frozen'" class="badge badge-xs badge-ghost gap-0.5">
+              <Icon name="pin" :size="10" />冻结
+            </span>
+            <span v-else-if="sc.status === 'merged'" class="badge badge-xs badge-ghost gap-0.5">
+              <Icon name="merge" :size="10" />已并入
+            </span>
+          </span>
+          <span class="text-[10px] font-normal opacity-70">
+            {{ sc.clock ? `第${sc.day}天 ${sc.clock}` : `第${sc.day}天` }} · {{ sc.place || "地点未定" }}
+          </span>
+        </button>
+      </div>
+      <div class="flex flex-none items-center gap-1 pl-1">
         <button
           class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
           data-tip="编辑当前场景：标题/地点/在场者/局部时钟"

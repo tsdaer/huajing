@@ -164,7 +164,8 @@ onUnmounted(() => {
     <div class="drawer min-h-0 flex-1 lg:drawer-open">
       <input id="shell-drawer" v-model="drawerOpen" type="checkbox" class="drawer-toggle" />
 
-      <div class="drawer-content flex h-full min-h-0 flex-col bg-base-200">
+      <!-- overflow-x-clip：右缘按钮的 tooltip 伪元素会伸出视口，外壳层禁止横向滚动（tooltip 越界部分裁掉） -->
+      <div class="drawer-content flex h-full min-h-0 flex-col overflow-x-clip bg-base-200">
         <!-- 顶栏：navbar（左：折叠按钮 + 页面标题；右：面包屑 + 状态） -->
         <header class="navbar flex-none gap-2 border-b border-base-300 bg-base-100 px-3 lg:px-6">
           <div class="navbar-start gap-2">
