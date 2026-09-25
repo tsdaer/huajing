@@ -102,3 +102,18 @@
 .msg-in {
   animation: msg-in 0.18s ease-out;
 }
+
+/* 弹出强调（拖放提示框等）：轻微缩放淡入 */
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.pop-in {
+  animation: pop-in 0.18s ease-out;
+}

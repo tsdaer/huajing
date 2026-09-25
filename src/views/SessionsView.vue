@@ -13,6 +13,7 @@ import {
 } from "../sessions";
 import type { CardSummary, Persona } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
+import EmptyState from "../components/EmptyState.vue";
 import Icon from "../components/Icon.vue";
 import SessionView from "./SessionView.vue";
 
@@ -112,22 +113,20 @@ async function create() {
       <!-- B4：:key 强制按会话重建组件，快速切换时旧实例的迟到写入不可能串台 -->
       <SessionView v-if="selectedSession" :key="selectedSession.id" :meta="selectedSession" />
 
-      <div
+      <EmptyState
         v-else
-        class="card card-dash flex flex-1 flex-col items-center justify-center gap-2 bg-base-100 p-8 text-center"
+        icon="chat"
+        title="挑一场戏，接着往下演"
+        desc="在左侧「会话」里选一场，或者新建一场。"
+        class="flex-1"
       >
-        <Icon name="sparkle" :size="24" class="text-base-content/25" />
-        <p class="m-0 text-sm text-base-content/50">挑一场戏，接着往下演。</p>
-        <p class="m-0 text-xs text-base-content/40">在左侧「会话」里选一场，或者新建一场。</p>
-        <div class="mt-1 flex items-center gap-2">
-          <button class="btn btn-primary btn-sm" @click="openNewSession">
-            <Icon name="plus" :size="15" />新建会话
-          </button>
-          <button class="btn btn-sm" @click="importOpen = true">
-            <Icon name="database" :size="15" />导入 ST 卡
-          </button>
-        </div>
-      </div>
+        <button class="btn btn-primary btn-sm" @click="openNewSession">
+          <Icon name="plus" :size="15" />新建会话
+        </button>
+        <button class="btn btn-sm" @click="importOpen = true">
+          <Icon name="database" :size="15" />导入 ST 卡
+        </button>
+      </EmptyState>
     </div>
 
     <!-- 新建会话弹窗（由顶栏按钮打开） -->

@@ -150,16 +150,18 @@ onUnmounted(() => {
     </div>
 
     <!-- 拖入卡文件的提示（M1.8）：松手即打开导入向导 -->
-    <div
-      v-if="dragging"
-      class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-base-300/70 backdrop-blur-xs"
-    >
-      <div class="rounded-box border-2 border-dashed border-primary bg-base-100 px-8 py-6 text-center">
-        <Icon name="sparkle" :size="24" class="mx-auto text-primary" />
-        <p class="mt-2 mb-0 text-sm font-medium">松手导入角色卡</p>
-        <p class="mb-0 text-xs text-base-content/50">SillyTavern 的 PNG 或 JSON</p>
+    <Transition name="fade">
+      <div
+        v-if="dragging"
+        class="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-base-300/70 backdrop-blur-xs"
+      >
+        <div class="pop-in rounded-box border-2 border-dashed border-primary bg-base-100 px-8 py-6 text-center">
+          <Icon name="sparkle" :size="24" class="mx-auto text-primary" />
+          <p class="mt-2 mb-0 text-sm font-medium">松手导入角色卡</p>
+          <p class="mb-0 text-xs text-base-content/50">SillyTavern 的 PNG 或 JSON</p>
+        </div>
       </div>
-    </div>
+    </Transition>
 
     <div class="drawer min-h-0 flex-1 lg:drawer-open">
       <input id="shell-drawer" v-model="drawerOpen" type="checkbox" class="drawer-toggle" />
@@ -204,12 +206,15 @@ onUnmounted(() => {
         </header>
 
         <main class="min-h-0 flex-1">
-          <HomeView v-if="view === 'home'" @go="view = $event" />
-          <SessionsView v-else-if="view === 'sessions'" />
-          <IngestView v-else-if="view === 'ingest'" />
-          <AssetsView v-else-if="view === 'assets'" @go="view = $event" />
-          <ThemeView v-else-if="view === 'theme'" />
-          <SettingsView v-else />
+          <!-- 页面切换淡入淡出（out-in：旧页先走，不叠影） -->
+          <Transition name="fade" mode="out-in">
+            <HomeView v-if="view === 'home'" @go="view = $event" />
+            <SessionsView v-else-if="view === 'sessions'" />
+            <IngestView v-else-if="view === 'ingest'" />
+            <AssetsView v-else-if="view === 'assets'" @go="view = $event" />
+            <ThemeView v-else-if="view === 'theme'" />
+            <SettingsView v-else />
+          </Transition>
         </main>
       </div>
 
@@ -290,7 +295,7 @@ onUnmounted(() => {
 
               <li v-else>
                 <button
-                  class="is-drawer-close:justify-center is-drawer-close:tooltip is-drawer-close:tooltip-right"
+                  class="is-drawer-close:justify-center is-drawer-close:tooltip is-drawer-close:tooltip-right transition-colors duration-150"
                   :class="{ 'menu-active': view === id }"
                   :data-tip="PAGES[id].label"
                   @click="go(id)"
@@ -307,7 +312,7 @@ onUnmounted(() => {
             <ul class="menu w-full gap-0.5 px-0">
               <li>
                 <button
-                  class="is-drawer-close:justify-center is-drawer-close:tooltip is-drawer-close:tooltip-right"
+                  class="is-drawer-close:justify-center is-drawer-close:tooltip is-drawer-close:tooltip-right transition-colors duration-150"
                   :class="{ 'menu-active': view === 'settings' }"
                   data-tip="设置"
                   @click="go('settings')"
