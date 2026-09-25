@@ -472,6 +472,11 @@
 - [x] 包 E 结构与边缘（E2–E5 全量；E1 零风险提取完成 proxy_of×8 + proposal_event×9，
       **余量**：session_ctx 前奏换写、commands.rs 按域物理拆分、SessionView 五组件抽取
       ——纯代码搬移，留作独立小步批次，不阻塞收口）
+- [x] E1 余量 · 后端半（独立批次，2026-09-25）：session_ctx 合并 9 处前奏三连 +
+      commands.rs 拆出 `commands/{providers,theater,ingestion,scenes,summary}.rs`
+      五域（约 2900 行迁出，`pub use` 顶回 commands 根，lib.rs 零改动）；
+      456 例单测原样全绿 + `pnpm build` 双绿。**前端半**（SessionView 五组件/
+      composable 抽取）仍在余量
 - [x] 收口：CHANGELOG + 双绿 + CDP 真机回归
 
 ## 执行备注（2026-09-25）

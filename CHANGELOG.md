@@ -163,6 +163,19 @@
   SessionView.vue 的五个组件/composable 抽取——属纯代码搬移，留作后续
   「分批小步、每步双绿」的独立批次（见 hardening.md 进度区备注）
 
+### Changed · E1 余量（独立批次）
+
+- **`session_ctx` 前奏合并**：`root()` + `load_session` + `project_session` 的命令
+  前奏三连提为 `SessionCtx`（9 处精确匹配换写；`meta` 需中途改写的路径按备注
+  保持手写展开），只读命令入口的样板减半
+- **commands.rs 按域物理拆分（后端半）**：新增 `commands/{providers,theater,
+  ingestion,scenes,summary}.rs` 五个域文件（约 2900 行迁出）——接入点与设置、
+  剧场/导演树与世界主线、素材规格化管线、场景与多线、自动总结管线（含写入
+  闸门的暂存/重放半区）。`tauri::State` 管理的类型与命令经 `pub use` 顶回
+  commands 根，lib.rs 注册表零改动；跨域内核（`advance_theater`/`flush_parked_
+  summaries` 等）升 `pub(crate)`。纯代码搬移，行为不变：456 例单测原样全绿
+- SessionView.vue 的五组件/composable 抽取（前端半）随后续批次
+
 ## [0.3.0] - 2026-09-25
 
 > M3「热闹、会长大、有节奏、不串台」完成定版（代码侧 M3.0–M3.11 全部落地，
