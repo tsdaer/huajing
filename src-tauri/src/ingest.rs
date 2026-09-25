@@ -1909,7 +1909,9 @@ fn lua_str_utf8(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\{}", c as u32)),
+            // 加固 C6：Lua 的 \ddd 最多吞 3 位——变宽转义遇到后随数字会被吞并错位
+            //（\x0c + "3" → \123 → 读回成 !）。定宽三位是 stimport::lua_str 的正确写法。
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\{:03}", c as u32)),
             c => out.push(c),
         }
     }
@@ -2808,6 +2810,17 @@ mod tests {
             "正常标题行为不变"
         );
         assert_eq!(heading_of("=== 往世乐土 ==="), Some((3, "往世乐土".to_string())));
+    }
+
+    #[test]
+    fn lua_str_utf8_control_char_before_digit_roundtrips() {
+        // C6：\x0c + "3" 曾被变宽转义写成 \123（Lua 最多吞 3 位 → 读回成 !）。
+        // 定宽三位后，控制字符 + 数字 + 引号 + 反斜杠 + 换行都要无损往返。
+        let s = "a\u{000c}3b\"引\"号\\反斜\n换行\t";
+        let lit = lua_str_utf8(s);
+        let lua = mlua::Lua::new();
+        let back: String = lua.load(format!("return {lit}")).eval().unwrap();
+        assert_eq!(back, s, "生成 → mlua 读回必须无损：{lit}");
     }
 
     #[test]

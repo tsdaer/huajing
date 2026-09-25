@@ -4,6 +4,7 @@
 //! 风险表：至少两家实测）。补全入口 [`chat_stream`] 逐段回调增量文本，
 //! 支持取消与逐块超时。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -144,12 +145,19 @@ impl SseParser {
 
     /// 喂入一段响应字节，返回其中完整 `data:` 行的负载（可能为空）。
     /// `[DONE]` 也作为负载返回，由调用方判断。
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+    /// 加固 C5：残余缓冲（无换行尾部）超过上限时报错——调用方断开连接；
+    /// 已消费行一次性 drain（单 chunk 多行不再从头部逐行搬移）。
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
         self.buf.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line[..line.len() - 1]);
+        let mut consumed = 0usize;
+        let mut scan = 0usize;
+        while let Some(rel) = self.buf[scan..].iter().position(|&b| b == b'\n') {
+            let pos = scan + rel;
+            let line = &self.buf[consumed..pos];
+            consumed = pos + 1;
+            scan = consumed;
+            let line = String::from_utf8_lossy(line);
             let line = line.trim_end_matches('\r');
             if let Some(data) = line.strip_prefix("data:") {
                 let data = data.strip_prefix(' ').unwrap_or(data);
@@ -158,7 +166,16 @@ impl SseParser {
                 }
             }
         }
-        events
+        if consumed > 0 {
+            self.buf.drain(..consumed);
+        }
+        if self.buf.len() > SSE_BUF_LIMIT {
+            return Err(format!(
+                "SSE 缓冲超过 {} MB 无有效换行——响应不像 SSE 流，主动断开",
+                SSE_BUF_LIMIT / 1024 / 1024
+            ));
+        }
+        Ok(events)
     }
 }
 
@@ -173,6 +190,8 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -182,78 +201,190 @@ struct StreamDelta {
 }
 
 /// 流式补全结果
+#[derive(Debug)]
 pub struct StreamOutcome {
     pub text: String,
     /// 被用户中断（保留已生成的部分文本）
     pub cancelled: bool,
+    /// 末 chunk 的 finish_reason（C3 空正文棘轮的判据；服务端没带时为 None）
+    pub finish_reason: Option<String>,
+}
+
+/// 流式中途失败：错误信息 + **已生成的部分文本**（加固 C2）。
+/// 网络抖动/超时不该让已经显示出来的文字凭空消失——调用方按取消语义落盘部分文本。
+#[derive(Debug, Clone)]
+pub struct StreamFailure {
+    pub message: String,
+    pub partial: String,
+}
+
+impl From<String> for StreamFailure {
+    fn from(message: String) -> Self {
+        StreamFailure { message, partial: String::new() }
+    }
+}
+
+impl std::fmt::Display for StreamFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// 每块之间的最长等待（无整体超时：长生成不误杀）
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// 非流式调用（send + 读 body 全程）的整体超时（加固 C1）：服务端回 200 后挂住
+/// 不回 body 会让总结/补全管线永久 await——不报错不重试，批次卡死到重启。
+/// 流式不受它管（[`chat_stream`] 逐块超时，长生成不误杀）。
+const NON_STREAM_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// SSE 缓冲上限（加固 C5）：坏网关回 200 后持续输出不含换行的字节时，
+/// 缓冲无界增长直到内存耗尽——超限报错断开，而不是陪它烧内存。
+const SSE_BUF_LIMIT: usize = 4 * 1024 * 1024;
+
 /// OpenAI 兼容 `/chat/completions` 流式补全。
 /// `on_delta` 逐段回调增量文本；`cancel` 置 true 后尽快返回（保留部分文本）。
+/// 失败时返回 [`StreamFailure`]——已生成的增量在 `partial` 里（加固 C2）。
 pub async fn chat_stream(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    on_delta: impl FnMut(&str),
+    cancel: &AtomicBool,
+    extra_proxy: Option<&str>,
+) -> Result<StreamOutcome, StreamFailure> {
+    chat_stream_bounded(provider, messages, on_delta, cancel, extra_proxy, None, CHUNK_TIMEOUT).await
+}
+
+/// 带请求参数的流式补全（加固 C3 的重试入口）：
+/// - `max_tokens`：Some 时随请求带上（None = 服务端默认，现状行为）；
+/// - `chunk_timeout`：单块最长等待（生产用 [`CHUNK_TIMEOUT`]，测试注入小值）。
+pub(crate) async fn chat_stream_bounded(
     provider: &Provider,
     messages: &[ChatMessage],
     mut on_delta: impl FnMut(&str),
     cancel: &AtomicBool,
     extra_proxy: Option<&str>,
-) -> Result<StreamOutcome, String> {
-    let (client, _proxy) = build_client(extra_proxy).await?;
+    max_tokens: Option<u32>,
+    chunk_timeout: Duration,
+) -> Result<StreamOutcome, StreamFailure> {
+    let (client, _proxy) = build_client(extra_proxy).await.map_err(StreamFailure::from)?;
     let url = endpoint(provider);
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": provider.model,
         "messages": messages,
         "temperature": provider.temperature,
         "stream": true,
     });
+    if let Some(mt) = max_tokens {
+        body["max_tokens"] = serde_json::json!(mt);
+    }
     let resp = client
         .post(&url)
         .bearer_auth(&provider.api_key)
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("请求失败（{}）：{}", provider.name, error_chain(&e)))?;
+        .map_err(|e| StreamFailure::from(format!("请求失败（{}）：{}", provider.name, error_chain(&e))))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let detail = resp.text().await.unwrap_or_default();
-        return Err(format!("{} 返回 {}：{}", provider.name, status, truncate(&detail, 500)));
+        return Err(StreamFailure::from(format!(
+            "{} 返回 {}：{}",
+            provider.name,
+            status,
+            truncate(&detail, 500)
+        )));
     }
 
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::new();
     let mut full = String::new();
     let mut cancelled = false;
+    let mut finish_reason: Option<String> = None;
     loop {
         if cancel.load(Ordering::Relaxed) {
             cancelled = true;
             break;
         }
-        let chunk = tokio::time::timeout(CHUNK_TIMEOUT, stream.next())
+        // 失败路径带出已生成的增量（C2）：流中途断掉时，已显示的文字不能凭空消失
+        let chunk = tokio::time::timeout(chunk_timeout, stream.next())
             .await
-            .map_err(|_| format!("{} 响应超时（{} 秒无数据）", provider.name, CHUNK_TIMEOUT.as_secs()))?
+            .map_err(|_| StreamFailure {
+                message: format!("{} 响应超时（{} 秒无数据）", provider.name, chunk_timeout.as_secs()),
+                partial: full.clone(),
+            })?
             .transpose()
-            .map_err(|e| format!("{} 流读取失败：{e}", provider.name))?;
+            .map_err(|e| StreamFailure {
+                message: format!("{} 流读取失败：{e}", provider.name),
+                partial: full.clone(),
+            })?;
         let Some(bytes) = chunk else { break };
 
-        for data in parser.feed(&bytes) {
+        let events = parser.feed(&bytes).map_err(|e| StreamFailure {
+            message: format!("{} {e}", provider.name),
+            partial: full.clone(),
+        })?;
+        for data in events {
             if data == "[DONE]" {
-                return Ok(StreamOutcome { text: full, cancelled: false });
+                return Ok(StreamOutcome { text: full, cancelled: false, finish_reason });
             }
             let Ok(parsed) = serde_json::from_str::<StreamChunk>(&data) else {
                 continue; // 非 JSON 负载（心跳等）跳过
             };
-            if let Some(delta) = parsed.choices.into_iter().find_map(|c| c.delta.content) {
-                if !delta.is_empty() {
-                    on_delta(&delta);
-                    full.push_str(&delta);
+            for choice in parsed.choices {
+                if choice.finish_reason.is_some() {
+                    finish_reason = choice.finish_reason;
+                }
+                if let Some(delta) = choice.delta.content {
+                    if !delta.is_empty() {
+                        on_delta(&delta);
+                        full.push_str(&delta);
+                    }
                 }
             }
         }
     }
     // 流结束但未见 [DONE]：按已收内容收尾
-    Ok(StreamOutcome { text: full, cancelled })
+    Ok(StreamOutcome { text: full, cancelled, finish_reason })
+}
+
+/// 带空正文棘轮的流式补全（加固 C3）：推理模型在服务端默认预算内把 token 耗在
+/// 思考上时，正文为空但流正常 [DONE] 结束——非流式的 self_or_retry 专门处理了
+/// 这个场景，流式此前没有等价物。判据与非流式一致（finish_reason=length），
+/// 预算复用 [`retry_budget`]（8192 起翻倍，封顶 32768）；取消/有正文不重试。
+pub async fn chat_stream_ratcheted(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    mut on_delta: impl FnMut(&str),
+    cancel: &AtomicBool,
+    extra_proxy: Option<&str>,
+) -> Result<StreamOutcome, StreamFailure> {
+    let mut budget: Option<u32> = None;
+    loop {
+        let outcome =
+            chat_stream_bounded(provider, messages, &mut on_delta, cancel, extra_proxy, budget, CHUNK_TIMEOUT)
+                .await?;
+        let empty = outcome.text.trim().is_empty();
+        if !outcome.cancelled && empty && outcome.finish_reason.as_deref() == Some("length") {
+            let last = budget.unwrap_or(4096);
+            match retry_budget(last) {
+                Some(next) => {
+                    budget = Some(next);
+                    continue;
+                }
+                None => {
+                    return Err(StreamFailure {
+                        message: format!(
+                            "{} 的思考耗尽了流式预算（{}），加大预算后仍无正文",
+                            provider.name, last
+                        ),
+                        partial: outcome.text,
+                    })
+                }
+            }
+        }
+        return Ok(outcome);
+    }
 }
 
 /// 把 reqwest 的错误链摊平成一行：只印顶层 `Display` 会丢掉真正的原因
@@ -279,6 +410,17 @@ pub async fn chat_once(
     messages: &[ChatMessage],
     extra_proxy: Option<&str>,
 ) -> Result<String, String> {
+    chat_once_bounded(provider, messages, extra_proxy, NON_STREAM_TIMEOUT).await
+}
+
+/// [`chat_once`] 的可注入超时版（加固 C1 的测试入口；生产用 [`NON_STREAM_TIMEOUT`]）
+async fn chat_once_bounded(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    extra_proxy: Option<&str>,
+    timeout: Duration,
+) -> Result<String, String> {
+    with_non_stream_timeout(&provider.name, timeout, async {
     let (client, _proxy) = build_client(extra_proxy).await?;
     let url = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
     let body = serde_json::json!({
@@ -306,6 +448,8 @@ pub async fn chat_once(
         ));
     }
     Ok(truncate(&resp.text().await.unwrap_or_default(), 200))
+    })
+    .await
 }
 
 /// 通用**非流式**补全：自动总结 / 设定捕获 / 补全 / 分类这类实用档调用走这里
@@ -320,21 +464,14 @@ pub async fn chat_complete(
     temperature: f32,
     extra_proxy: Option<&str>,
 ) -> Result<String, String> {
-    let (client, _proxy) = build_client(extra_proxy).await?;
-    let url = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
-    let body = serde_json::json!({
-        "model": provider.model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": false,
-    });
+    // 加固 C4：开头的 client/url/body 是建了不用的死代码（真正发送在 self_or_retry 里
+    // 完整重来一遍），删除；client 由 build_client 的缓存兜住重复探测
     self_or_retry(provider, messages, max_tokens, temperature, extra_proxy, 0).await
 }
 
 /// 非流式调用的预算棘轮：推理型模型的思考 token 计入 max_tokens（M2.6 的教训），
 /// 思考太长会「finish_reason=length、正文为空」。内容为空且被长度截断时，
-/// 换 4 倍预算（封顶 16384）重试一次——非推理模型永远一次成功，不多花一分钱。
+/// 预算翻倍重试（×2、封顶 32768、至多四梯）——非推理模型永远一次成功，不多花一分钱。
 /// M3.11 真机验收实锤：deepseek-flash 在 2048 下思考耗掉 7692 字符，素材管线的
 /// 分类/归纳全数返回空。
 fn retry_budget(max_tokens: u32) -> Option<u32> {
@@ -380,6 +517,19 @@ async fn chat_once_full(
     temperature: f32,
     extra_proxy: Option<&str>,
 ) -> Result<(String, Option<String>), String> {
+    chat_once_full_bounded(provider, messages, max_tokens, temperature, extra_proxy, NON_STREAM_TIMEOUT).await
+}
+
+/// [`chat_once_full`] 的可注入超时版（加固 C1 的测试入口）
+async fn chat_once_full_bounded(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    temperature: f32,
+    extra_proxy: Option<&str>,
+    timeout: Duration,
+) -> Result<(String, Option<String>), String> {
+    with_non_stream_timeout(&provider.name, timeout, async {
     let (client, _proxy) = build_client(extra_proxy).await?;
     let url = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
     let body = serde_json::json!({
@@ -427,6 +577,27 @@ async fn chat_once_full(
         .and_then(|c| c.as_str())
         .map(str::to_string);
     Ok((content, finish_reason))
+    })
+    .await
+}
+
+/// 非流式调用的整体超时包装（加固 C1）：超时映射成可读错误，管线不再永久挂死
+async fn with_non_stream_timeout<T, F>(
+    provider_name: &str,
+    timeout: Duration,
+    fut: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(format!(
+            "{} 非流式响应超时（{} 秒内无完整响应）",
+            provider_name,
+            timeout.as_secs()
+        )),
+    }
 }
 
 /// embeddings 地址（自检与真实调用共用，避免两处规则漂移）
@@ -485,6 +656,7 @@ pub async fn embeddings(
     if inputs.is_empty() {
         return Ok(Vec::new());
     }
+    with_non_stream_timeout(&provider.name, NON_STREAM_TIMEOUT, async {
     let (client, _proxy) = build_client(extra_proxy).await?;
     let body = serde_json::json!({
         "model": provider.model,
@@ -512,6 +684,8 @@ pub async fn embeddings(
         .await
         .map_err(|e| format!("响应解析失败（{}）：{e}", provider.name))?;
     parse_embeddings_response(&value)
+    })
+    .await
 }
 
 /// 环境变量里的代理（reqwest 的 system-proxy 也会读它们）
@@ -647,14 +821,45 @@ async fn resolve_proxy(extra: Option<&str>) -> Option<(String, String)> {
     if let Some(found) = proxy_from_env() {
         return Some(found); // 环境变量是用户显式意图，即使代理没开也照用（报错更直白）
     }
-    match proxy_from_system() {
+    // 加固 C4：reg 子进程查询是阻塞调用，别在 async 上下文里直接跑
+    let system = tokio::task::spawn_blocking(proxy_from_system)
+        .await
+        .unwrap_or(None);
+    match system {
         Some((url, source)) if proxy_reachable(&url).await => Some((url, source)),
         _ => None,
     }
 }
 
-/// 建一个 HTTP 客户端（连同一个会话的多次请求共用一份；Tauri State 持有）
+/// 按「用户手填代理」缓存的客户端池（加固 C4）：build_client 每次调用都会做
+/// 代理探测——Windows 上 spawn 一个 reg 子进程 + 300ms TCP 探测，预算棘轮一次
+/// 重试最多 5 遍完整探测。键是归一化后的手填代理（None 与空串等价）；
+/// 系统代理在运行期变化不在缓存失效范围内（重启后重新探测，行为与设置页手填一致）。
+fn client_cache() -> &'static std::sync::Mutex<HashMap<Option<String>, (reqwest::Client, Option<String>)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Option<String>, (reqwest::Client, Option<String>)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 建一个 HTTP 客户端（同参数跨调用复用缓存实例）
 pub async fn build_client(extra_proxy: Option<&str>) -> Result<(reqwest::Client, Option<String>), String> {
+    let key: Option<String> = extra_proxy
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Ok(cache) = client_cache().lock() {
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit.clone());
+        }
+    }
+    let built = build_client_uncached(extra_proxy).await?;
+    if let Ok(mut cache) = client_cache().lock() {
+        cache.insert(key, built.clone());
+    }
+    Ok(built)
+}
+
+async fn build_client_uncached(extra_proxy: Option<&str>) -> Result<(reqwest::Client, Option<String>), String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .user_agent(concat!("huajing/", env!("CARGO_PKG_VERSION")));
@@ -705,6 +910,235 @@ mod ratchet_tests {
         assert_eq!(retry_budget(8192), Some(16384));
         assert_eq!(retry_budget(16384), Some(32768));
         assert_eq!(retry_budget(32768), None, "32768 是封顶：再往上翻倍即不重试");
+    }
+
+    // ---------- 加固 C1-C5 的钉子用例（本地 mock 服务端，不打真实网络） ----------
+
+    fn test_provider(base_url: &str) -> Provider {
+        Provider {
+            name: "mock".into(),
+            base_url: base_url.into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            temperature: 0.0,
+            role: "chat".into(),
+        }
+    }
+
+    /// mock 服务端读一整条 HTTP 请求（头 + Content-Length 的 body）——
+    /// 单次 read 只会拿到一个 TCP 段，头和体经常分离
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(pos) = text.find("\r\n\r\n") {
+                let clen = text[..pos]
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= pos + 4 + clen {
+                    return text.into_owned();
+                }
+            }
+            let n = sock.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                return text.into_owned();
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// C1：服务端回 200 后装死不回 body——非流式调用按整体超时报错，而不是永久挂死
+    #[test]
+    fn non_stream_call_times_out_when_server_hangs() {
+        rt().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"partial\":",
+                    )
+                    .await;
+                // 装死：不再发数据也不关连接
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+            let provider = test_provider(&format!("http://{addr}"));
+            let err = chat_once_full_bounded(
+                &provider,
+                &[ChatMessage { role: "user".into(), content: "hi".into() }],
+                16,
+                0.0,
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("超时"), "{err}");
+            // chat_once（自检路径）同样受整体超时保护
+            let err = chat_once_bounded(
+                &provider,
+                &[ChatMessage { role: "user".into(), content: "hi".into() }],
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("超时"), "{err}");
+        });
+    }
+
+    /// C2：流中途失败（块间超时）时，已生成的增量必须随错误带回
+    #[test]
+    fn stream_failure_carries_partial_text() {
+        rt().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"早\"}}]}\n\n";
+                let _ = sock.write_all(format!("{head}{body}").as_bytes()).await;
+                // 装死：不发新块也不关流 → 块间超时走错误路径
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+            let provider = test_provider(&format!("http://{addr}"));
+            let cancel = AtomicBool::new(false);
+            let err = chat_stream_bounded(
+                &provider,
+                &[ChatMessage { role: "user".into(), content: "hi".into() }],
+                |_| {},
+                &cancel,
+                None,
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.partial, "早", "失败要带回已生成的增量：{err:?}");
+            assert!(err.message.contains("超时"), "{err}");
+        });
+    }
+
+    /// C3：空正文 + finish_reason=length（思考耗尽预算）触发带预算重试
+    #[test]
+    fn stream_ratchet_retries_empty_length_with_bigger_budget() {
+        rt().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let sse = |delta: &str, finish: Option<&str>| {
+                    let mut payload = String::new();
+                    if delta.is_empty() && finish.is_some() {
+                        payload.push_str(
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                        );
+                    } else {
+                        payload.push_str(&format!(
+                            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{delta}\"}}}}]}}\n\n"
+                        ));
+                    }
+                    payload.push_str("data: [DONE]\n\n");
+                    payload
+                };
+                // 第一条连接：空正文 + length；断言请求里没带 max_tokens（服务端默认预算）
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let first_req = read_http_request(&mut sock).await;
+                assert!(!first_req.contains("max_tokens"), "首请求不带预算：{first_req}");
+                let body = sse("", Some("length"));
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                // 第二条连接：带 max_tokens=8192 的重试；正常正文
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let retry_req = read_http_request(&mut sock).await;
+                assert!(
+                    retry_req.contains("\"max_tokens\":8192"),
+                    "重试要带翻倍预算：{retry_req}"
+                );
+                let body = sse("正文来了", None);
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+            let provider = test_provider(&format!("http://{addr}"));
+            let cancel = AtomicBool::new(false);
+            let mut seen = String::new();
+            let out = chat_stream_ratcheted(
+                &provider,
+                &[ChatMessage { role: "user".into(), content: "hi".into() }],
+                |d| seen.push_str(d),
+                &cancel,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.text, "正文来了", "重试后的正文非空");
+            assert_eq!(seen, "正文来了");
+        });
+    }
+
+    /// C4：build_client 同参数复用缓存实例（代理探测不再每次重跑）
+    #[test]
+    fn build_client_caches_by_proxy_key() {
+        rt().block_on(async {
+            let _ = build_client(None).await.unwrap();
+            assert!(
+                client_cache().lock().unwrap().contains_key(&None),
+                "None 键要进缓存"
+            );
+            // 不同键各建各的（语法合法的代理地址不会在 build 阶段拨号）
+            let _ = build_client(Some("http://127.0.0.1:1")).await.unwrap();
+            assert!(client_cache().lock().unwrap().contains_key(&Some("http://127.0.0.1:1".into())));
+        });
+    }
+
+    /// C5：SSE 缓冲超限报错；单 chunk 多行与逐字节喂的解析结果一致
+    #[test]
+    fn sse_buf_capped_and_multiline_chunk_matches_streaming() {
+        let mut p = SseParser::new();
+        let big = vec![b'x'; SSE_BUF_LIMIT + 1];
+        assert!(p.feed(&big).is_err(), "超限要报错断开");
+
+        let lines: &[u8] = b"data: a\ndata: b\n\ndata: c\n";
+        let mut whole = SseParser::new();
+        let a = whole.feed(lines).unwrap();
+        let mut drip = SseParser::new();
+        let mut b = Vec::new();
+        for byte in lines {
+            b.extend(drip.feed(&[*byte]).unwrap());
+        }
+        assert_eq!(a, b, "整段喂与逐字节喂解析一致");
+        assert_eq!(a, vec!["a", "b", "c"]);
     }
 }
 #[cfg(test)]
@@ -860,32 +1294,32 @@ mod tests {
     #[test]
     fn sse_single_chunk_multiple_events() {
         let mut p = SseParser::new();
-        let events = p.feed(b"data: {\"a\":1}\n\ndata: {\"a\":2}\n\n");
+        let events = p.feed(b"data: {\"a\":1}\n\ndata: {\"a\":2}\n\n").unwrap();
         assert_eq!(events, vec![r#"{"a":1}"#, r#"{"a":2}"#]);
     }
 
     #[test]
     fn sse_event_split_across_chunks() {
         let mut p = SseParser::new();
-        assert!(p.feed(b"data: {\"a\"").is_empty());
-        assert_eq!(p.feed(b":1}\n"), vec![r#"{"a":1}"#]);
+        assert!(p.feed(b"data: {\"a\"").unwrap().is_empty());
+        assert_eq!(p.feed(b":1}\n").unwrap(), vec![r#"{"a":1}"#]);
 
         let mut q = SseParser::new();
-        assert!(q.feed(b"data: [DO").is_empty());
-        assert_eq!(q.feed(b"NE]\n"), vec!["[DONE]"]);
+        assert!(q.feed(b"data: [DO").unwrap().is_empty());
+        assert_eq!(q.feed(b"NE]\n").unwrap(), vec!["[DONE]"]);
     }
 
     #[test]
     fn sse_crlf_and_no_space_after_colon() {
         let mut p = SseParser::new();
-        let events = p.feed(b"data:{\"x\":1}\r\ndata: {\"x\":2}\r\n");
+        let events = p.feed(b"data:{\"x\":1}\r\ndata: {\"x\":2}\r\n").unwrap();
         assert_eq!(events, vec![r#"{"x":1}"#, r#"{"x":2}"#]);
     }
 
     #[test]
     fn sse_ignores_non_data_lines() {
         let mut p = SseParser::new();
-        let events = p.feed(b": keepalive\nevent: message\nid: 7\nretry: 1000\ndata: hi\n\n");
+        let events = p.feed(b": keepalive\nevent: message\nid: 7\nretry: 1000\ndata: hi\n\n").unwrap();
         assert_eq!(events, vec!["hi"]);
     }
 
@@ -894,15 +1328,15 @@ mod tests {
         let mut p = SseParser::new();
         let full = "data: 你好，世界\n\n".as_bytes().to_vec();
         let (a, b) = full.split_at(9); // 切在多字节字符中间
-        assert!(p.feed(a).is_empty());
-        assert_eq!(p.feed(b), vec!["你好，世界"]);
+        assert!(p.feed(a).unwrap().is_empty());
+        assert_eq!(p.feed(b).unwrap(), vec!["你好，世界"]);
     }
 
     #[test]
     fn sse_empty_and_blank_data_ignored() {
         // data: 后仅去一个可选空格；空负载忽略（不 trim，负载可能以空格结尾）
         let mut p = SseParser::new();
-        let events = p.feed(b"data:\ndata: \ndata: ok\n");
+        let events = p.feed(b"data:\ndata: \ndata: ok\n").unwrap();
         assert_eq!(events, vec!["ok"]);
     }
 

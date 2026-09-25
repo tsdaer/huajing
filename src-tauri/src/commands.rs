@@ -2554,7 +2554,9 @@ async fn stream_reply(
         .and_then(|s| s.proxy)
         .filter(|p| !p.trim().is_empty());
     let chat = assembly.messages.clone();
-    let stream = llm::chat_stream(provider, &chat, |delta| {
+    // C3：带空正文棘轮——推理模型把服务端默认预算耗在思考上时（finish=length、
+    // 正文空），自动带翻倍预算重试；C2：失败时已生成的增量在 failure.partial 里
+    let stream = llm::chat_stream_ratcheted(provider, &chat, |delta| {
         let _ = on_event.send(StreamEvent::Delta {
             text: delta.to_string(),
             name: Some(speaker_name.clone()),
@@ -2619,7 +2621,61 @@ async fn stream_reply(
                 report,
             })
         }
-        Err(message) => Ok(StreamEvent::Error { message }),
+        Err(failure) => {
+            // C2：流中途失败不再丢弃已生成的文本——partial 非空时按取消语义落盘
+            // （先报错提示，再走与「用户中断保留部分文本」相同的收尾），文字不凭空消失
+            if failure.partial.is_empty() {
+                return Ok(StreamEvent::Error {
+                    message: failure.message,
+                });
+            }
+            let _ = on_event.send(StreamEvent::Error {
+                message: failure.message,
+            });
+            let user_report = Some(user_report);
+            let committed = if finalize {
+                commit_reply(
+                    root,
+                    meta,
+                    cast,
+                    speaker,
+                    turn,
+                    &failure.partial,
+                    Some(&ui_sink(app)),
+                    log,
+                    runtime,
+                    tree_cache,
+                    summary_flags,
+                    scene,
+                )
+            } else {
+                commit_reply_core(
+                    root,
+                    meta,
+                    cast,
+                    speaker,
+                    turn,
+                    &failure.partial,
+                    Some(&ui_sink(app)),
+                    log,
+                    scene,
+                )
+            };
+            let report = match committed {
+                Ok(next) => {
+                    forward_ui_events(on_event, &next);
+                    Some(next)
+                }
+                Err(e) => {
+                    return Ok(StreamEvent::Error { message: e });
+                }
+            };
+            Ok(StreamEvent::Done {
+                full: failure.partial,
+                cancelled: true,
+                report: report.or(user_report),
+            })
+        }
     }
 }
 

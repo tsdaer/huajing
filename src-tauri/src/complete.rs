@@ -130,10 +130,15 @@ pub fn improv_candidates<'a>(cx: &'a Codex, text: &str) -> Vec<&'a CodexEntity> 
         .iter()
         .filter(|e| e.status != "retired")
         .filter(|e| {
-            e.name.to_lowercase().contains(&hay) || hay.contains(&e.name.to_lowercase()) || e
-                .aliases
-                .iter()
-                .any(|a| !a.trim().is_empty() && hay.contains(&a.to_lowercase()))
+            // 加固 C7：反向 contains（实体名包含整段对话文本）是写反的一半——短文本
+            //（「猫」）会误激活一片实体，空名实体的 hay.contains("") 恒真全入候选；
+            // 提及判定只该是「文本里出现了实体名/别名」。
+            let name = e.name.trim().to_lowercase();
+            !name.is_empty() && hay.contains(&name)
+                || e.aliases.iter().any(|a| {
+                    let a = a.trim().to_lowercase();
+                    !a.is_empty() && hay.contains(&a)
+                })
         })
         .filter(|e| thinness(e) >= THIN_THRESHOLD)
         .collect();
@@ -531,6 +536,33 @@ mod tests {
         // 空字符串与空数组都算缺失
         let bare = entity("char", json!({ "tells": {} }));
         assert!(missing_paths(&bare).contains(&"tells".to_string()));
+    }
+
+    #[test]
+    fn improv_mention_requires_name_to_appear_in_text() {
+        // C7：反向 contains 曾让短文本（「猫」）激活一切名字含猫的实体；
+        // 修正后只有「文本里出现实体名/别名」才入候选。
+        let mut cat = entity("char", json!({})); // 空模板 = 过薄（thinness >= 3）
+        cat.name = "猫娘".into();
+        cat.id = "char.猫娘".into();
+        let mut dog = entity("char", json!({}));
+        dog.name = "犬耳娘".into();
+        dog.id = "char.犬耳娘".into();
+        dog.aliases = vec!["猫见愁".into()];
+        let cx = Codex::build(vec![cat, dog]);
+
+        assert!(
+            improv_candidates(&cx, "猫").is_empty(),
+            "短文本不得反向激活名字含猫的实体"
+        );
+        let hits = improv_candidates(&cx, "想撸猫娘");
+        assert_eq!(hits.len(), 1, "真提及才入候选：{:?}", hits.iter().map(|e| &e.id).collect::<Vec<_>>());
+        assert_eq!(hits[0].id, "char.猫娘");
+        // 别名路径：文本提到别名
+        let hits = improv_candidates(&cx, "猫见愁来了");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "char.犬耳娘");
+        assert!(improv_candidates(&cx, "谁都没提").is_empty());
     }
 
     #[test]
