@@ -1,22 +1,25 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import Icon from "../components/Icon.vue";
 import { PRESETS } from "../theme-presets";
+import { api } from "../api";
 import {
+  ACTIVE_STEM,
   BASE_KEY,
   TOKEN_GROUPS,
   applyVars,
+  clearCustom,
   clearVars,
   cssColorToHex,
-  loadCustom,
-  removeCustom,
-  saveCustom,
+  getActiveCustom,
+  persistCustom,
   toPluginCss,
   type ThemePreset,
 } from "../theme";
 
 // 主题编辑器：基础主题（daisyUI 默认 light/dark）+ 33 个预设（来自 docs/theme_test/theme.css）
-// + 自定义令牌。自定义令牌写在 :root 内联样式上，实时覆盖当前主题。
+// + 自定义令牌。自定义令牌写在 :root 内联样式上，实时覆盖当前主题；
+// 持久化走 DataHub/themes/（M4.3 · 决断 7）——custom 是活动主题，其余名字是主题库。
 
 // ---------- 基础主题 ----------
 type BasePref = "system" | "light" | "dark";
@@ -35,22 +38,22 @@ watch(basePref, (t) => {
 });
 
 // ---------- 自定义令牌 ----------
-const saved = loadCustom();
+const saved = getActiveCustom();
 const vars = ref<Record<string, string>>(saved ? { ...saved.vars } : {});
 const colorScheme = ref<"light" | "dark">(saved?.colorScheme ?? "light");
 const themeName = ref(saved?.preset ?? "");
 const hasCustom = computed(() => Object.keys(vars.value).length > 0);
 
-/** 每次改动都实时落到页面上并记住 */
+/** 每次改动都实时落到页面上并（防抖）写进 DataHub/themes/custom.json */
 watch(
-  [vars, colorScheme],
+  [vars, colorScheme, themeName],
   () => {
     applyVars(vars.value);
     if (Object.keys(vars.value).length > 0) {
       document.documentElement.style.colorScheme = colorScheme.value;
-      saveCustom({ preset: themeName.value, colorScheme: colorScheme.value, vars: vars.value });
+      persistCustom({ preset: themeName.value, colorScheme: colorScheme.value, vars: vars.value });
     } else {
-      removeCustom();
+      clearCustom();
     }
   },
   { deep: true },
@@ -74,7 +77,47 @@ function resetCustom() {
   themeName.value = "";
   vars.value = {};
   clearVars();
-  removeCustom();
+  clearCustom();
+}
+
+// ---------- 主题库（DataHub/themes/ 下除活动主题外的 *.json） ----------
+const library = ref<string[]>([]);
+const libraryMsg = ref("");
+
+async function refreshLibrary() {
+  try {
+    library.value = (await api.themeList()).filter((n) => n !== ACTIVE_STEM);
+  } catch {
+    library.value = [];
+  }
+}
+
+onMounted(refreshLibrary);
+
+async function saveToLibrary() {
+  const name = themeName.value.trim();
+  if (!name || !hasCustom.value) return;
+  try {
+    await api.themeSave(name, { preset: name, colorScheme: colorScheme.value, vars: vars.value });
+    libraryMsg.value = "";
+    await refreshLibrary();
+  } catch (e) {
+    libraryMsg.value = String(e);
+  }
+}
+
+/** 从库里点选：载入编辑器（watcher 会实时应用并写回活动主题） */
+async function applyFromLibrary(name: string) {
+  try {
+    const t = await api.themeLoad(name);
+    if (!t) return;
+    themeName.value = t.preset || name;
+    colorScheme.value = t.colorScheme === "dark" ? "dark" : "light";
+    vars.value = { ...t.vars };
+    libraryMsg.value = "";
+  } catch (e) {
+    libraryMsg.value = String(e);
+  }
 }
 
 // ---------- 预设筛选 ----------
@@ -84,9 +127,38 @@ const visiblePresets = computed(() => {
   return q ? PRESETS.filter((p) => p.name.toLowerCase().includes(q)) : PRESETS;
 });
 
-// ---------- 导出 ----------
+// ---------- 导入：粘贴 CSS 主题块或选 .json 文件（键校验在后端，坏键拒绝并列出） ----------
+const importText = ref("");
+const importMsg = ref<{ ok: boolean; text: string } | null>(null);
+const importing = ref(false);
+
+async function doImport() {
+  importing.value = true;
+  try {
+    const parsed = await api.themeParseImport(importText.value, TOKEN_GROUPS.flatMap((g) => g.tokens.map((t) => t.key)));
+    themeName.value = parsed.name;
+    colorScheme.value = parsed.colorScheme === "dark" ? "dark" : "light";
+    vars.value = { ...parsed.vars };
+    importMsg.value = { ok: true, text: `已导入「${parsed.name}」（${Object.keys(parsed.vars).length} 个令牌），正在生效` };
+    importText.value = "";
+  } catch (e) {
+    importMsg.value = { ok: false, text: String(e) };
+  } finally {
+    importing.value = false;
+  }
+}
+
+async function onImportFile(ev: Event) {
+  const file = (ev.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  importText.value = await file.text();
+  await doImport();
+}
+
+// ---------- 导出：复制到剪贴板 / 保存文件 双出口 ----------
 const exportCss = computed(() => toPluginCss(vars.value, themeName.value || "custom", colorScheme.value));
 const copied = ref(false);
+const savedPath = ref("");
 
 async function copyCss() {
   try {
@@ -95,6 +167,14 @@ async function copyCss() {
     window.setTimeout(() => (copied.value = false), 1600);
   } catch {
     copied.value = false;
+  }
+}
+
+async function saveCssFile() {
+  try {
+    savedPath.value = await api.themeExportFile(themeName.value.trim() || "custom", exportCss.value);
+  } catch {
+    savedPath.value = "";
   }
 }
 </script>
@@ -209,11 +289,20 @@ async function copyCss() {
                 <option value="light">浅色</option>
                 <option value="dark">深色</option>
               </select>
+              <button
+                class="btn btn-sm"
+                :disabled="!hasCustom || !themeName.trim()"
+                :title="!themeName.trim() ? '先给主题起个名字' : '存一份进主题库（DataHub/themes/）'"
+                @click="saveToLibrary"
+              >
+                <Icon name="copy" :size="15" />存入库
+              </button>
               <button class="btn btn-sm" :disabled="!hasCustom" @click="resetCustom">
                 <Icon name="trash" :size="15" />清除
               </button>
             </div>
           </div>
+          <p v-if="libraryMsg" role="alert" class="m-0 text-xs text-error">{{ libraryMsg }}</p>
 
           <div v-for="group in TOKEN_GROUPS" :key="group.title" class="flex flex-col gap-2">
             <div class="flex flex-wrap items-baseline gap-2">
@@ -247,6 +336,36 @@ async function copyCss() {
                   @input="setToken(t.key, ($event.target as HTMLInputElement).value)"
                 />
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 主题库：DataHub/themes/ 下保存的主题（拷走 DataHub 即跟走） -->
+      <section class="card card-border bg-base-100">
+        <div class="card-body gap-4 p-5">
+          <div>
+            <h2 class="card-title gap-2 text-sm font-medium">
+              <Icon name="layers" :size="16" class="text-base-content/45" />
+              主题库
+              <span class="badge badge-sm badge-ghost">{{ library.length }}</span>
+            </h2>
+            <p class="mt-1 mb-0 text-xs text-base-content/50">
+              存进 <code class="font-mono">DataHub/themes/</code> 的主题——拷走 DataHub
+              即跟走，换设备放回同目录即可点选应用。
+            </p>
+          </div>
+          <p v-if="library.length === 0" class="m-0 text-xs text-base-content/45">
+            库里还没有主题：给自定义令牌起个名，点「存入库」。
+          </p>
+          <div v-else class="flex flex-wrap gap-2">
+            <div
+              v-for="name in library"
+              :key="name"
+              class="flex items-center gap-2 rounded-box bg-base-200 py-1.5 pl-3 pr-1.5 text-xs"
+            >
+              <span class="font-mono">{{ name }}</span>
+              <button class="btn btn-ghost btn-xs" @click="applyFromLibrary(name)">应用</button>
             </div>
           </div>
         </div>
@@ -305,6 +424,43 @@ async function copyCss() {
         </div>
       </section>
 
+      <!-- 导入：粘贴 CSS 主题块或选 .json 文件；键校验在后端，坏键拒绝并列出 -->
+      <section class="card card-border bg-base-100">
+        <div class="card-body gap-4 p-5">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 class="card-title gap-2 text-sm font-medium">
+                <Icon name="download" :size="16" class="text-base-content/45" />
+                导入
+              </h2>
+              <p class="mt-1 mb-0 text-xs text-base-content/50">
+                粘贴本页导出的 CSS 主题块，或选一个主题 JSON。只认编辑器认识的令牌键，
+                键名不对会整包拒绝并列出非法键。
+              </p>
+            </div>
+            <label class="btn btn-sm">
+              <Icon name="download" :size="15" />选择文件…
+              <input type="file" accept=".json,.css,.txt" class="hidden" @change="onImportFile" />
+            </label>
+          </div>
+          <textarea
+            v-model="importText"
+            class="textarea h-32 w-full font-mono text-xs leading-relaxed"
+            placeholder='@plugin "daisyui/theme" { name: "…"; color-scheme: dark; --color-primary: …; }'
+          ></textarea>
+          <div class="flex items-center justify-end gap-2">
+            <p v-if="importMsg" class="m-0 flex-1 text-xs" :class="importMsg.ok ? 'text-success' : 'text-error'">
+              {{ importMsg.text }}
+            </p>
+            <button class="btn btn-primary btn-sm" :disabled="!importText.trim() || importing" @click="doImport">
+              <span v-if="importing" class="loading loading-spinner loading-xs"></span>
+              <Icon v-else name="check" :size="15" />
+              导入并应用
+            </button>
+          </div>
+        </div>
+      </section>
+
       <!-- 导出 -->
       <section class="card card-border bg-base-100">
         <div class="card-body gap-4 p-5">
@@ -316,12 +472,21 @@ async function copyCss() {
               </h2>
               <p class="mt-1 mb-0 text-xs text-base-content/50">
                 粘进 <code class="font-mono">src/style.css</code> 即可成为编译期主题（可去掉
-                <code class="font-mono">default/prefersdark</code> 两行）。
+                <code class="font-mono">default/prefersdark</code> 两行）；「保存文件」落到
+                <code class="font-mono">DataHub/exports/</code>。
               </p>
             </div>
-            <button class="btn btn-sm" @click="copyCss">
-              <Icon :name="copied ? 'check' : 'copy'" :size="15" />{{ copied ? "已复制" : "复制 CSS" }}
-            </button>
+            <div class="flex items-center gap-2">
+              <p v-if="savedPath" class="m-0 max-w-52 truncate text-[11px] text-base-content/55" :title="savedPath">
+                已存 {{ savedPath }}
+              </p>
+              <button class="btn btn-sm" @click="saveCssFile">
+                <Icon name="download" :size="15" />保存文件
+              </button>
+              <button class="btn btn-sm" @click="copyCss">
+                <Icon :name="copied ? 'check' : 'copy'" :size="15" />{{ copied ? "已复制" : "复制 CSS" }}
+              </button>
+            </div>
           </div>
           <textarea class="textarea h-64 w-full font-mono text-xs leading-relaxed" readonly :value="exportCss"></textarea>
         </div>

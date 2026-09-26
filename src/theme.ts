@@ -1,6 +1,10 @@
 // daisyUI 主题令牌层。
 // 预设来自 docs/theme_test/theme.css（以字符串内联，运行时解析，不加进编译产物）；
 // 自定义主题以 :root 内联变量覆盖当前主题，导出仍是标准 @plugin "daisyui/theme" 块。
+// 持久化（M4.3 · 决断 7）：自定义主题落 DataHub/themes/<名>.json（拷走 DataHub 即
+// 主题跟走），localStorage 只作旧值的迁移源。
+
+import { api } from "./api";
 
 export interface ThemePreset {
   name: string;
@@ -11,6 +15,13 @@ export interface ThemePreset {
 export interface CustomTheme {
   preset: string;
   colorScheme: "light" | "dark";
+  vars: Record<string, string>;
+}
+
+/** 主题块导入的解析结果（后端 parse_theme_import 的返回） */
+export interface ParsedThemeImport {
+  name: string;
+  colorScheme: string;
   vars: Record<string, string>;
 }
 
@@ -87,6 +98,8 @@ export const COLOR_KEYS = TOKEN_GROUPS.flatMap((g) => g.tokens.filter((t) => t.k
 
 export const CUSTOM_KEY = "huajing.theme.custom";
 export const BASE_KEY = "huajing.ui-theme";
+/** 当前生效的自定义主题在 DataHub/themes/ 下的固定文件 stem（后端同款常量） */
+export const ACTIVE_STEM = "custom";
 
 /** 写入 :root 内联变量（内联样式优先于主题规则，因此能覆盖 light/dark） */
 export function applyVars(vars: Record<string, string>): void {
@@ -104,7 +117,26 @@ export function clearVars(): void {
   root.style.removeProperty("color-scheme");
 }
 
-export function loadCustom(): CustomTheme | null {
+// ---------- 持久化：后端 themes/custom.json 是唯一事实源，localStorage 仅作迁移源 ----------
+
+let activeCustom: CustomTheme | null = null;
+
+/** 当前生效的自定义主题（启动时由 initCustomTheme 填充，之后与编辑器同步） */
+export function getActiveCustom(): CustomTheme | null {
+  return activeCustom;
+}
+
+function fromBackend(raw: Awaited<ReturnType<typeof api.themeLoad>>): CustomTheme | null {
+  if (!raw || typeof raw !== "object" || !raw.vars) return null;
+  return {
+    preset: raw.preset ?? "",
+    colorScheme: raw.colorScheme === "dark" ? "dark" : "light",
+    vars: raw.vars,
+  };
+}
+
+/** 旧版 localStorage 值（M4.3 之前自定义主题只存这里） */
+function readLegacy(): CustomTheme | null {
   try {
     const raw = localStorage.getItem(CUSTOM_KEY);
     if (!raw) return null;
@@ -116,12 +148,50 @@ export function loadCustom(): CustomTheme | null {
   }
 }
 
-export function saveCustom(theme: CustomTheme): void {
-  localStorage.setItem(CUSTOM_KEY, JSON.stringify(theme));
+/**
+ * 启动加载（main.ts 挂载前 await，避免主题闪变）：读后端活动主题；
+ * 后端没有而 localStorage 有旧值 → 自动迁移（写后端成功才清旧键，失败下次再试）。
+ */
+export async function initCustomTheme(): Promise<CustomTheme | null> {
+  let theme: CustomTheme | null = null;
+  try {
+    theme = fromBackend(await api.themeLoad(ACTIVE_STEM));
+  } catch {
+    theme = null;
+  }
+  if (!theme) {
+    const legacy = readLegacy();
+    if (legacy) {
+      try {
+        await api.themeSave(ACTIVE_STEM, legacy);
+        localStorage.removeItem(CUSTOM_KEY);
+        theme = legacy;
+      } catch {
+        // 迁移失败不阻塞启动：旧键保留，下次启动再试
+      }
+    }
+  }
+  activeCustom = theme;
+  return theme;
 }
 
-export function removeCustom(): void {
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** 编辑器实时改动落后端（防抖——每个键入都写盘就太吵了） */
+export function persistCustom(theme: CustomTheme): void {
+  activeCustom = theme;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    api.themeSave(ACTIVE_STEM, theme).catch(() => {});
+  }, 400);
+}
+
+/** 清除活动主题：删后端文件 + 旧键彻底退役（否则下次启动又被迁移回来） */
+export function clearCustom(): void {
+  activeCustom = null;
+  if (saveTimer) clearTimeout(saveTimer);
   localStorage.removeItem(CUSTOM_KEY);
+  api.themeDelete(ACTIVE_STEM).catch(() => {});
 }
 
 /** 生成可直接粘进 style.css 的主题块 */

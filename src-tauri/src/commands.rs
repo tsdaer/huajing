@@ -34,6 +34,7 @@ pub mod providers;
 pub mod scenes;
 pub mod summary;
 pub mod theater;
+pub mod theme;
 pub mod updater;
 
 pub use ingestion::*;
@@ -41,6 +42,7 @@ pub use providers::*;
 pub use scenes::*;
 pub use summary::*;
 pub use theater::*;
+pub use theme::*;
 pub use updater::*;
 
 #[tauri::command]

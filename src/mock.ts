@@ -48,6 +48,9 @@ const settings: Settings = {
   proxy: null,
 };
 
+/** themes/<名>.json 的内存替身（M4.3 主题持久化） */
+const themeFiles = new Map<string, Record<string, unknown>>();
+
 const personas: Persona[] = [
   { name: "夜读者", description: "安静的图书馆常客，话少，观察细。" },
 ];
@@ -470,6 +473,23 @@ export function setupMock() {
         };
       case "download_and_install":
         throw new Error("浏览器 mock 模式没有安装器——更新闭环请运行打包版");
+      // ---------- 主题持久化（M4.3）：内存 Map——启动迁移/库保存/应用浏览器模式可走查；
+      // 导入解析是 Rust 纯函数，mock 不复刻（真机或单测验证） ----------
+      case "theme_save": {
+        const { name, theme } = args as { name: string; theme: Record<string, unknown> };
+        themeFiles.set(name, theme);
+        return name;
+      }
+      case "theme_load":
+        return themeFiles.get((args as { name: string }).name) ?? null;
+      case "theme_list":
+        return [...themeFiles.keys()].sort();
+      case "theme_delete":
+        return themeFiles.delete((args as { name: string }).name);
+      case "theme_parse_import":
+        throw new Error("浏览器 mock 不做导入解析（Rust 纯函数）——请运行打包版走查导入");
+      case "theme_export_file":
+        return "DataHub/exports/" + (args as { name: string }).name + ".theme.css（浏览器 mock）";
       case "list_personas":
         return personas;
       case "list_cards":

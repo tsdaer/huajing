@@ -43,6 +43,7 @@ import type {
   WorldbookReport,
   WorldlineView,
 } from "./types";
+import type { CustomTheme, ParsedThemeImport } from "./theme";
 
 export type NewSessionOptions = {
   character: string;
@@ -89,6 +90,21 @@ export const api = {
     channel.onmessage = onEvent;
     return invoke<void>("download_and_install", { onEvent: channel });
   },
+
+  // ---------- 主题持久化（M4.3 · 决断 7：DataHub/themes/<名>.json） ----------
+  /** 保存主题（覆盖同名）；返回落盘文件 stem */
+  themeSave: (name: string, theme: CustomTheme) => invoke<string>("theme_save", { name, theme }),
+  /** 读主题；不存在 = null（启动加载依赖这个语义） */
+  themeLoad: (name: string) => invoke<CustomTheme | null>("theme_load", { name }),
+  /** 主题库清单（themes/*.json 的 stem，字典序，含活动主题 custom） */
+  themeList: () => invoke<string[]>("theme_list"),
+  /** 删除主题文件；返回是否真的删了 */
+  themeDelete: (name: string) => invoke<boolean>("theme_delete", { name }),
+  /** 主题块导入解析（CSS 块或 JSON）；键不在 allowedKeys 里拒绝并列出非法键 */
+  themeParseImport: (payload: string, allowedKeys: string[]) =>
+    invoke<ParsedThemeImport>("theme_parse_import", { payload, allowedKeys }),
+  /** 主题 CSS 落文件（导出「保存文件」出口）：exports/<名>.theme.css，返回完整路径 */
+  themeExportFile: (name: string, css: string) => invoke<string>("theme_export_file", { name, css }),
 
   listPersonas: () => invoke<Persona[]>("list_personas"),
 

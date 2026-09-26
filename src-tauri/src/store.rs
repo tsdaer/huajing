@@ -329,6 +329,183 @@ pub fn list_personas(root: &Path) -> StoreResult<Vec<Persona>> {
     Ok(out)
 }
 
+// ---------- themes/（自定义主题，M4.3 · 决断 7：主题块是运行时数据，归 JSON 侧）----------
+//
+// `themes/<名>.json`：拷走 DataHub 即主题跟走。固定保留名 `custom` 是「当前生效的
+// 自定义主题」——启动时由前端加载并应用；其余名字是主题库（主题页保存/应用）。
+
+/// 当前生效的自定义主题的固定文件名（stem）。活动主题永远写这里，避免「哪个文件
+/// 在生效」需要第二个指针。
+pub const THEME_ACTIVE_STEM: &str = "custom";
+
+/// 主题 JSON（与前端 `CustomTheme` 同形，camelCase 由 serde 映射）。
+/// vars 是令牌 → 值（如 `--color-primary` → `oklch(...)`）；BTreeMap 让序列化
+/// 顺序确定（同主题多次落盘字节一致，diff 友好）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTheme {
+    #[serde(default)]
+    pub preset: String,
+    pub color_scheme: String,
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+}
+
+pub fn save_theme(root: &Path, name: &str, theme: &CustomTheme) -> StoreResult<String> {
+    let stem = crate::stimport::sanitize_dir_name(name);
+    let dir = root.join("themes");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{stem}.json"));
+    let json = serde_json::to_string_pretty(theme)?;
+    std::fs::write(&path, json + "\n")?;
+    Ok(stem)
+}
+
+/// 读单个主题；文件不存在 = None（不是错误——启动加载依赖这个语义）。
+pub fn load_theme(root: &Path, name: &str) -> StoreResult<Option<CustomTheme>> {
+    let stem = crate::stimport::sanitize_dir_name(name);
+    let path = root.join("themes").join(format!("{stem}.json"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&std::fs::read_to_string(&path)?)?))
+}
+
+pub fn list_themes(root: &Path) -> StoreResult<Vec<String>> {
+    let dir = root.join("themes");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            out.push(stem.to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// 删除主题文件；返回是否真的删了东西（清除活动主题时用于幂等）。
+pub fn delete_theme(root: &Path, name: &str) -> StoreResult<bool> {
+    let stem = crate::stimport::sanitize_dir_name(name);
+    let path = root.join("themes").join(format!("{stem}.json"));
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path)?;
+    Ok(true)
+}
+
+/// 主题块导入的解析结果（name/color-scheme 取自块内声明，vars 为键值对）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedThemeImport {
+    pub name: String,
+    pub color_scheme: String,
+    pub vars: BTreeMap<String, String>,
+}
+
+/// 导入解析（纯函数，便于单测）：接受 toPluginCss 同格式的 `@plugin "daisyui/theme"`
+/// CSS 块，或前端 `CustomTheme` 同形的 JSON。键不在 allowed_keys 里的一律拒绝并
+/// **列出全部非法键**（DoD：坏令牌键导入拒绝并列出非法键）——导入面只认编辑器
+/// 认识的令牌，未知键宁可让用户删掉也不静默带上。
+pub fn parse_theme_import(payload: &str, allowed_keys: &[String]) -> Result<ParsedThemeImport, String> {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return Err("导入内容为空".into());
+    }
+    let (name, color_scheme, raw_vars) = if trimmed.starts_with('{') {
+        parse_theme_json(trimmed)?
+    } else {
+        parse_theme_css(trimmed)?
+    };
+    let mut vars = BTreeMap::new();
+    let mut illegal: Vec<String> = Vec::new();
+    for (key, value) in raw_vars {
+        let value = value.trim().trim_end_matches(';').trim().to_string();
+        if !allowed_keys.iter().any(|k| k == &key) {
+            illegal.push(key);
+            continue;
+        }
+        if value.is_empty() {
+            continue;
+        }
+        vars.insert(key, value);
+    }
+    if !illegal.is_empty() {
+        illegal.sort();
+        illegal.dedup();
+        return Err(format!("存在不认识的令牌键：{}", illegal.join("、")));
+    }
+    if vars.is_empty() {
+        return Err("没有可用的令牌键值对".into());
+    }
+    let name = if name.trim().is_empty() { "custom".to_string() } else { name.trim().to_string() };
+    let color_scheme = if color_scheme == "dark" { "dark".to_string() } else { "light".to_string() };
+    Ok(ParsedThemeImport { name, color_scheme, vars })
+}
+
+/// JSON 分支：`{preset?, colorScheme?, vars?}`（前端 CustomTheme 同形）。
+fn parse_theme_json(trimmed: &str) -> Result<(String, String, Vec<(String, String)>), String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Raw {
+        #[serde(default)]
+        preset: String,
+        #[serde(default)]
+        color_scheme: String,
+        #[serde(default)]
+        vars: BTreeMap<String, String>,
+    }
+    let raw: Raw = serde_json::from_str(trimmed).map_err(|e| format!("主题 JSON 解析失败：{e}"))?;
+    Ok((
+        raw.preset,
+        raw.color_scheme,
+        raw.vars.into_iter().collect(),
+    ))
+}
+
+/// CSS 分支：取 `@plugin "daisyui/theme" { … }` 块内的 `name` / `color-scheme`
+/// 声明与 `--key: value;` 令牌行。块外的内容一律忽略（用户可能连着别的 CSS 一起粘）。
+fn parse_theme_css(trimmed: &str) -> Result<(String, String, Vec<(String, String)>), String> {
+    const MARK: &str = "@plugin";
+    let mark_pos = trimmed.find(MARK).ok_or("未找到 @plugin 主题块（应粘「主题」页导出的 CSS）")?;
+    let open = trimmed[mark_pos..]
+        .find('{')
+        .ok_or("主题块缺少 {（应粘「主题」页导出的 CSS）")?;
+    let after_open = &trimmed[mark_pos + open + 1..];
+    // 主题块不嵌套：碰到第一个 } 即收尾
+    let close = after_open.find('}').ok_or("主题块缺少 }（应粘「主题」页导出的 CSS）")?;
+    let body = &after_open[..close];
+
+    let mut name = String::new();
+    let mut color_scheme = String::new();
+    let mut vars = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        let line = line.strip_suffix(';').unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('"').to_string();
+        if key == "name" {
+            name = value;
+        } else if key == "color-scheme" {
+            color_scheme = value;
+        } else if key.starts_with("--") {
+            vars.push((key.to_string(), value));
+        }
+        // 其余声明（default / prefersdark 等）不是令牌，忽略
+    }
+    Ok((name, color_scheme, vars))
+}
+
 // ---------- sessions/（设计 §12：session.json + messages.jsonl + state.json + blackboard.json）----------
 
 /// 剧场模式配置（M3.6 · 设计 §10.5）：自动轮次的轮数预算与起点。
@@ -2070,5 +2247,141 @@ mod tests {
         assert_eq!(s.input_budget(), 0, "0 钳到 1 后预算归零但不 panic");
         s.context_window = Some(8192);
         assert_eq!(s.input_budget(), 8192 * 75 / 100, "正常值不受影响");
+    }
+
+    // ---------- themes/（M4.3 · 决断 7） ----------
+
+    fn sample_theme(name: &str) -> CustomTheme {
+        CustomTheme {
+            preset: name.into(),
+            color_scheme: "dark".into(),
+            vars: BTreeMap::from([
+                ("--color-primary".to_string(), "oklch(55% 0.2 20)".to_string()),
+                ("--radius-box".to_string(), "1rem".to_string()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn themes_roundtrip_list_and_delete() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(list_themes(root.path()).unwrap().is_empty());
+        assert!(load_theme(root.path(), THEME_ACTIVE_STEM).unwrap().is_none(), "空库读活动主题 = None（不是错误）");
+
+        save_theme(root.path(), THEME_ACTIVE_STEM, &sample_theme("当前")).unwrap();
+        save_theme(root.path(), "cupcake 改", &sample_theme("cupcake 改")).unwrap();
+        // 覆盖同名而非堆文件
+        let mut edited = sample_theme("cupcake 改");
+        edited.vars.insert("--color-base-100".into(), "#111".into());
+        save_theme(root.path(), "cupcake 改", &edited).unwrap();
+
+        assert_eq!(list_themes(root.path()).unwrap(), vec!["cupcake 改", "custom"]);
+        let loaded = load_theme(root.path(), THEME_ACTIVE_STEM).unwrap().unwrap();
+        assert_eq!(loaded, sample_theme("当前"));
+        assert_eq!(
+            load_theme(root.path(), "cupcake 改").unwrap().unwrap().vars.get("--color-base-100").map(String::as_str),
+            Some("#111")
+        );
+
+        assert!(delete_theme(root.path(), THEME_ACTIVE_STEM).unwrap());
+        assert!(!delete_theme(root.path(), THEME_ACTIVE_STEM).unwrap(), "重复删除幂等报 false");
+        assert_eq!(list_themes(root.path()).unwrap(), vec!["cupcake 改"]);
+    }
+
+    #[test]
+    fn theme_name_sanitized_into_safe_stem() {
+        let root = tempfile::tempdir().unwrap();
+        // 路径分隔与上跳片段不能构成目录穿越；落盘文件落在 themes/ 平面一层
+        let stem = save_theme(root.path(), "a/b\\c..d:e", &sample_theme("x")).unwrap();
+        assert!(!stem.contains('/') && !stem.contains('\\') && !stem.contains(".."));
+        assert!(root.path().join("themes").join(format!("{stem}.json")).is_file());
+        assert_eq!(list_themes(root.path()).unwrap(), vec![stem]);
+    }
+
+    #[test]
+    fn themes_survive_datahub_copy() {
+        // DoD「DataHub 拷贝主题跟走」读侧：themes/ 目录原样拷到新数据根后读回一致
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        save_theme(src.path(), THEME_ACTIVE_STEM, &sample_theme("当前")).unwrap();
+        save_theme(src.path(), "library", &sample_theme("library")).unwrap();
+
+        // themes/ 目录是平面一层 *.json，逐文件拷贝（copy_dir_all 尚在 stable 之外）
+        let dst_themes = dst.path().join("themes");
+        std::fs::create_dir_all(&dst_themes).unwrap();
+        for entry in std::fs::read_dir(src.path().join("themes")).unwrap().flatten() {
+            std::fs::copy(entry.path(), dst_themes.join(entry.file_name())).unwrap();
+        }
+        assert_eq!(list_themes(dst.path()).unwrap(), vec!["custom", "library"]);
+        assert_eq!(load_theme(dst.path(), THEME_ACTIVE_STEM).unwrap(), Some(sample_theme("当前")));
+        // 字节级一致：同主题多次落盘内容稳定（BTreeMap 顺序确定）
+        let first = std::fs::read(src.path().join("themes").join("custom.json")).unwrap();
+        let second = std::fs::read(dst.path().join("themes").join("custom.json")).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn theme_import_parses_css_block() {
+        let allowed = vec!["--color-primary".to_string(), "--radius-box".to_string()];
+        let css = r#"@plugin "daisyui/theme" {
+  name: "my theme";
+  default: false;
+  prefersdark: false;
+  color-scheme: dark;
+  --color-primary: oklch(55% 0.2 20);
+  --radius-box: 1rem;
+}"#;
+        let parsed = parse_theme_import(css, &allowed).unwrap();
+        assert_eq!(parsed.name, "my theme");
+        assert_eq!(parsed.color_scheme, "dark");
+        assert_eq!(parsed.vars.get("--color-primary").map(String::as_str), Some("oklch(55% 0.2 20)"));
+        assert_eq!(parsed.vars.get("--radius-box").map(String::as_str), Some("1rem"));
+        // 结构键（default/prefersdark）不是令牌，忽略不算非法
+    }
+
+    #[test]
+    fn theme_import_parses_json_payload() {
+        let allowed = vec!["--color-primary".to_string()];
+        let parsed = parse_theme_import(
+            r##"{"preset":"库里的","colorScheme":"dark","vars":{"--color-primary":"#123456"}}"##,
+            &allowed,
+        )
+        .unwrap();
+        assert_eq!(parsed.name, "库里的");
+        assert_eq!(parsed.color_scheme, "dark");
+        assert_eq!(parsed.vars.get("--color-primary").map(String::as_str), Some("#123456"));
+    }
+
+    #[test]
+    fn theme_import_rejects_illegal_keys_and_lists_them() {
+        let allowed = vec!["--color-primary".to_string(), "--color-accent".to_string()];
+        let css = r#"@plugin "daisyui/theme" {
+  name: "bad";
+  color-scheme: light;
+  --color-primary: #fff;
+  --color-nope: #000;
+  --radius-unknown: 2px;
+}"#;
+        let err = parse_theme_import(css, &allowed).unwrap_err();
+        assert!(err.contains("--color-nope") && err.contains("--radius-unknown"), "列出全部非法键：{err}");
+        assert!(!err.contains("--color-primary"), "合法键不在报错里：{err}");
+
+        let err = parse_theme_import(r#"{"vars":{"--bogus":"x"}}"#, &allowed).unwrap_err();
+        assert!(err.contains("--bogus"), "JSON 分支同样拒绝：{err}");
+
+        assert!(parse_theme_import("", &allowed).is_err(), "空内容拒绝");
+        assert!(parse_theme_import("body { color: red; }", &allowed).is_err(), "无 @plugin 块拒绝");
+        assert!(
+            parse_theme_import("@plugin \"daisyui/theme\" { name: \"x\"; }", &allowed).is_err(),
+            "没有可用键值对拒绝"
+        );
+        // name/color-scheme 缺省兜底
+        let parsed = parse_theme_import(
+            "@plugin \"daisyui/theme\" { --color-primary: #fff; }",
+            &allowed,
+        )
+        .unwrap();
+        assert_eq!(parsed.name, "custom");
+        assert_eq!(parsed.color_scheme, "light");
     }
 }

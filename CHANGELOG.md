@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+### Added · 主题系统收尾（M4.3 · 设计 §14 · 决断 7「主题跟数据走」）
+
+- **自定义主题落 `DataHub/themes/<名>.json`**（store.rs 目录约定 + 五条命令：
+  保存/读取/列表/删除/导入解析）：`custom` 是保留名 = 当前生效的自定义主题
+  （启动时挂载前加载应用，无主题闪变），其余名字是主题库。文件名沿
+  `sanitize_dir_name` 惯例（路径分隔/上跳片段不能构成穿越）；vars 用 BTreeMap
+  序列化顺序确定（同主题多次落盘字节一致）。**拷走 DataHub 即主题跟走**
+  （单测读侧 + 真机走查双钉）。
+- **localStorage 旧值首启迁移**：后端无 `custom.json` 而 localStorage 有旧自定义
+  → 自动写进 DataHub 并清掉旧键（迁移失败不阻塞启动，下次再试）；
+  localStorage 从此只是迁移源，不再是事实源。
+- **主题块导入**：粘贴 toPluginCss 同格式的 `@plugin "daisyui/theme"` CSS 块
+  （或连着别的 CSS 一起粘，块外内容忽略）或选择主题 JSON 文件 → 后端纯函数
+  解析（name/color-scheme/令牌键值对），键不在编辑器令牌全集里**整包拒绝并列出
+  全部非法键**（单测 + 真机各一钉）；导入即应用并写回活动主题。
+- **导出双出口**：复制到剪贴板（已有）+「保存文件」落 `DataHub/exports/<名>.theme.css`。
+- **主题库 UI**：「存入库」按当前主题名落 `themes/<名>.json`，列表点选即应用
+  （watcher 实时生效并写回活动主题）；「清除」删活动主题文件、库条目保留。
+  浏览器 mock 给主题命令的内存实现（导入解析除外——Rust 纯函数不复刻）。
+
 ### Added · 签名自动更新（M4.2 · 设计 §13 · 决断 1「更新无服务器」）
 
 - **updater 插件接线**（新增依赖 `tauri-plugin-updater` + `tauri-plugin-process`，官方
