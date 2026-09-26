@@ -25,8 +25,6 @@ export interface UseChatStreamDeps {
   composerEl: Ref<HTMLTextAreaElement | null>;
   jumpToLastPage: () => Promise<void> | void;
   refreshInspector: () => Promise<void> | void;
-  /** B6：组件卸载后 promise 链断链 */
-  isDisposed: () => boolean;
   theaterApi: TheaterApi;
   /** 轮末收尾里「面板相关」的刷新（检查器开着就重拉、事件流页签即时可见），SessionView 接线 */
   onRoundEnd: () => Promise<void> | void;
@@ -220,14 +218,12 @@ export function useChatStream(deps: UseChatStreamDeps) {
     scheduleNote.value = "";
     void deps.refreshInspector();
     void refreshCard();
-    // 剧场模式：刷新进度，预算内自动推进下一轮（出错/用户手动停止就停在原地）
+    // 剧场模式（M4.1 加固）：轮末回报调度器（用户手动停止 → 暂停到下一轮干净收尾），
+    // 推进本身交给 autoAdvance——它内部重读进度、复核守卫，出错/取消/超预算就原地不动
     const cancelled = final.event === "done" && final.cancelled;
     if (deps.theaterApi.theater.value?.on) {
-      await deps.theaterApi.refreshTheater(deps.sessionId());
-      const t = deps.theaterApi.theater.value;
-      // B6：组件卸载后 promise 链就地断掉，不再驱动下一轮
-      if (!deps.isDisposed() && !deps.error.value && !cancelled && t?.on && t.used < t.budget)
-        void deps.theaterApi.autoAdvance();
+      deps.theaterApi.notifyRoundEnd(cancelled);
+      void deps.theaterApi.autoAdvance();
     }
     // 刚聊完一轮：状态树/剧情线/心理/宫殿多半都变了，抽屉开着就顺手重拉（设计 §8/§9 的「面板可查」）
     await deps.onRoundEnd();

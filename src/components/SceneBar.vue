@@ -30,12 +30,14 @@ function sceneTip(sc: Scene): string {
 <template>
   <div class="card card-border flex-none bg-base-100">
     <div class="flex items-center gap-1 p-2">
-      <!-- 场景滚动带：多于一屏才出现右缘渐隐，暗示可横滑；滚动条隐藏（截断即暗示） -->
+      <!-- 场景滚动带：多于一屏才出现右缘渐隐，暗示可横滑；滚动条隐藏（截断即暗示）。
+           ≤3 场景时不设滚动容器——overflow 滚动容器会把纵剪方向一起裁掉，
+           悬停提示（伪元素在按钮下方）就永远露不出来 -->
       <div
-        class="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        class="flex min-w-0 flex-1 items-center gap-1 py-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         :class="
           scenes.length > 3
-            ? '[mask-image:linear-gradient(to_right,black_0%,black_calc(100%-28px),transparent_100%)]'
+            ? 'overflow-x-auto [mask-image:linear-gradient(to_right,black_0%,black_calc(100%-28px),transparent_100%)]'
             : ''
         "
       >
@@ -65,9 +67,11 @@ function sceneTip(sc: Scene): string {
           </span>
         </button>
       </div>
+      <!-- 右缘按钮组：提示一律向左弹（tooltip-left）——按钮贴着窗口右缘，
+           居中气泡的右半必被外壳层裁掉（设计 §10.3） -->
       <div class="flex flex-none items-center gap-1 pl-1">
         <button
-          class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+          class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
           data-tip="编辑当前场景：标题/地点/在场者/局部时钟"
           :disabled="busy || !activeScene"
           @click="emit('edit')"
@@ -75,7 +79,7 @@ function sceneTip(sc: Scene): string {
           <Icon name="edit" :size="15" />
         </button>
         <button
-          class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+          class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
           data-tip="新场景：另起一个舞台（视角随即切过去）"
           :disabled="busy"
           @click="emit('create')"
@@ -83,7 +87,7 @@ function sceneTip(sc: Scene): string {
           <Icon name="plus" :size="15" />
         </button>
         <button
-          class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+          class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
           data-tip="分场：挑人离场另立场景（「与此同时」）"
           :disabled="busy"
           @click="emit('split')"
@@ -91,7 +95,7 @@ function sceneTip(sc: Scene): string {
           <Icon name="split" :size="15" />
         </button>
         <button
-          class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+          class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
           data-tip="合场：把另一路场景并进当前场景（对话框里讲清对齐后果）"
           :disabled="busy"
           @click="emit('merge')"

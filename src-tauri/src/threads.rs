@@ -1354,6 +1354,7 @@ fn f32_value(x: f32) -> Value {
 fn value_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => crate::prompt::num_text(n),
         other => other.to_string(),
     }
 }
@@ -1374,7 +1375,7 @@ fn get_text(map: &Map<String, Value>, key: &str) -> Option<String> {
 fn as_text(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
+        Value::Number(n) => Some(crate::prompt::num_text(n)),
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }

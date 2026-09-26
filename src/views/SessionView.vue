@@ -159,6 +159,8 @@ const theaterCtl = useTheater({
   error,
   generating,
   isDisposed: () => disposed,
+  sessionId: () => props.meta.id,
+  isIdle: () => editingIndex.value === -1,
   loadScenes: () => loadScenes(),
   sendText: (content) => chat.sendText(content),
 });
@@ -181,11 +183,11 @@ const chat = useChatStream({
   composerEl,
   jumpToLastPage,
   refreshInspector,
-  isDisposed: () => disposed,
   theaterApi: {
     theater: theaterCtl.theater,
     refreshTheater: theaterCtl.refreshTheater,
     autoAdvance: theaterCtl.autoAdvance,
+    notifyRoundEnd: theaterCtl.notifyRoundEnd,
   },
   onRoundEnd: () => {
     // 刚聊完一轮：抽屉开着就顺手重拉（设计 §8/§9 的「面板可查」）
@@ -628,6 +630,14 @@ watch(cardGeneration, () => {
     })
     .catch(() => {});
 });
+// 消息增删改变剧场进度（used = 当前轮 − 开场轮）：视图跟着重读。预算耗尽后
+// 删档回退也能让自动轮次恢复——调度器的缓存预检靠这次重读纠偏，否则永不解封
+watch(
+  () => messages.value.length,
+  () => {
+    if (props.meta.id) void theaterCtl.refreshTheater(props.meta.id);
+  },
+);
 </script>
 
 <template>
@@ -681,7 +691,7 @@ watch(cardGeneration, () => {
 
         <div class="flex flex-none items-center gap-1">
           <button
-            class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
             data-tip="黑板"
             :class="{ 'btn-active': panel === 'board' }"
             @click="togglePanel('board')"
@@ -689,7 +699,7 @@ watch(cardGeneration, () => {
             <Icon name="layers" :size="16" />
           </button>
           <button
-            class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
             data-tip="记忆检查器"
             :class="{ 'btn-active': panel === 'inspector' }"
             @click="togglePanel('inspector')"
@@ -787,7 +797,7 @@ watch(cardGeneration, () => {
                   class="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 max-lg:opacity-70"
                 >
                   <button
-                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-bottom"
+                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-left"
                     data-tip="编辑"
                     @click="startEdit(i)"
                   >
@@ -795,14 +805,14 @@ watch(cardGeneration, () => {
                   </button>
                   <button
                     v-if="canReroll(i, m)"
-                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-bottom"
+                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-left"
                     :data-tip="m.role === 'char' ? '重roll 这一轮' : '重试生成'"
                     @click="reroll"
                   >
                     <Icon name="refresh" :size="13" />
                   </button>
                   <button
-                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-bottom"
+                    class="btn btn-square btn-ghost btn-xs tooltip tooltip-left"
                     data-tip="删除"
                     @click="removeMsg(i)"
                   >
@@ -913,7 +923,7 @@ watch(cardGeneration, () => {
             ></progress>
             <span class="flex-none tabular-nums text-base-content/50">{{ theater?.used }}/{{ theater?.budget }} 轮</span>
             <button
-              class="btn btn-ghost btn-xs tooltip tooltip-top flex-none"
+              class="btn btn-ghost btn-xs tooltip tooltip-left flex-none"
               :disabled="generating"
               data-tip="停掉自动轮次（已走到的阶段保留）"
               @click="theaterCtl.setTheater(meta.id, false)"
@@ -947,7 +957,7 @@ watch(cardGeneration, () => {
             <div role="tablist" class="tabs tabs-box tabs-xs">
               <button
                 role="tab"
-                class="tab tooltip tooltip-bottom"
+                class="tab tooltip tooltip-right"
                 :class="{ 'tab-active': !speaker }"
                 data-tip="导演按相关性打分选人接话（最近提及 · 场景 · 剧情线 · 想说话）"
                 @click="speaker = ''"
@@ -1046,7 +1056,7 @@ watch(cardGeneration, () => {
             </span>
             <button
               v-if="!theater?.on"
-              class="btn btn-ghost btn-xs tooltip tooltip-top ml-auto"
+              class="btn btn-ghost btn-xs tooltip tooltip-left ml-auto"
               :disabled="generating"
               data-tip="剧场模式：导演树起承转合自动跑一轮数预算（缺省 20 轮），多场景时交叉剪辑"
               @click="theaterCtl.setTheater(meta.id, true)"

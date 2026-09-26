@@ -302,7 +302,7 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
       <div role="tablist" class="tabs tabs-box tabs-xs">
         <button
           role="tab"
-          class="tab tooltip tooltip-bottom"
+          class="tab tooltip tooltip-right"
           :class="{ 'tab-active': !inspView }"
           data-tip="主角色（缺省视角）"
           @click="inspView = ''"

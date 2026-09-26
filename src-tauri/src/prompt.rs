@@ -1280,6 +1280,42 @@ pub fn estimate_tokens(text: &str) -> usize {
     cjk + other.div_ceil(4)
 }
 
+// ---------- 数字 → 提示词文本（组装各层共用的展示口径）----------
+
+/// JSON 数字 → 提示词可读文本。
+///
+/// Lua 侧的浮点运算在状态里留下 0.30000000000000004 一类二进制噪声（f32 心理
+/// 强度升位成 f64 还会变成 0.3799999952316284），原样拼进提示词既费 token 又
+/// 教模型学着输出长尾数字。展示口径（M4.1 走查）：整数原样；小数收敛到最多
+/// 4 位并去掉尾随零（0.3、55.7、0.6667）；非有限值兜底原样输出。
+pub fn num_text(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    let Some(f) = n.as_f64() else {
+        return n.to_string();
+    };
+    if !f.is_finite() {
+        return n.to_string();
+    }
+    if f == f.trunc() && f.abs() < 1e15 {
+        return format!("{}", f as i64);
+    }
+    let mut s = format!("{f:.4}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    if s == "-0" { "0".to_string() } else { s }
+}
+
 fn is_cjk(c: char) -> bool {
     matches!(c as u32,
         0x3000..=0x303F   // CJK 标点
@@ -1537,6 +1573,20 @@ mod tests {
         let asm = build(&inputs(&settings, Some(&persona), &card, &state, &bb, &[], &[], None));
         assert!(asm.messages[0].content.contains("【用户人格】\n夜读者：深夜常来的读者。"));
         assert!(asm.layers.iter().any(|l| l.id == "A2"));
+    }
+
+    #[test]
+    fn num_text_collapses_float_noise() {
+        // Lua 累加 / f32 升位留下的二进制噪声收敛为干净短数（M4.1 走查）
+        let n = |s: &str| num_text(&serde_json::from_str::<serde_json::Value>(s).unwrap().as_number().unwrap().clone());
+        assert_eq!(n("0.30000000000000004"), "0.3");
+        assert_eq!(n("0.3799999952316284"), "0.38");
+        assert_eq!(n("55.70000000000001"), "55.7");
+        assert_eq!(n("72.0"), "72"); // f64 整数值不带 .0
+        assert_eq!(n("2"), "2"); // 整数原样
+        assert_eq!(n("-0.0"), "0");
+        assert_eq!(n("0.6666666666666666"), "0.6667"); // 超出 4 位收敛
+        assert_eq!(n("1.5"), "1.5");
     }
 
     #[test]

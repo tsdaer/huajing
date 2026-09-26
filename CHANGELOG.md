@@ -4,6 +4,41 @@
 
 ## [Unreleased]
 
+### Fixed · 真机走查四处（界面整页闪烁 / 边缘 tooltip 裁剪 / 提示词浮点噪声 / 剧场停摆）
+
+- **每轮回复后界面整页闪烁（dev 模式）**（`vite.config.ts`）：`tauri dev` 下 vite 监听
+  整个项目（此前只忽略 `src-tauri`），而每轮回复落定后端都要做轮末世界回写——重写
+  `DataHub/codex/default/world.json`——vite 对这个 `.json` 变更触发**整页 reload**，
+  界面像浏览器刷新一样闪一下（真机隔离实验实锤：world.json 重写必现、`.jsonl`
+  追加与无关 `.json` 增删不触发）。重载同时卸载会话视图（B6 断链 + 停止在途生成），
+  也是此前「剧场跑两轮就静默停摆」在 dev 下的真凶。修复：`DataHub/**`、`dist/**`、
+  `temp/**` 加入 `server.watch.ignored`——运行时数据有应用自己的热加载通道
+  （`watch.rs` 只推 characters/personas/settings），前端 dev server 不该盯它们。
+  打包版无 vite，本就不受影响。
+
+### Fixed · 真机走查三处（边缘 tooltip 裁剪 / 提示词浮点噪声 / 剧场停摆）
+
+- **边缘组件悬停提示被裁剪**：聊天区 `<section>` 自带 `overflow-hidden`、应用外壳
+  `drawer-content` 挂 `overflow-x-clip`，daisyUI 气泡又恒居中于触发元素——右缘
+  按钮（剧场、收棚、合场、分场、新场景、编辑场景、黑板/检查器开关）与贴左缘的
+  「导演调度」页签、检查器「主角色」页签的气泡必被裁掉。修复按「向内容区弹」
+  一律改 `tooltip-left` / `tooltip-right`；场景条滚动带 `overflow-x-auto` 会把
+  纵向裁剪一起带出来（`overflow-y` 被计算为 `auto`），改为仅多于 3 场景才挂
+  滚动容器，场景卡的悬停详情在常态下露得出来。
+- **提示词组装的浮点长尾**（`prompt.rs` 新增 `num_text`，`codex.rs` / `threads.rs`
+  的数字渲染收口）：Lua 侧浮点运算在状态里留下 `0.30000000000000004` 一类二进制
+  噪声（f32 心理强度升位 f64 还会翻成 `0.3799999952316284`），B3 实体卡（one_liner /
+  facts / ▸当前 live 行 / `{{bb.*}}` 占位）与剧情线字段原样拼进提示词。展示口径：
+  整数原样，小数收敛到最多 4 位去尾零（`0.3`、`55.7`、`0.6667`）；单测钉死。
+- **剧场自动轮次跑两轮后静默停摆**（`useTheater.ts` 推进链重写为收敛式调度）：
+  旧实现是 hand-rolled promise 链——`generating`/世代/错误/取消/进度任一守卫在
+  轮末判定失败就**静默断链**，进度条停在半路、无提示、无自愈（真机两个会话
+  均复现「恰好两轮后没动静」）。修复：`autoAdvance` 变为可从任意时机安全重入的
+  调度入口（先廉价预检再重读磁盘上的剧场视图，进度/开关/预算以重读为准）+
+  单飞守卫防双发；轮末回报 `notifyRoundEnd`（用户手动停止 → 暂停到下一轮干净
+  收尾，不再永久哑火）；2s 看门狗心跳兜住一切静默断链并顺带解决「带着剧场
+  开关重开页面不续跑」；消息增删跟随重读剧场视图（预算耗尽后删档回退可解封）。
+
 ### Added · 持续集成与发布自动化（GitHub Actions）
 
 - **CI 门禁**（`.github/workflows/ci.yml`）：push 到 main / PR / 手动 dispatch 触发，windows-latest 与开发机同平台，concurrency 同 ref 自动取消旧跑，全程只读权限；云端只守前端构建（`pnpm install --frozen-lockfile` + `pnpm build`，vue-tsc + vite）。`cargo test` 不上云——llm.rs 的 loopback mock 用例依赖「重试开新连接」，在无代理直连的 runner 上被 keep-alive 连接池复用卡死（本地系统代理掩护故绿），496 例全绿仍由本地 DoD 保证。

@@ -703,7 +703,7 @@ fn as_text(v: &Value) -> Option<String> {
                 Some(t.to_string())
             }
         }
-        Value::Number(n) => Some(n.to_string()),
+        Value::Number(n) => Some(crate::prompt::num_text(n)),
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
@@ -2078,7 +2078,7 @@ fn push_affects(v: &Value, out: &mut Vec<String>) {
 fn value_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.trim().to_string(),
-        Value::Number(n) => n.to_string(),
+        Value::Number(n) => crate::prompt::num_text(n),
         Value::Bool(b) => {
             if *b {
                 "是".to_string()
@@ -2230,6 +2230,33 @@ mod tests {
     use serde_json::json;
 
     // ---------- 测试脚手架 ----------
+
+    #[test]
+    fn value_text_and_live_line_render_clean_numbers() {
+        // 状态里的浮点噪声（Lua 累加 / f32 升位）不原样进 B3 卡片文本（M4.1 走查）
+        assert_eq!(value_text(&json!(0.3799999952316284)), "0.38");
+        assert_eq!(value_text(&json!(0.30000000000000004)), "0.3");
+        assert_eq!(value_text(&json!(72.0)), "72");
+        let e = CodexEntity::from_value(&json!({
+            "id": "char.小雨",
+            "name": "小雨",
+            "type": "char",
+            "one_liner": "图书馆的管理员。",
+            "live": ["好感", "情绪"]
+        }))
+        .expect("实体应能解析");
+        let bb = [
+            ("好感".to_string(), json!(55.70000000000001)),
+            (
+                "char.小雨.情绪".to_string(),
+                json!(0.3799999952316284),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let line = live_line(&e, &bb).expect("live 值应取到");
+        assert_eq!(line, "▸当前:55.7,0.38");
+    }
 
     fn big() -> CodexBudget {
         CodexBudget {
