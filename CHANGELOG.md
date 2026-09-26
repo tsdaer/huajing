@@ -2,6 +2,14 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
+## [Unreleased]
+
+### Added · 持续集成与发布自动化（GitHub Actions）
+
+- **CI 门禁**（`.github/workflows/ci.yml`）：push 到 main / PR / 手动 dispatch 触发，windows-latest 与开发机同平台；`web`（pnpm install --frozen-lockfile + `pnpm build`）与 `rust`（Rust stable + rust-cache + `cargo test --locked` 离线全量）两 job 并行，concurrency 同 ref 自动取消旧跑，全程只读权限。
+- **发布构建**（`.github/workflows/release.yml`）：push tag `v*` 或手动 dispatch 触发；从 `tauri.conf.json` 读版本并校验 tag 与版本严格一致（不符即红，防错包流出）→ `pnpm tauri build` 产 NSIS + MSI → 从 CHANGELOG 提取 `[x.y.z]` 定版段作 body → 挂**草稿 Release**，人工检查后手动 Publish 才公开；手动 dispatch 可勾 `build_only` 试车（只产 workflow artifacts 不建 Release）。CI 与 Release 共享 rust-cache key。
+- README 增「持续集成与发布」小节与 CI badge；updater 签名 / `latest.json` 留位给 M4.2。
+
 ## [0.3.1] - 2026-09-26
 
 > 0.3.x 收尾定版（M4.0 · [docs/plan/m4.md](docs/plan/m4.md)）：增强计划（工具调用/定时器/卡 API/旁白/小说模式/OOC）与全库加固的发布段，四项遗留真机走查全部通过并当场修复两处引擎缺陷。`cargo test` 496 例全绿（495 + 版本一致性钉子）、`pnpm build` 双绿。

@@ -1,0 +1,57 @@
+# CI 门禁：把项目自身的 DoD（cargo test + pnpm build 双绿）搬上云端。
+# 触发：push 到 main、指向 main 的 PR、手动 workflow_dispatch。
+# concurrency 按 ref 分组：同一分支连推自动取消被顶替的旧跑，不排队空烧。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 前端门禁：vue-tsc 类型检查 + vite 构建（即 package.json 的 pnpm build）
+  web:
+    name: web (vue-tsc + vite)
+    runs-on: windows-latest # 与开发机同平台，避免 Linux/macOS-only 的意外红
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # 仓库未钉 pnpm/node 版本（无 packageManager/.nvmrc），在此处钉：
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+  # Rust 门禁：离线全量测试（含 M4.0 的「版本三处一致性」钉子）。
+  # 4 个联网用例本就 #[ignore]（HUAJING_NET_TEST=1 才跑），CI 天然跳过。
+  # --locked 钉死 Cargo.lock：依赖漂移在这里即红，而不是本地某天莫名变了。
+  rust:
+    name: rust (cargo test)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          # 与 release.yml 共享缓存：发布构建不吃冷启动
+          shared-key: huajing-cargo
+      - run: cargo test --locked

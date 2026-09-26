@@ -1,0 +1,5 @@
+# 行尾钉版：CI/workflow 的 run: 脚本送 bash 执行，CRLF 会让 runner 报
+# `$'\r': command not found`。此处只钉自动化相关文件，不触发全库 renormalize。
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf

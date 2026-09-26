@@ -5,6 +5,8 @@
 **本地优先（local-first）的智能体角色扮演客户端**——角色即 Lua 脚本、数据全明文、
 剧情由确定性状态机推进、世界设定是活的实体图谱。
 
+[![CI](https://github.com/tsdaer/huajing/actions/workflows/ci.yml/badge.svg)](https://github.com/tsdaer/huajing/actions/workflows/ci.yml)
+
 ## 架构一览
 
 | 层 | 选择 |
@@ -30,6 +32,17 @@ pnpm tauri build      # 产出安装包
 
 **导入角色卡**：把 SillyTavern 的 PNG / JSON 卡拖进窗口即可（或「会话 → 导入 ST 卡」粘贴路径），
 解析预览确认后生成 `DataHub/characters/<名字>/card.lua`，改卡保存即生效，无需重启。
+
+## 持续集成与发布
+
+自动化全部在 GitHub Actions（`.github/workflows/`），本地不装任何钩子；工具链版本（pnpm 10 / Node 22 / Rust stable）钉在 workflow 里，`cargo test` / `pnpm build` 都加 `--frozen-lockfile` / `--locked` 保证可复现。
+
+| 工作流 | 触发 | 做什么 |
+|---|---|---|
+| **CI**（`ci.yml`） | push 到 main、PR、手动 dispatch | 双绿门禁并行跑：前端 `pnpm build`（vue-tsc + vite）+ Rust `cargo test --locked`（离线全量，含版本三处一致性钉子） |
+| **Release**（`release.yml`） | push tag `v*`、手动 dispatch | Windows NSIS + MSI 构建 → **草稿 Release**；tag 与 `tauri.conf.json` 版本不一致直接红 |
+
+发布流程：版本三处 bump + CHANGELOG 定版段（照旧人肉写）→ `git tag vX.Y.Z && git push origin vX.Y.Z` → Actions 构建完挂**草稿** Release（安装包 + CHANGELOG 定版段为 body）→ 检查无误后手动点 **Publish** 才对外可见。试车不碰发布面：Actions 页手动跑 Release 并勾选 `build_only`，产物只存 workflow artifacts。
 
 ## 目录结构
 

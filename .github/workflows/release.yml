@@ -1,0 +1,117 @@
+# 发布构建：Windows NSIS + MSI 安装包 → 草稿 Release。
+# 两条触发路径（可控设计）：
+#   1. push tag v*       —— 构建成功后挂 DRAFT Release，人工检查后手动 Publish 才对外可见；
+#   2. workflow_dispatch —— 手动按钮：勾选 build_only 为试车模式（只产构件不建 Release），
+#                          不勾则按当前清单版本直接建草稿 Release。
+# updater 签名 / latest.json 属 M4.2（docs/plan/m4.md）范围：届时在本 job
+# 加签名密钥步骤并产出 latest.json，随同一个草稿 Release 上传即可。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      build_only:
+        description: "仅构建产 artifacts，不建草稿 Release（试车）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # 发布构建互相不顶替
+
+jobs:
+  build:
+    name: windows (nsis + msi)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # 仅草稿 Release 需要；build_only 试车模式实际不写
+    steps:
+      - uses: actions/checkout@v4
+
+      # 仓库未钉 pnpm/node 版本（无 packageManager/.nvmrc），在此处钉（与 ci.yml 一致）：
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # 版本单一事实源是 tauri.conf.json（安装包与未来 M4.2 更新清单都读它）
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "打包版本：${VERSION}"
+
+      # 防错包流出：tag 必须与清单版本严格一致（v0.3.2 ≠ 0.3.1 直接红）
+      - name: Verify tag matches version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          if [ "v${{ steps.version.outputs.version }}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 tauri.conf.json 版本 ${{ steps.version.outputs.version }} 不一致"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: huajing-cargo # 与 ci.yml 共享缓存
+
+      - run: pnpm install --frozen-lockfile
+
+      # tauri build 自动执行 beforeBuildCommand（pnpm build：vue-tsc + vite）
+      - run: pnpm tauri build
+
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p dist-release
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe dist-release/
+          cp src-tauri/target/release/bundle/msi/*.msi dist-release/
+          ls -l dist-release
+
+      # 试车模式：构件存为 workflow artifacts（默认保留 90 天），不建 Release
+      - name: Upload artifacts (build_only)
+        if: github.event_name == 'workflow_dispatch' && inputs.build_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: huajing-${{ steps.version.outputs.version }}-windows
+          path: dist-release/*
+          if-no-files-found: error
+
+      # 发布模式：提取 CHANGELOG.md 的 ## [x.y.z] 定版段作为 Release body
+      - name: Extract changelog section
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.build_only)
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          awk -v header="## [${VERSION}]" '
+            index($0, header) == 1 { found = 1; next }
+            found && /^## /        { exit }
+            found                  { print }
+          ' CHANGELOG.md > release-body.md
+          if [ ! -s release-body.md ]; then
+            echo "CHANGELOG.md 未找到 [${VERSION}] 定版段。" > release-body.md
+            echo "完整变更见 [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md)。" >> release-body.md
+          fi
+
+      # 草稿 Release：构建完只挂草稿，人工检查后手动 Publish 才公开
+      - name: Create draft release
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.build_only)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: v${{ steps.version.outputs.version }}
+          files: dist-release/*
+          body_path: release-body.md
