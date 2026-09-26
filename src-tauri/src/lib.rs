@@ -5,6 +5,7 @@ mod card;     // 角色卡与 Lua 沙箱（设计 §3）
 mod codex;    // 设定集：实体图谱、激活与分级注入（M2.2 · 设计 §6）
 mod commands; // Tauri 命令层
 mod complete; // 设定补全：模板补全、一致性校验、即兴模式（M3.8 · 设计 §6.8）
+mod consolidate; // 宫殿睡眠整理：候选分组、合并稿、归档标记（M4.4 · 设计 §5.4）
 mod diag;     // 运行时诊断环形缓冲
 mod director; // 导演调度：发言权打分与发言计划（M3.4 · 设计 §10.5）
 mod event;    // 事件日志：类型化事件流与投影（M2.0 · 设计 §7.3）
@@ -121,6 +122,7 @@ pub fn run() {
             commands::theme_delete,
             commands::theme_parse_import,
             commands::theme_export_file,
+            commands::consolidate_now,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,

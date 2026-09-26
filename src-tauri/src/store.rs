@@ -189,7 +189,7 @@ pub fn delete_provider(root: &Path, name: &str) -> StoreResult<Vec<Provider>> {
 
 // ---------- settings.toml（界面与全局配置）----------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_locale")]
     pub locale: String,
@@ -221,6 +221,9 @@ pub struct Settings {
     /// 签名自动更新（M4.2 · 设计 §13 · 决断 1）：`[updater]` 区，端点可配缺省关
     #[serde(default)]
     pub updater: UpdaterConfig,
+    /// 宫殿睡眠整理（M4.4 · 设计 §5.4 · 决断 4/5）：`[consolidate]` 区，自动缺省关
+    #[serde(default)]
+    pub consolidate: ConsolidateConfig,
 }
 
 /// `[updater]` 区（M4.2 · 决断 1）：静态清单（latest.json）的完整 URL + 开关。
@@ -242,6 +245,38 @@ impl Default for UpdaterConfig {
         UpdaterConfig {
             endpoint: None,
             enabled: false,
+        }
+    }
+}
+
+/// `[consolidate]` 区（M4.4 · 决断 4/5）：睡眠整理的阈值与空闲自动开关。
+/// 整理本体永远是**手动按钮优先**（确认框说明「归档不复活」），自动只是省心档。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsolidateConfig {
+    /// 候选阈值：salience 按故事时钟衰减后仍低于它的 episode/hearsay 才进候选。缺省 0.25。
+    #[serde(default = "default_consolidate_threshold")]
+    pub threshold: f64,
+    /// 空闲自动整理，缺省关（整理产物是模型产物，质量不佳用户不开即可——风险 4 的边界）。
+    #[serde(default)]
+    pub auto: bool,
+    /// 自动触发的空闲判据：会话轮末距上一条消息的真实间隔超过该分钟数才动手。缺省 30。
+    #[serde(default = "default_consolidate_idle_minutes")]
+    pub idle_minutes: u64,
+}
+
+fn default_consolidate_threshold() -> f64 {
+    0.25
+}
+fn default_consolidate_idle_minutes() -> u64 {
+    30
+}
+
+impl Default for ConsolidateConfig {
+    fn default() -> Self {
+        ConsolidateConfig {
+            threshold: default_consolidate_threshold(),
+            auto: false,
+            idle_minutes: default_consolidate_idle_minutes(),
         }
     }
 }
@@ -282,6 +317,7 @@ impl Default for Settings {
             tool_calls_per_turn: None,
             stage_narration: false,
             updater: UpdaterConfig::default(),
+            consolidate: ConsolidateConfig::default(),
         }
     }
 }
@@ -2234,6 +2270,45 @@ mod tests {
         assert_eq!(meta.characters, vec!["b", "a"], "保序去重：{meta:?}");
         let bb = load_blackboard(root.path(), &meta.id).unwrap();
         assert_eq!(bb.actors, vec!["b", "a"], "黑板 actors 同样无重复");
+    }
+
+    #[test]
+    fn settings_roundtrip_defaults_and_updater_block() {
+        // 缺省 + 缺区兼容：settings.toml 里没有 [updater] / [consolidate] 也不炸
+        let mut s = Settings::default();
+        s.wizard_done = true;
+        let raw = toml::to_string_pretty(&s).unwrap();
+        let back: Settings = toml::from_str(&raw).unwrap();
+        assert_eq!(back, s);
+        let mut legacy = Settings::default();
+        legacy.wizard_done = true;
+        let back: Settings = toml::from_str("wizard_done = true").unwrap();
+        assert_eq!(back, legacy, "单字段文件：其余字段全走缺省");
+
+        // [updater] 区（M4.2）：端点 + 开关往返
+        let mut s = Settings::default();
+        s.updater.endpoint = Some("http://127.0.0.1:8452/latest.json".into());
+        s.updater.enabled = true;
+        let raw = toml::to_string_pretty(&s).unwrap();
+        assert!(raw.contains("[updater]") && raw.contains("enabled = true"));
+        let back: Settings = toml::from_str(&raw).unwrap();
+        assert_eq!(back.updater.endpoint.as_deref(), Some("http://127.0.0.1:8452/latest.json"));
+        assert!(back.updater.enabled);
+
+        // [consolidate] 区（M4.4）：阈值 / 自动 / 空闲分钟数往返，缺省自动关
+        let mut s = Settings::default();
+        assert!(!s.consolidate.auto, "自动整理缺省关");
+        assert!((s.consolidate.threshold - 0.25).abs() < 1e-9, "阈值缺省 0.25");
+        assert_eq!(s.consolidate.idle_minutes, 30);
+        s.consolidate.auto = true;
+        s.consolidate.threshold = 0.15;
+        s.consolidate.idle_minutes = 45;
+        let raw = toml::to_string_pretty(&s).unwrap();
+        assert!(raw.contains("[consolidate]") && raw.contains("auto = true"));
+        let back: Settings = toml::from_str(&raw).unwrap();
+        assert!(back.consolidate.auto);
+        assert!((back.consolidate.threshold - 0.15).abs() < 1e-9);
+        assert_eq!(back.consolidate.idle_minutes, 45);
     }
 
     #[test]

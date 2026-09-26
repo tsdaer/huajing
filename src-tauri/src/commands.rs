@@ -3760,6 +3760,10 @@ fn finalize_turn(
             .unwrap_or_default();
         spawn_summary(root, &meta.id, flags, active);
     }
+
+    // 轮末空闲自动整理（M4.4 · [consolidate] auto 缺省关；判据 = 距上条消息真实间隔）。
+    // util 档未配 / 不满足空闲判据时零开销直接返回。
+    summary::maybe_auto_consolidate(root, &meta.id);
     Ok(())
 }
 
@@ -5892,6 +5896,7 @@ fn resolve_thread_at(
         source: "thread.resolve".into(),
         ts: store::unix_now(),
         rehearsals: 0,
+        archived: false,
     };
     thread.attach_resolution_memory(&memory.id);
     let snapshot = thread.to_value();
@@ -6314,6 +6319,7 @@ fn inspector_payload(
     let memories = memory_objects(proj, character, board.day);
     let palace_view = serde_json::json!({
         "count": memories.len(),
+        "archivedCount": memories.iter().filter(|m| m.archived).count(),
         "rooms": palace::rooms(&memories),
         "timeline": palace::timeline(&memories),
         "graph": palace::link_graph(&memories),
@@ -10031,6 +10037,7 @@ return {
             source: "manual".into(),
             ts: store::unix_now(),
             rehearsals: 0,
+            archived: false,
         };
         log.append(
             &root,
@@ -10178,6 +10185,7 @@ return {
             source: "manual".into(),
             ts: store::unix_now(),
             rehearsals: 0,
+            archived: false,
         };
         log.append(
             &root,

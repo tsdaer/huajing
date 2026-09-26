@@ -2262,6 +2262,7 @@ mod tests {
             source: h.source.clone(),
             ts: 0,
             rehearsals: 0,
+            archived: false,
         };
         assert_eq!(mem.kind, palace::KIND_HEARSAY);
         assert!((mem.salience - 0.4).abs() < 1e-6, "听来的事显著度折半（§10.4）");
@@ -2379,6 +2380,7 @@ mod tests {
             source: "pipeline".to_string(),
             ts: 0,
             rehearsals: 0,
+            archived: false,
         };
         assert_eq!(mem.id, "mem_0192");
         assert_eq!(mem.turn, 14); // turns 升序 → 首个是最早的那一轮

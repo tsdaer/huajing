@@ -486,6 +486,8 @@ export function setupMock() {
         return [...themeFiles.keys()].sort();
       case "theme_delete":
         return themeFiles.delete((args as { name: string }).name);
+      case "consolidate_now":
+        return { groups: 0, merged: 0, archived: 0, skipped: [] };
       case "theme_parse_import":
         throw new Error("浏览器 mock 不做导入解析（Rust 纯函数）——请运行打包版走查导入");
       case "theme_export_file":

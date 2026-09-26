@@ -1009,7 +1009,25 @@ pub fn fold(p: &mut Projection, rec: &LogRecord) {
             *upto = (*upto).max(s.to_turn);
             p.summary_upto = p.summary_upto.max(s.to_turn);
         }
-        LogBody::Memory(m) => p.episodes.push(m.object.clone()),
+        LogBody::Memory(m) => {
+            // 同 id 后写覆盖（M4.4 睡眠整理）：归档标记以「整条对象 + archived」重发，
+            // 折叠时覆盖原条目——事件流仍只追加，palace.jsonl 每条记忆保持一行。
+            // 既有事件流的记忆 id 唯一（next_id 分配），该分支对旧流是纯行为保持。
+            let id = m.object.get("id").and_then(|v| v.as_str()).map(str::to_string);
+            if let Some(id) = id {
+                if let Some(slot) = p
+                    .episodes
+                    .iter_mut()
+                    .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+                {
+                    *slot = m.object.clone();
+                } else {
+                    p.episodes.push(m.object.clone());
+                }
+            } else {
+                p.episodes.push(m.object.clone());
+            }
+        }
         LogBody::Proposal(pr) => {
             // 提案是状态机：propose 落条目，accept/reject 改状态（payload 缺失时保留原提案正文）
             let entry = p

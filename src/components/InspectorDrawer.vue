@@ -472,7 +472,7 @@ defineExpose({ ensureInspector, resetForSession, refreshAfterRound });
           @resolve="resolveThreadCmd"
         />
         <PsychePanel v-else-if="inspTab === 'psyche'" :psyche="inspector.psyche" />
-        <PalacePanel v-else-if="inspTab === 'palace'" :palace="inspector.palace" @jump="(t) => emit('jump', t)" />
+        <PalacePanel v-else-if="inspTab === 'palace'" :palace="inspector.palace" :session-id="sessionId" @jump="(t) => emit('jump', t)" @refresh="() => loadInspector()" />
         <CodexPanel
           v-else-if="inspTab === 'codex'"
           :session-id="sessionId"

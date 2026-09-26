@@ -23,6 +23,7 @@ const emit = defineEmits<{ jump: [turn: number] }>();
       <span class="badge badge-xs badge-ghost gap-0.5 font-mono">
         第 {{ m.turn }} 轮<Icon name="undo" :size="10" class="opacity-60" />
       </span>
+      <span v-if="m.archived" class="badge badge-xs badge-ghost badge-info">已归档</span>
       <span>{{ storyStamp(m) }}</span>
       <span v-if="m.place" class="truncate">· {{ m.place }}</span>
       <span v-if="m.emotion" class="badge badge-xs badge-soft badge-secondary">{{ m.emotion }}</span>

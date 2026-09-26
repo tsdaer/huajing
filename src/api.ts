@@ -44,6 +44,7 @@ import type {
   WorldlineView,
 } from "./types";
 import type { CustomTheme, ParsedThemeImport } from "./theme";
+import type { ConsolidateProgress, ConsolidateReport } from "./types";
 
 export type NewSessionOptions = {
   character: string;
@@ -179,6 +180,12 @@ export const api = {
     invoke<SemanticCheck>("codex_semantic_check", { sessionId, id }),
   /** 手动触发一次总结（可能较慢；正常路径是消息滑出窗口后自动触发） */
   summarizeNow: (sessionId: string) => invoke<string>("summarize_now", { sessionId }),
+  /** 手动触发一次睡眠整理（M4.4 · 设计 §5.4）：每组一次 util 档合并稿，进度经 onEvent 推送 */
+  consolidateNow: (sessionId: string, onEvent: (e: ConsolidateProgress) => void) => {
+    const channel = new Channel<ConsolidateProgress>();
+    channel.onmessage = onEvent;
+    return invoke<ConsolidateReport>("consolidate_now", { sessionId, onEvent: channel });
+  },
 
   /** 手动开线（设计 §8.3）：玩家给这段关系记一笔欠账，origin=manual 不随重放丢弃 */
   openThread: (

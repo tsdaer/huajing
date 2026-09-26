@@ -101,6 +101,23 @@ export type UpdateProgress =
   | { event: "downloaded"; bytes: number }
   | { event: "installing" };
 
+/** 睡眠整理的结论（consolidate_now · M4.4 · 设计 §5.4） */
+export interface ConsolidateReport {
+  /** 分到的组数 */
+  groups: number;
+  /** 成功落合并稿的组数 */
+  merged: number;
+  /** 归档的原记忆条数 */
+  archived: number;
+  /** 放弃的组与原因 */
+  skipped: string[];
+}
+
+/** 整理进度事件（consolidate_now 经 Channel 推送：组级进度） */
+export type ConsolidateProgress =
+  | { event: "started"; groups: number }
+  | { event: "group_done"; done: number; total: number };
+
 /** 段末走向选项（增强 F2 · 小说模式） */
 export interface StoryOption {
   label: string;
@@ -614,11 +631,15 @@ export interface InspectorMemory {
   emotion?: string | null;
   place?: string | null;
   source: string;
+  /** 睡眠整理归档标记（M4.4）：true = 已被合并稿替代（面板「已归档」过滤） */
+  archived?: boolean;
 }
 
 /** 记忆宫殿三视图 + 最近记忆（设计 §5.5） */
 export interface InspectorPalace {
   count: number;
+  /** 睡眠整理归档的记忆总数（M4.4；全量口径，不受 recent 窗口限制） */
+  archivedCount?: number;
   rooms: { place: string; count: number; top: InspectorMemory[] }[];
   timeline: { label: string; count: number; top: InspectorMemory[] }[];
   /** 节点是 link 标签，边是共现 [a, b, 次数] */

@@ -122,6 +122,11 @@ pub struct MemObject {
     pub ts: u64,
     /// 再提及次数：被召回后由 rehearse 累加，构成再提及加成。
     pub rehearsals: u32,
+    /// 睡眠整理归档标记（M4.4 · 设计 §5.4 · 决断 5）：true = 已被合并稿替代，
+    /// 退出召回层；palace.jsonl 全量保留（面板「已归档」页签可溯源）。
+    /// **归档不复活**——「被再次提及则回升」只作用于未归档记忆。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 impl MemObject {
@@ -202,6 +207,8 @@ struct MemObjectWire {
     ts: Option<u64>,
     #[serde(default)]
     rehearsals: Option<u32>,
+    #[serde(default)]
+    archived: Option<bool>,
 }
 
 /// 设计 `5.2 示例里的嵌套时间形态。
@@ -270,6 +277,7 @@ impl From<MemObjectWire> for MemObject {
             source: w.source.unwrap_or_default(),
             ts: w.ts.unwrap_or(0),
             rehearsals: w.rehearsals.unwrap_or(0),
+            archived: w.archived.unwrap_or(false),
         }
     }
 }
@@ -315,6 +323,7 @@ pub fn from_legacy_fact(
         source: source.to_string(),
         ts,
         rehearsals: 0,
+        archived: false,
     }
 }
 
@@ -414,6 +423,10 @@ pub fn recall(objs: &[MemObject], q: &RecallQuery) -> Vec<RecallHit> {
     let mut hits: Vec<(&MemObject, f32, Vec<String>)> = Vec::new();
     let mut seen_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for m in objs {
+        // 归档退出召回（M4.4 · 决断 5）：合并稿已替代的内容不再进入召回层。
+        if m.archived {
+            continue;
+        }
         // 视角过滤是硬约束（`10.4）：只召回 witnesses 含当前角色的记忆。
         // （D5：borrow 判定，不再为过滤克隆 witnesses/actors 列表）
         if !viewer.is_empty() {
@@ -545,8 +558,8 @@ fn score_of(m: &MemObject, q: &RecallQuery, ctx: &ScoreCtx, viewer: &str) -> (f3
 }
 
 /// 故事时间衰减系数：0.5^(Δ/HALF_LIFE_DAYS)，Δ 为负按 0（未来时间不倒扣）。
-/// 打分层与 decay_all 共用这一处公式，避免两条路径漂移。
-fn decay_factor(delta_days: f64) -> f64 {
+/// 打分层与 decay_all / 睡眠整理候选层共用这一处公式，避免多条路径漂移。
+pub fn decay_factor(delta_days: f64) -> f64 {
     0.5f64.powf(delta_days.max(0.0) / HALF_LIFE_DAYS)
 }
 
@@ -661,6 +674,9 @@ pub struct MemBrief {
     pub emotion: Option<String>,
     pub place: Option<String>,
     pub source: String,
+    /** 睡眠整理归档标记（M4.4）：true = 已被合并稿替代，面板「已归档」页签的数据源 */
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// 记忆 → 面板摘要。
@@ -675,6 +691,7 @@ pub fn brief(m: &MemObject) -> MemBrief {
         emotion: m.emotion.clone(),
         place: m.place.clone(),
         source: m.source.clone(),
+        archived: m.archived,
     }
 }
 
@@ -884,7 +901,7 @@ fn contains_tag(items: &[String], norm: &str) -> bool {
 }
 
 /// 显著度清洗：非有限值按 0，并夹到 0–1。
-fn sanitize_salience(s: f32) -> f32 {
+pub fn sanitize_salience(s: f32) -> f32 {
     if s.is_finite() {
         s.clamp(0.0, 1.0)
     } else {
@@ -936,6 +953,7 @@ mod tests {
             source: String::new(),
             ts: 0,
             rehearsals: 0,
+            archived: false,
         }
     }
 

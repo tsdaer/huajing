@@ -429,6 +429,7 @@ fn apply_summary_outcome_locked(
             source: "pipeline.summary".into(),
             ts,
             rehearsals: 0,
+            archived: false,
         };
         if obj.witnesses.is_empty() {
             obj.witnesses = obj.actors.clone();
@@ -476,6 +477,7 @@ fn apply_summary_outcome_locked(
                 source: hs.source.clone(),
                 ts,
                 rehearsals: 0,
+                archived: false,
             };
             let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
             bodies.push(
@@ -542,6 +544,7 @@ fn apply_summary_outcome_locked(
             source: "pipeline.summary".into(),
             ts,
             rehearsals: 0,
+            archived: false,
         };
         let object = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
         bodies.push(
@@ -888,4 +891,315 @@ async fn run_summary(
 pub async fn summarize_now(session_id: String) -> Result<String, String> {
     // 手动触发没有「当轮激活记录」（审计对照表里的激活名单给空，提示词里写明）
     run_summary(root(), session_id, true, Vec::new()).await
+}
+
+// ---------- 睡眠整理（M4.4 · 设计 §5.4 · 决断 4/5：手动优先，自动缺省关） ----------
+
+/// 整理进度（Channel 推送：组级进度——每组一次 util 档调用）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ConsolidateProgress {
+    Started { groups: usize },
+    GroupDone { done: usize, total: usize },
+}
+
+/// 空闲自动整理的在跑标记（进程内即可：重启后按空闲判据重新判定）。
+static AUTO_CONSOLIDATE_INFLIGHT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// 手动触发一次睡眠整理（宫殿面板「睡眠整理」按钮；确认框由前端负责）。
+/// 未配置 util 档 → Err 可读提示且**零改动**（记忆原样保留，同 F2 降级纪律）。
+#[tauri::command]
+pub async fn consolidate_now(
+    session_id: String,
+    on_event: Channel<ConsolidateProgress>,
+) -> Result<crate::consolidate::ConsolidateReport, String> {
+    let root = root();
+    let log = store::EventLog::new();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let settings = store::load_settings(&root).unwrap_or_default();
+    let provider = strict_util_provider(&root);
+    run_consolidation(&root, &meta, &log, &settings, provider.as_ref(), Some(&on_event)).await
+}
+
+/// 睡眠整理的 util 档选取（严格档）：**不回退 chat**——合并稿要写进记忆层，
+/// 宁可不整理也不烧主演预算（M4.4 DoD：未配 util 档提示未配置且零改动）。
+pub(crate) fn strict_util_provider(root: &std::path::Path) -> Option<Provider> {
+    store::load_providers(root)
+        .ok()?
+        .into_iter()
+        .find(|p| p.role == "util")
+}
+
+/// 整理主流程（手动命令与空闲自动共用）：候选 → 分组 → 每组一次 util 档合并稿 →
+/// 闸门内一批落盘（合并稿 Memory + 摘要「章节归档」Summary + 成员归档 Memory）。
+/// `provider = None` = 未配 util 档：第一句就返回可读 Err，之后才有任何写路径——零改动。
+pub(crate) async fn run_consolidation(
+    root: &std::path::Path,
+    meta: &store::SessionMeta,
+    log: &store::EventLog,
+    settings: &store::Settings,
+    provider: Option<&Provider>,
+    on_event: Option<&Channel<ConsolidateProgress>>,
+) -> Result<crate::consolidate::ConsolidateReport, String> {
+    use crate::consolidate;
+
+    let provider = provider.ok_or_else(|| {
+        "未配置工具档（role=util）接入点，无法整理——记忆原样保留；可先到设置页加一个工具档"
+            .to_string()
+    })?;
+    let proj = project_session(log, root, meta)?;
+    let now_day = proj
+        .effective_board(None)
+        .day;
+    // 候选只取事件流里的结构化记忆（键值事实是按角色合成的投影，不属于整理对象）
+    let mems: Vec<palace::MemObject> = proj
+        .episodes
+        .iter()
+        .filter_map(|v| serde_json::from_value::<palace::MemObject>(v.clone()).ok())
+        .collect();
+    let cands = consolidate::candidates(&mems, now_day, settings.consolidate.threshold);
+    let plans = consolidate::plan_groups(&cands);
+    if plans.is_empty() {
+        return Ok(crate::consolidate::ConsolidateReport {
+            groups: 0,
+            merged: 0,
+            archived: 0,
+            skipped: Vec::new(),
+        });
+    }
+    if let Some(ch) = on_event {
+        let _ = ch.send(ConsolidateProgress::Started { groups: plans.len() });
+    }
+
+    // 每组一次 util 档合并稿；失败/空稿/超长 → 该组放弃不阻塞其他组（决断 4）
+    let proxy = proxy_of(root);
+    let mut drafts: Vec<Option<String>> = Vec::with_capacity(plans.len());
+    for (i, group) in plans.iter().enumerate() {
+        let prompt_text = consolidate::build_prompt(group);
+        let raw = llm::chat_complete(
+            provider,
+            &[llm::ChatMessage::text("user", prompt_text)],
+            500,
+            0.2,
+            proxy.as_deref(),
+        )
+        .await;
+        drafts.push(raw.ok().as_deref().and_then(consolidate::parse_draft));
+        if let Some(ch) = on_event {
+            let _ = ch.send(ConsolidateProgress::GroupDone {
+                done: i + 1,
+                total: plans.len(),
+            });
+        }
+    }
+
+    // 合并稿进「组内地点对应的场景卷」；映射不到场景的组落世界层卷（None）
+    let scene_of_place = |place: Option<&str>| -> Option<String> {
+        let p = place?.trim();
+        if p.is_empty() {
+            return None;
+        }
+        proj.scenes
+            .values()
+            .find(|sc| sc.place.trim() == p)
+            .map(|sc| sc.id.clone())
+    };
+    let next_index = consolidate::next_index_of(&mems);
+    let (bodies, report) = consolidate::build_bodies(
+        &plans,
+        &drafts,
+        next_index,
+        now_day,
+        &scene_of_place,
+        store::unix_now(),
+    );
+    if bodies.is_empty() {
+        return Ok(report);
+    }
+    if !gate().try_acquire(&meta.id) {
+        return Err("会话写入中，本次整理放弃——稍后再试".to_string());
+    }
+    let result = commit_batch(log, root, meta, bodies);
+    gate().release(&meta.id);
+    result?;
+    crate::diag::record(
+        "consolidate",
+        format!(
+            "睡眠整理：{} 组合并稿 / 全 {} 组，归档 {} 条（放弃：{}）",
+            report.merged,
+            report.groups,
+            report.archived,
+            if report.skipped.is_empty() { "无".to_string() } else { report.skipped.join("；") }
+        ),
+    );
+    Ok(report)
+}
+
+/// 轮末空闲自动整理（M4.4：settings `[consolidate]` 的 auto + idle_minutes，缺省关）。
+/// 判据 = 距上一条消息的真实间隔超过阈值；util 档未配时静默跳过（diag 留档）。
+pub(crate) fn maybe_auto_consolidate(root: &std::path::Path, session_id: &str) {
+    let settings = match store::load_settings(root) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if !settings.consolidate.auto {
+        return;
+    }
+    let log = store::EventLog::new();
+    let Ok(meta) = store::load_session(root, session_id) else {
+        return;
+    };
+    let Ok(proj) = project_session(&log, root, &meta) else {
+        return;
+    };
+    let last_ts = proj.messages.last().map(|m| m.ts).unwrap_or(0);
+    let idle = store::unix_now().saturating_sub(last_ts);
+    if idle < settings.consolidate.idle_minutes.saturating_mul(60) {
+        return;
+    }
+    // 防重入：同一会话一次只跑一份整理（手动 consolidate_now 不受此限——它由用户显式发起）
+    let inserted = AUTO_CONSOLIDATE_INFLIGHT
+        .lock()
+        .map(|mut set| set.insert(session_id.to_string()))
+        .unwrap_or(false);
+    if !inserted {
+        return;
+    }
+    let root = root.to_path_buf();
+    let sid = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let log = store::EventLog::new();
+        let outcome: Option<crate::consolidate::ConsolidateReport> = async {
+            let meta = store::load_session(&root, &sid).ok()?;
+            let settings = store::load_settings(&root).ok()?;
+            let provider = strict_util_provider(&root)?;
+            run_consolidation(&root, &meta, &log, &settings, Some(&provider), None)
+                .await
+                .ok()
+        }
+        .await;
+        if let Some(report) = outcome {
+            if report.merged > 0 {
+                crate::diag::record(
+                    "consolidate",
+                    format!(
+                        "空闲自动整理：合并稿 {} 段，归档 {} 条",
+                        report.merged, report.archived
+                    ),
+                );
+            }
+        }
+        if let Ok(mut set) = AUTO_CONSOLIDATE_INFLIGHT.lock() {
+            set.remove(&sid);
+        }
+    });
+}
+
+#[cfg(test)]
+mod consolidate_tests {
+    use super::*;
+    use crate::event::LogBody;
+    use crate::palace::MemObject;
+
+    const BARE_CARD: &str = "return { spec = 'charcard/1.0', name = '小雨' }";
+
+    fn setup_session() -> (tempfile::TempDir, store::SessionMeta, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        store::ensure_layout(&root).unwrap();
+        let card_dir = root.join("characters/小雨");
+        std::fs::create_dir_all(&card_dir).unwrap();
+        std::fs::write(card_dir.join("card.lua"), BARE_CARD).unwrap();
+        let meta = store::new_session(
+            &root,
+            &store::NewSessionRequest {
+                characters: Vec::new(),
+                character: "小雨".into(),
+                persona: None,
+                day: Some(1),
+                clock: Some("20:00".into()),
+                place: Some("图书馆".into()),
+                premise: None,
+                script: None,
+            },
+        )
+        .unwrap();
+        (dir, meta, root)
+    }
+
+    fn low_mem(turn: u64) -> MemObject {
+        MemObject {
+            id: palace::next_id(turn as usize),
+            kind: palace::KIND_EPISODE.to_string(),
+            content: format!("旧事{turn}：在图书馆整理便签"),
+            turn,
+            story_day: 1,
+            story_clock: "12:00".to_string(),
+            place: Some("图书馆".to_string()),
+            actors: vec!["小雨".to_string()],
+            witnesses: vec!["小雨".to_string()],
+            salience: 0.1,
+            emotion: None,
+            links: vec!["topic:便签".to_string()],
+            thread: None,
+            source: "pipeline.summary".to_string(),
+            ts: 1,
+            rehearsals: 0,
+            archived: false,
+        }
+    }
+
+    /// M4.4 DoD：未配 util 档 → 整理返回可读 Err 且**零改动**（无任何事件落流、
+    /// 原记忆一条不少、全部未归档）。
+    #[test]
+    fn consolidation_without_util_provider_changes_nothing() {
+        let (_dir, meta, root) = setup_session();
+        let log = store::EventLog::new();
+        for turn in 1..=3u64 {
+            log.append(
+                &root,
+                &meta.id,
+                LogBody::Memory(event::MemoryEvent {
+                    turn,
+                    origin: "pipeline".into(),
+                    object: serde_json::to_value(low_mem(turn)).unwrap(),
+                    ts: 1,
+                }),
+            )
+            .unwrap();
+        }
+        let baseline = log.read(&root, &meta.id).unwrap();
+        assert_eq!(baseline.len(), 3, "genesis 之外只有三条种子记忆");
+        // 临时 DataHub 没有 providers.toml → strict_util_provider = None
+        assert!(strict_util_provider(&root).is_none());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let settings = store::load_settings(&root).unwrap_or_default();
+        let report = rt.block_on(run_consolidation(
+            &root,
+            &meta,
+            &log,
+            &settings,
+            None,
+            None,
+        ));
+        let err = report.unwrap_err();
+        assert!(err.contains("工具档"), "可读提示：{err}");
+
+        let after = log.read(&root, &meta.id).unwrap();
+        assert_eq!(after, baseline, "事件流零追加");
+        let proj = event::project_over(&after, &event::Base::default());
+        assert_eq!(proj.episodes.len(), 3);
+        assert!(
+            proj.episodes
+                .iter()
+                .all(|v| v.get("archived").is_none()),
+            "原记忆全部未归档"
+        );
+    }
 }
