@@ -2,7 +2,37 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本段与里程碑的对应关系见 [ROADMAP.md](ROADMAP.md)。
 
-## [Unreleased] · 增强计划 · 包 D OOC 导演通道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+## [0.3.1] - 2026-09-26
+
+> 0.3.x 收尾定版（M4.0 · [docs/plan/m4.md](docs/plan/m4.md)）：增强计划（工具调用/定时器/卡 API/旁白/小说模式/OOC）与全库加固的发布段，四项遗留真机走查全部通过并当场修复两处引擎缺陷。`cargo test` 496 例全绿（495 + 版本一致性钉子）、`pnpm build` 双绿。
+
+### Fixed · M4.0 真机走查当场修复
+
+- **流式空正文棘轮触发面加宽**（`llm.rs` `chat_stream_ratcheted_inner`）：原判据只认
+  `finish_reason=length`，真机实锤 deepseek-flash 对元信息类输入也会以 finish=stop
+  直接交空流（无增量、无工具调用），落盘侧只能丢弃回复、留下孤儿用户消息且界面无
+  提示。触发面加宽为「正文为空 && 无工具调用」（任何 finish_reason 一视同仁，
+  纯工具轮正文为空属正常不重试），预算梯级（8192 起翻倍封顶 32768）耗尽时报错可见
+  而非静默孤儿；单测 2 例钉死（空 stop 触发重试带翻倍预算 / 纯工具轮不重试）
+- **空回复轮不再生成段末选项**（`commands.rs`）：小说模式空 Done（纯工具轮/空流）
+  没有「段」可接选项，原先仍会生成白烧 util 档预算；`options_spawn_worthy` 守卫 +
+  单测钉死
+
+### 走查收口（CDP 驱动真实 exe + 真实 deepseek 接入点，记录与脚本在 temp/，不入库）
+
+- **走查① 工具通道**：构造用例「剧情即兴发明新事实」当轮进收件箱（origin=model
+  提案×3，不等总结批次，检查器可读可确认）；psyche_feel 当轮生效且心理面板同轮可见
+  （好奇 0.30 带来源）。模型采样波动如实记录（增强计划风险 1：同一构造消息并非
+  每轮都触发工具，走查以多框架构造点验通道）
+- **走查② 三主题渲染**：cupcake/wireframe/abyss 三预设 × 小说散文/旁白/OOC 截图
+  经像素级视觉判定全过——散文段落左竖线 + 衬线、旁白无气泡全宽居中斜体、OOC 虚线
+  折叠、三主题令牌差异明显、无布局破坏
+- **走查③ 小说全链路**：开模式 → 散文段 → 4 选项（util 档异步生成）→ 点选续写 →
+  自由输入续写 → 关模式回台词体 → OOC 开线（origin=manual）→ 切场旁白落流，单轮全通
+- **走查④ 导出压测**：200 轮合成会话（3 场景编年）`export_novel` 3 章完整产出，
+  转写失败章优雅留原文标记；加固 D 包耗时仪表真机数字：400 条读回 22ms、
+  200 轮全量重放编辑 2.8s（D3 async 不冻结窗口）、导出 25.9s（含每章 util 转写）
+### 增强计划 · 包 D OOC 导演通道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 D（/ooc 前缀，不进剧情记忆）
 
@@ -19,7 +49,7 @@
 - **DoD**：OOC 驱动的跳转/收线与面板操作同源（单测断言转移事件与 origin=manual）；
   `/ooc` 消息不进任何记忆通道（单测钉死）；`cargo test` 492 例全绿
 
-## [Unreleased] · 增强计划 · 包 F 小说模式（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+### 增强计划 · 包 F 小说模式（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 F（互动式散文剧；决断 9/10）
 
@@ -45,7 +75,7 @@
   未配选项档 provider 时降级为纯自由输入（单测钉死）；全链路真机可玩与 200 轮
   导出压测留待 dev 真机走查（M4 前统一回归）；`cargo test` 489 例全绿
 
-## [Unreleased] · 增强计划 · 包 E 旁白声道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+### 增强计划 · 包 E 旁白声道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 E（narration 一等 voice，决断 8：旁白归宿主与模式所有）
 
@@ -67,7 +97,7 @@
   模板兜底纯函数单测 + 无 provider 时转移照常、旁白最终落盘（轮询断言）；
   三主题预设下的渲染目检与截图留待 dev 真机走查（M4 前统一回归）
 
-## [Unreleased] · 增强计划 · 包 B 故事时钟定时器（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+### 增强计划 · 包 B 故事时钟定时器（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 B（on_timer 落地，决断 5：只用故事时钟）
 
@@ -88,7 +118,7 @@
   全求值路径无系统时间）；同轮重复求值不重复发射；编辑历史重放后触发标记与
   转移一致；线 deadline 行为不变（既有单测不改通过）；`cargo test` 483 例全绿
 
-## [Unreleased] · 增强计划 · 包 C 卡 Lua API 对齐（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+### 增强计划 · 包 C 卡 Lua API 对齐（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 ### Added · 包 C（设计 §3.1 清偿，API 表实现态全绿）
 
@@ -112,7 +142,7 @@
   总结管线同一份实现，决断 7 兑现）；intensity 夹 0–1、delta 夹 −1–1、空名拒绝
 - 设计文档 §3.1 实现态标注更新为全绿；`cargo test` 481 例全绿（包 A 后 477 + 新增 4）
 
-## [Unreleased] · 增强计划 · 包 A 工具调用快通道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
+### 增强计划 · 包 A 工具调用快通道（[docs/plan/enhancement.md](docs/plan/enhancement.md)）
 
 > 主演模型能当轮自报持久变化：工具与剧情同报文、轮末确定性应用、效果是消息的
 > 衍生事件（编辑/重roll 重放自动正确），一切仍走事件流与收件箱，确定性执行不变。
@@ -150,7 +180,7 @@
 - 设计文档同步：§4.2 预算表增 T 行、§3.1 实现态标注 + §3.1b 工具白名单表；
   `cargo test` 477 例全绿（基线 428 + 新增 49）、`pnpm build` 双绿
 
-## [Unreleased] · 全库审查加固清偿（[docs/plan/hardening.md](docs/plan/hardening.md)）
+### 全库审查加固清偿（[docs/plan/hardening.md](docs/plan/hardening.md)）
 
 > 2026-09-25 全库审查（4 个并行审查代理分区通读 + 高危项人工复核）的逐包清偿，
 > 目标：崩溃与数据丢失归零、异步生命周期有守卫、热路径告别 O(n²)。每包一个 commit，
