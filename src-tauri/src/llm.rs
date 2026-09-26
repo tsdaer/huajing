@@ -508,8 +508,14 @@ pub(crate) async fn chat_stream_bounded(
 
 /// 带空正文棘轮的流式补全（加固 C3）：推理模型在服务端默认预算内把 token 耗在
 /// 思考上时，正文为空但流正常 [DONE] 结束——非流式的 self_or_retry 专门处理了
-/// 这个场景，流式此前没有等价物。判据与非流式一致（finish_reason=length），
-/// 预算复用 [`retry_budget`]（8192 起翻倍，封顶 32768）；取消/有正文不重试。
+/// 这个场景，流式此前没有等价物。预算复用 [`retry_budget`]（8192 起翻倍，
+/// 封顶 32768）；取消/有正文不重试。
+///
+/// M4.0 真机走查实锤：空正文不只在 finish=length 出现——deepseek-flash 对
+/// 元信息类输入也会以 finish=stop 直接交空流（无增量、无工具调用），落盘侧
+/// 只能丢掉这条回复，留下孤儿用户消息且界面无任何提示。触发面因此加宽为
+/// 「正文为空 && 无工具调用」（纯工具轮正文为空属正常，不重试），任何
+/// finish_reason 一视同仁；梯级耗尽报错可见，而不是静默孤儿。
 pub async fn chat_stream_ratcheted(
     provider: &Provider,
     messages: &[ChatMessage],
@@ -521,7 +527,7 @@ pub async fn chat_stream_ratcheted(
 }
 
 /// [`chat_stream_ratcheted`] 的工具版内核：`tools` 随每梯重试一起带上
-/// （空正文重试与工具无交集，同一轮的请求形态保持一致）。
+/// （同一轮的请求形态保持一致；空正文且无工具调用才重试，见上）。
 pub(crate) async fn chat_stream_ratcheted_inner(
     provider: &Provider,
     messages: &[ChatMessage],
@@ -544,8 +550,9 @@ pub(crate) async fn chat_stream_ratcheted_inner(
         )
         .await?;
         let empty = outcome.text.trim().is_empty();
-        if !outcome.cancelled && empty && outcome.finish_reason.as_deref() == Some("length") {
+        if !outcome.cancelled && empty && outcome.tool_calls.is_empty() {
             let last = budget.unwrap_or(4096);
+            let finish = outcome.finish_reason.clone().unwrap_or_default();
             match retry_budget(last) {
                 Some(next) => {
                     budget = Some(next);
@@ -554,7 +561,7 @@ pub(crate) async fn chat_stream_ratcheted_inner(
                 None => {
                     return Err(StreamFailure {
                         message: format!(
-                            "{} 的思考耗尽了流式预算（{}），加大预算后仍无正文",
+                            "{} 的流式返回连续空正文（末次 finish_reason={finish:?}，预算 {}），加大预算后仍无正文",
                             provider.name, last
                         ),
                         partial: outcome.text,
@@ -1539,6 +1546,106 @@ mod ratchet_tests {
             .unwrap();
             assert_eq!(out.text, "正文来了", "重试后的正文非空");
             assert_eq!(seen, "正文来了");
+        });
+    }
+
+    /// M4.0 走查实锤：空正文 + finish=stop（无增量、无工具调用）同样触发预算重试——
+    /// 静默空流会留下孤儿用户消息且界面无提示，必须走棘轮而非照单全收
+    #[test]
+    fn stream_ratchet_retries_empty_stop_not_just_length() {
+        rt().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let _first_req = read_http_request(&mut sock).await;
+                let body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let retry_req = read_http_request(&mut sock).await;
+                assert!(
+                    retry_req.contains("\"max_tokens\":8192"),
+                    "空正文 + stop 的重试要带翻倍预算：{retry_req}"
+                );
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"重试后到了\"}}]}\n\ndata: [DONE]\n\n";
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+            let provider = test_provider(&format!("http://{addr}"));
+            let cancel = AtomicBool::new(false);
+            let out = chat_stream_ratcheted(
+                &provider,
+                &[ChatMessage::text("user", "hi")],
+                |_| {},
+                &cancel,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.text, "重试后到了");
+        });
+    }
+
+    /// 纯工具轮正文为空属正常（决断 2：工具与剧情同报文）：finish=tool_calls
+    /// 且有工具分片时不触发空正文重试，避免给工具轮白烧一遍预算
+    #[test]
+    fn stream_ratchet_skips_pure_tool_turn() {
+        rt().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let _req = read_http_request(&mut sock).await;
+                let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"psyche_feel\",\"arguments\":\"{\\\"name\\\":\\\"惊讶\\\"}\"}}]}}]}\n\n"
+                    .to_string()
+                    + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                // 只有 1 条连接：若发生重试，第二条 accept 会挂到超时外、断言先失败
+                drop(read_http_request(&mut sock).await);
+            });
+            let provider = test_provider(&format!("http://{addr}"));
+            let cancel = AtomicBool::new(false);
+            let out = chat_stream_ratcheted_inner(
+                &provider,
+                &[ChatMessage::text("user", "hi")],
+                |_| {},
+                &cancel,
+                None,
+                Some(&[serde_json::json!({"type": "function", "function": {"name": "psyche_feel"}})]),
+            )
+            .await
+            .unwrap();
+            assert!(out.text.is_empty(), "纯工具轮正文为空照常返回");
+            assert_eq!(out.tool_calls.len(), 1, "工具调用要原样带出");
+            assert_eq!(out.tool_calls[0].name, "psyche_feel");
         });
     }
 

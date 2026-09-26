@@ -4863,15 +4863,19 @@ async fn send_message_inner(
         }
     }
     // 增强 F2：小说模式的段末选项生成（一段 = 主演一次响应；段落已可读，
-    // 选项异步补齐——util 档生成，未配则整段降级为纯自由输入，不阻塞主链路）
+    // 选项异步补齐——util 档生成，未配则整段降级为纯自由输入，不阻塞主链路）。
+    // 空回复轮（纯工具轮 / 空流重试耗尽）没有「段」可接选项，跳过——
+    // M4.0 走查实锤：空 Done 也生成选项只会白烧 util 档预算
     if meta.novel_mode {
-        if let Ok(StreamEvent::Done { cancelled: false, .. }) = &last {
-            spawn_options_generation(
-                root.clone(),
-                session_id.clone(),
-                turn,
-                scene.clone(),
-            );
+        if let Ok(StreamEvent::Done { cancelled: false, full, .. }) = &last {
+            if options_spawn_worthy(full) {
+                spawn_options_generation(
+                    root.clone(),
+                    session_id.clone(),
+                    turn,
+                    scene.clone(),
+                );
+            }
         }
     }
     last
@@ -5031,6 +5035,11 @@ fn spawn_options_generation(
             Err(e) => crate::diag::record("options", format!("选项落盘失败：{e}")),
         }
     });
+}
+
+/// 空回复轮不生成段末选项（M4.0 走查实锤：空 Done 也生成只会白烧 util 档预算）
+fn options_spawn_worthy(full: &str) -> bool {
+    !full.trim().is_empty()
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -7484,6 +7493,15 @@ return {
             })
             .await; // 超时即通过（整段时间内没有任何选项事件出现）
         });
+    }
+
+    /// M4.0 走查实锤：空回复轮（纯工具轮 / 空流）不生成段末选项——
+    /// 没有「段」可接，生成只会白烧 util 档预算
+    #[test]
+    fn options_not_spawned_for_empty_paragraph() {
+        assert!(!options_spawn_worthy(""), "空正文不生成");
+        assert!(!options_spawn_worthy("  \n "), "纯空白不生成");
+        assert!(options_spawn_worthy("（她抬起头。）"), "正常段落生成");
     }
 
     /// 增强 F1：小说模式开关 v1 仅 1v1 可开（多角色阵容拒绝），开关可持久化
