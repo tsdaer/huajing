@@ -35,11 +35,11 @@ pnpm tauri build      # 产出安装包
 
 ## 持续集成与发布
 
-自动化全部在 GitHub Actions（`.github/workflows/`），本地不装任何钩子；工具链版本（pnpm 10 / Node 22 / Rust stable）钉在 workflow 里，`cargo test` / `pnpm build` 都加 `--frozen-lockfile` / `--locked` 保证可复现。
+自动化全部在 GitHub Actions（`.github/workflows/`），本地不装任何钩子；工具链版本（pnpm 10 / Node 22 / Rust stable）钉在 workflow 里，依赖安装统一 `--frozen-lockfile` 保证可复现。
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| **CI**（`ci.yml`） | push 到 main、PR、手动 dispatch | 双绿门禁并行跑：前端 `pnpm build`（vue-tsc + vite）+ Rust `cargo test --locked`（离线全量，含版本三处一致性钉子） |
+| **CI**（`ci.yml`） | push 到 main、PR、手动 dispatch | 前端构建门禁：`pnpm build`（vue-tsc 类型检查 + vite）；`cargo test` 不上云（mock 用例在无代理 runner 上有连接池死锁），496 例全绿由本地 DoD 保证 |
 | **Release**（`release.yml`） | push tag `v*`、手动 dispatch | Windows NSIS + MSI 构建 → **草稿 Release**；tag 与 `tauri.conf.json` 版本不一致直接红 |
 
 发布流程：版本三处 bump + CHANGELOG 定版段（照旧人肉写）→ `git tag vX.Y.Z && git push origin vX.Y.Z` → Actions 构建完挂**草稿** Release（安装包 + CHANGELOG 定版段为 body）→ 检查无误后手动点 **Publish** 才对外可见。试车不碰发布面：Actions 页手动跑 Release 并勾选 `build_only`，产物只存 workflow artifacts。

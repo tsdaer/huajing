@@ -6,8 +6,9 @@
 
 ### Added · 持续集成与发布自动化（GitHub Actions）
 
-- **CI 门禁**（`.github/workflows/ci.yml`）：push 到 main / PR / 手动 dispatch 触发，windows-latest 与开发机同平台；`web`（pnpm install --frozen-lockfile + `pnpm build`）与 `rust`（Rust stable + rust-cache + `cargo test --locked` 离线全量）两 job 并行，concurrency 同 ref 自动取消旧跑，全程只读权限。
-- **发布构建**（`.github/workflows/release.yml`）：push tag `v*` 或手动 dispatch 触发；从 `tauri.conf.json` 读版本并校验 tag 与版本严格一致（不符即红，防错包流出）→ `pnpm tauri build` 产 NSIS + MSI → 从 CHANGELOG 提取 `[x.y.z]` 定版段作 body → 挂**草稿 Release**，人工检查后手动 Publish 才公开；手动 dispatch 可勾 `build_only` 试车（只产 workflow artifacts 不建 Release）。CI 与 Release 共享 rust-cache key。
+- **CI 门禁**（`.github/workflows/ci.yml`）：push 到 main / PR / 手动 dispatch 触发，windows-latest 与开发机同平台，concurrency 同 ref 自动取消旧跑，全程只读权限；云端只守前端构建（`pnpm install --frozen-lockfile` + `pnpm build`，vue-tsc + vite）。`cargo test` 不上云——llm.rs 的 loopback mock 用例依赖「重试开新连接」，在无代理直连的 runner 上被 keep-alive 连接池复用卡死（本地系统代理掩护故绿），496 例全绿仍由本地 DoD 保证。
+- **发布构建**（`.github/workflows/release.yml`）：push tag `v*` 或手动 dispatch 触发；从 `tauri.conf.json` 读版本并校验 tag 与版本严格一致（不符即红，防错包流出）→ `pnpm tauri build` 产 NSIS + MSI → 从 CHANGELOG 提取 `[x.y.z]` 定版段作 body → 挂**草稿 Release**，人工检查后手动 Publish 才公开；手动 dispatch 可勾 `build_only` 试车（只产 workflow artifacts 不建 Release）。
+- `.gitattributes` 钉 yml/sh 行尾 LF（防 workflow `run:` 脚本以 CRLF 进 bash）。
 - README 增「持续集成与发布」小节与 CI badge；updater 签名 / `latest.json` 留位给 M4.2。
 
 ## [0.3.1] - 2026-09-26

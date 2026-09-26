@@ -66,7 +66,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          shared-key: huajing-cargo # 与 ci.yml 共享缓存
+          shared-key: huajing-cargo # 固定键名：缓存跨次发布稳定复用
 
       - run: pnpm install --frozen-lockfile
 
