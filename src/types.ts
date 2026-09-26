@@ -69,7 +69,37 @@ export interface Settings {
   tool_calls_per_turn?: number | null;
   /** 阶段转移旁白（增强 E2）：状态树转移时生成氛围旁白（便宜档+模板兜底） */
   stage_narration?: boolean;
+  /** 签名自动更新（M4.2 · §13 决断 1）：`[updater]` 区，缺省关 */
+  updater?: UpdaterConfig;
 }
+
+/** `[updater]` 区（M4.2 · 决断 1）：静态清单地址 + 开关；双缺 = 未启用（UI 不报错） */
+export interface UpdaterConfig {
+  /** latest.json 的完整 URL（GitHub Releases 或任意静态托管，发布流程见 docs/release.md） */
+  endpoint?: string | null;
+  /** 缺省 false：v1 自用，端点由用户显式启用 */
+  enabled?: boolean;
+}
+
+/** 检查更新的结论（check_update；state 四态见后端 commands/updater.rs） */
+export interface UpdateStatus {
+  /** disabled | up_to_date | available | error；updater_info 另有 configured */
+  state: string;
+  current_version: string;
+  /** 可用的新版本号（available 时有值） */
+  version?: string | null;
+  /** 发布说明（清单 notes 原文） */
+  notes?: string | null;
+  /** 人类可读结论：成功给版本关系，失败给分类原因 */
+  message: string;
+}
+
+/** 下载进度事件（download_and_install 经 Channel 推送；installing 后应用退出） */
+export type UpdateProgress =
+  | { event: "started"; total?: number | null }
+  | { event: "progress"; downloaded: number; total?: number | null }
+  | { event: "downloaded"; bytes: number }
+  | { event: "installing" };
 
 /** 段末走向选项（增强 F2 · 小说模式） */
 export interface StoryOption {

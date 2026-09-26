@@ -31,6 +31,10 @@ mod worldline; // 世界主线与世界时钟：世界作用域的阶段弧（M3
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // 签名自动更新（M4.2 · 决断 1）：公钥进 tauri.conf.json（plugins.updater.pubkey），
+        // endpoint 运行时从 settings.toml 读（commands/updater.rs）；签名不符在下载后即拒装
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(commands::CancelFlags::default())
         .manage(commands::LastAssemblies::default())
         .manage(store::EventLog::new())
@@ -108,6 +112,9 @@ pub fn run() {
             commands::export_worldbook_st,
             commands::list_scripts,
             commands::get_script,
+            commands::updater_info,
+            commands::check_update,
+            commands::download_and_install,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,

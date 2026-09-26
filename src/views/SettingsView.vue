@@ -1,7 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { api } from "../api";
-import type { DiagRecord, Persona, Provider, ProviderTest, RuntimeInfo, Settings } from "../types";
+import type {
+  AppInfo,
+  DiagRecord,
+  Persona,
+  Provider,
+  ProviderTest,
+  RuntimeInfo,
+  Settings,
+  UpdateStatus,
+} from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
 
@@ -38,7 +47,9 @@ async function refresh() {
     ]);
     wizardDone.value = settings.value.wizard_done;
     proxyDraft.value = settings.value.proxy ?? "";
+    syncUpdaterDrafts();
     runtime.value = await api.runtimeInfo();
+    appInfo.value = await api.appInfo();
     await refreshDiagnostics();
     // 全新用户：直接落在「填 key」这一步，省掉找入口的时间
     if (needsSetup.value) startCreate();
@@ -56,6 +67,7 @@ function startCreate() {
 
 // ---------- 运行环境 ----------
 const runtime = ref<RuntimeInfo | null>(null);
+const appInfo = ref<AppInfo | null>(null);
 const diagnostics = ref<DiagRecord[]>([]);
 
 function fmtClock(ts: number): string {
@@ -76,6 +88,91 @@ const buildStamp = computed(() => {
   if (!ts) return "该构建未提供";
   return new Date(ts * 1000).toLocaleString();
 });
+
+// ---------- 关于与更新（M4.2 · 决断 1：端点可配缺省关，未启用只提示不报错） ----------
+const updaterEndpointDraft = ref("");
+const updaterEnabledDraft = ref(false);
+const savingUpdater = ref(false);
+
+/** 检查/下载状态机：idle → checking → idle(结论) → downloading → installing（应用退出） */
+const updateStatus = ref<UpdateStatus | null>(null);
+const updatePhase = ref<"idle" | "checking" | "downloading" | "installing">("idle");
+const dl = ref({ downloaded: 0, total: 0 });
+
+/** enabled 且端点非空才算配置了（与后端 updater_endpoint_of 同判据）；否则检查按钮置灰 */
+const updaterConfigured = computed(
+  () => !!(updaterEnabledDraft.value && updaterEndpointDraft.value.trim()),
+);
+
+function syncUpdaterDrafts() {
+  updaterEndpointDraft.value = settings.value?.updater?.endpoint ?? "";
+  updaterEnabledDraft.value = !!settings.value?.updater?.enabled;
+}
+
+async function saveUpdaterConfig() {
+  if (!settings.value) return;
+  savingUpdater.value = true;
+  try {
+    settings.value = await api.saveSettings({
+      ...settings.value,
+      updater: {
+        enabled: updaterEnabledDraft.value,
+        endpoint: updaterEndpointDraft.value.trim() || null,
+      },
+    });
+    syncUpdaterDrafts();
+    updateStatus.value = null;
+    error.value = "";
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    savingUpdater.value = false;
+  }
+}
+
+async function checkForUpdate() {
+  updatePhase.value = "checking";
+  updateStatus.value = null;
+  try {
+    updateStatus.value = await api.checkUpdate();
+    error.value = "";
+  } catch (e) {
+    updateStatus.value = { state: "error", current_version: "", message: String(e) };
+  } finally {
+    updatePhase.value = "idle";
+  }
+}
+
+async function startDownloadInstall() {
+  updatePhase.value = "downloading";
+  dl.value = { downloaded: 0, total: 0 };
+  try {
+    // installing 之后 Windows 上进程被安装器接管退出，await 通常不会返回
+    await api.downloadAndInstall((e) => {
+      if (e.event === "progress") {
+        dl.value = { downloaded: e.downloaded, total: e.total ?? 0 };
+      } else if (e.event === "installing") {
+        updatePhase.value = "installing";
+      }
+    });
+    updatePhase.value = "idle";
+  } catch (e) {
+    updatePhase.value = "idle";
+    updateStatus.value = { state: "error", current_version: "", message: String(e) };
+  }
+}
+
+function fmtBytes(n: number): string {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
 
 // ---------- 出网代理 ----------
 const proxyDraft = ref("");
@@ -572,6 +669,101 @@ async function confirmRemove() {
           <p v-else class="m-0 text-[11px] text-base-content/45">
             暂无记录。发一条消息或导入一张卡后再刷新。
           </p>
+        </div>
+      </section>
+
+      <!-- 关于与更新（M4.2 · 决断 1：未启用只提示不报错，检查按钮置灰） -->
+      <section class="card card-border bg-base-100">
+        <div class="card-body gap-3 p-5">
+          <div>
+            <h2 class="card-title gap-2 text-sm font-medium">
+              <Icon name="refresh" :size="16" class="text-base-content/45" />
+              关于与更新
+            </h2>
+            <p class="mt-1 mb-0 text-xs text-base-content/50">
+              化境 v{{ appInfo?.version ?? "—" }}。更新包经 minisign
+              签名校验（公钥内置于本安装包），签名不符会被拒绝安装。
+            </p>
+          </div>
+
+          <!-- 端点配置：settings.toml [updater] -->
+          <div class="flex flex-col gap-2 rounded-box bg-base-200 p-3">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-sm">启用自动更新</span>
+              <input
+                v-model="updaterEnabledDraft"
+                type="checkbox"
+                class="toggle toggle-sm"
+                aria-label="启用自动更新"
+              />
+            </div>
+            <div class="join w-full">
+              <input
+                v-model="updaterEndpointDraft"
+                class="input join-item input-sm flex-1 font-mono text-xs"
+                placeholder="latest.json 的完整 URL（如 https://…/huajing/latest.json）"
+                aria-label="更新清单地址"
+              />
+              <button class="btn join-item btn-sm" :disabled="savingUpdater" @click="saveUpdaterConfig">
+                <span v-if="savingUpdater" class="loading loading-spinner loading-xs"></span>
+                保存
+              </button>
+            </div>
+            <p class="m-0 text-[11px] text-base-content/50">
+              清单可托管在 GitHub Releases 或任意静态站点（发布流程见
+              <code class="font-mono">docs/release.md</code>）。
+            </p>
+          </div>
+
+          <!-- 检查结论：四态之一（available 给出下载入口） -->
+          <div
+            v-if="updateStatus"
+            class="rounded-box border px-3 py-2.5 text-xs"
+            :class="updateStatus.state === 'error'
+              ? 'border-error/40 bg-error/5'
+              : 'border-success/40 bg-success/5'"
+          >
+            <p class="m-0 font-medium">{{ updateStatus.message }}</p>
+            <p v-if="updateStatus.notes" class="mt-1 mb-0 text-[11px] whitespace-pre-line text-base-content/60">
+              {{ updateStatus.notes }}
+            </p>
+          </div>
+
+          <!-- 下载进度（Content-Length 缺失时总长未知，显示已下载字节数） -->
+          <div v-if="updatePhase === 'downloading'" class="flex flex-col gap-1">
+            <progress
+              class="progress progress-primary h-2"
+              :value="dl.downloaded"
+              :max="dl.total || 1"
+            ></progress>
+            <p class="m-0 text-[11px] text-base-content/60">
+              {{ fmtBytes(dl.downloaded) }}<template v-if="dl.total"> / {{ fmtBytes(dl.total) }}</template>
+              · 下载完成后自动校验签名
+            </p>
+          </div>
+          <p v-if="updatePhase === 'installing'" class="m-0 text-xs text-success">
+            签名校验通过，安装器已启动——应用即将退出并进入新版本。
+          </p>
+
+          <div class="flex justify-end gap-2">
+            <button
+              class="btn btn-sm"
+              :disabled="!updaterConfigured || updatePhase !== 'idle'"
+              @click="checkForUpdate"
+            >
+              <span v-if="updatePhase === 'checking'" class="loading loading-spinner loading-xs"></span>
+              <Icon v-else name="refresh" :size="13" />
+              检查更新
+            </button>
+            <button
+              v-if="updateStatus?.state === 'available'"
+              class="btn btn-primary btn-sm"
+              :disabled="updatePhase !== 'idle'"
+              @click="startDownloadInstall"
+            >
+              下载并安装 v{{ updateStatus.version }}
+            </button>
+          </div>
         </div>
       </section>
 

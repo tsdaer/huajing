@@ -36,6 +36,8 @@ import type {
   SessionMeta,
   Settings,
   StreamEvent,
+  UpdateProgress,
+  UpdateStatus,
   TheaterView,
   TimelineEntry,
   WorldbookReport,
@@ -75,6 +77,18 @@ export const api = {
 
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
+
+  // ---------- 签名自动更新（M4.2 · 设计 §13 · 决断 1） ----------
+  /** 更新器现状：configured/disabled（设置页决定检查按钮是否置灰） */
+  updaterInfo: () => invoke<UpdateStatus>("updater_info"),
+  /** 检查更新（不下载）；disabled = 未启用（不是错误） */
+  checkUpdate: () => invoke<UpdateStatus>("check_update"),
+  /** 下载并安装：进度经 onEvent 推送；签名不符在下载后拒绝；installing 后应用退出 */
+  downloadAndInstall: (onEvent: (e: UpdateProgress) => void) => {
+    const channel = new Channel<UpdateProgress>();
+    channel.onmessage = onEvent;
+    return invoke<void>("download_and_install", { onEvent: channel });
+  },
 
   listPersonas: () => invoke<Persona[]>("list_personas"),
 

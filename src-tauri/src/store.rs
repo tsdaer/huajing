@@ -218,6 +218,32 @@ pub struct Settings {
     /// 模板兜底）。false = 不生成（缺省）
     #[serde(default)]
     pub stage_narration: bool,
+    /// 签名自动更新（M4.2 · 设计 §13 · 决断 1）：`[updater]` 区，端点可配缺省关
+    #[serde(default)]
+    pub updater: UpdaterConfig,
+}
+
+/// `[updater]` 区（M4.2 · 决断 1）：静态清单（latest.json）的完整 URL + 开关。
+/// enabled=false 或 endpoint 空 = 自动更新未启用——UI 只提示不报错，检查入口置灰。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdaterConfig {
+    /// 更新清单（latest.json）的完整 URL。发布形态见 docs/release.md：
+    /// GitHub Releases 或任意静态托管皆可，客户端不做任何动态协商
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// 自动更新开关，缺省 false。v1 自用没有分发基础设施：客户端能力先行，
+    /// 端点由用户显式启用（哪怕是官方清单也尊重这个开关）
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for UpdaterConfig {
+    fn default() -> Self {
+        UpdaterConfig {
+            endpoint: None,
+            enabled: false,
+        }
+    }
 }
 
 impl Settings {
@@ -255,6 +281,7 @@ impl Default for Settings {
             auto_accept_minor_facts: false,
             tool_calls_per_turn: None,
             stage_narration: false,
+            updater: UpdaterConfig::default(),
         }
     }
 }

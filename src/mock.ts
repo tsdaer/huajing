@@ -455,6 +455,21 @@ export function setupMock() {
       case "save_settings":
         Object.assign(settings, args as Partial<Settings>);
         return settings;
+      // ---------- 签名自动更新（M4.2）：浏览器 mock 无安装器，检查给未启用态（不报错） ----------
+      case "updater_info":
+        return {
+          state: "disabled",
+          current_version: "0.3.1-mock",
+          message: "自动更新未启用",
+        };
+      case "check_update":
+        return {
+          state: "disabled",
+          current_version: "0.3.1-mock",
+          message: "自动更新未启用",
+        };
+      case "download_and_install":
+        throw new Error("浏览器 mock 模式没有安装器——更新闭环请运行打包版");
       case "list_personas":
         return personas;
       case "list_cards":

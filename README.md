@@ -44,6 +44,8 @@ pnpm tauri build      # 产出安装包
 
 发布流程：版本三处 bump + CHANGELOG 定版段（照旧人肉写）→ `git tag vX.Y.Z && git push origin vX.Y.Z` → Actions 构建完挂**草稿** Release（安装包 + CHANGELOG 定版段为 body）→ 检查无误后手动点 **Publish** 才对外可见。试车不碰发布面：Actions 页手动跑 Release 并勾选 `build_only`，产物只存 workflow artifacts。
 
+**签名自动更新**（M4.2）：更新包用 minisign 签名（私钥只在发布者手里，公钥内置于客户端），客户端从 `settings.toml` `[updater]` 配置的静态 `latest.json` 清单做检查 → 下载 → 签名校验 → 重启安装，缺省关闭。签名、清单生成与托管的完整流程见 [docs/release.md](docs/release.md)。
+
 ## 目录结构
 
 ```

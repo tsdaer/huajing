@@ -34,12 +34,14 @@ pub mod providers;
 pub mod scenes;
 pub mod summary;
 pub mod theater;
+pub mod updater;
 
 pub use ingestion::*;
 pub use providers::*;
 pub use scenes::*;
 pub use summary::*;
 pub use theater::*;
+pub use updater::*;
 
 #[tauri::command]
 pub fn app_info() -> serde_json::Value {

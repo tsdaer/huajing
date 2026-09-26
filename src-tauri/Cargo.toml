@@ -20,6 +20,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+# 签名自动更新（M4.2 · 设计 §13 · 决断 1）：官方插件内置 minisign 签名校验；
+# endpoint 不进编译期配置，运行时从 settings.toml 读（enabled 缺省 false = 未启用不报错）
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mlua = { version = "0.12.1", default-features = false, features = ["luajit", "serialize", "vendored"] }

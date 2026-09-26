@@ -4,6 +4,33 @@
 
 ## [Unreleased]
 
+### Added · 签名自动更新（M4.2 · 设计 §13 · 决断 1「更新无服务器」）
+
+- **updater 插件接线**（新增依赖 `tauri-plugin-updater` + `tauri-plugin-process`，官方
+  插件）：minisign 公钥进 `tauri.conf.json`（`plugins.updater.pubkey`，安装模式
+  passive——安装器进度条可见、装完自动重启），私钥由 `pnpm tauri signer generate`
+  生成于用户目录**不入库**；endpoint 不进编译期配置，运行时从 settings.toml 读。
+- **settings.toml `[updater]` 区**（`store.rs` `UpdaterConfig`）：`endpoint`
+  （latest.json 完整 URL）+ `enabled`（缺省 false）。未启用 = UI 只提示
+  「自动更新未启用」且检查按钮置灰，**不是错误**；启用判据（enabled 且端点非空）
+  前后端同口径，单测钉死（含缺区兼容与 TOML 往返）。
+- **更新命令三件套**（`commands/updater.rs`）：`updater_info`（现状 + 开关可用性）、
+  `check_update`（不下载；disabled/up_to_date/available/error 四态结论）、
+  `download_and_install`（进度经 Channel 推送 started/progress/downloaded/installing，
+  签名校验内建于下载完成后——篡改包在校验即被拒绝、绝不进安装器；Windows 上启动
+  NSIS 安装器后退出进程，由安装器接管重启）。手填代理沿对话通道同口径带上。
+- **错误逐类可读**（决断 1）：签名族（校验失败/解码失败/版本盖章不符→「已拒绝安装」）、
+  网络族（reqwest/下载失败→附排查线索）、清单族（JSON 结构/平台条目缺失/端点协议）
+  三族分类 + 插件完整原因链透出，运行时诊断（diag）留档；分类文案与插件 2.12 错误链
+  逐字对齐，单测覆盖三族 + 兜底。
+- **设置页「关于与更新」区**：当前版本、启用开关、清单地址、检查更新（未配置置灰）、
+  检查结论（含发布说明）、下载进度条（总长未知时显示已下载）、安装中提示。浏览器
+  mock 给未启用态的可读降级。
+- **docs/release.md**（发布流程首次成文）：签名密钥管理（位置/备份/换钥重发全量）、
+  版本三处同步、构建安装包、`tauri signer sign` 签名与 `latest.json` 生成、静态托管
+  与端点配置（正式构建仅 https，debug 放行 http——本地构造用例的基础）、发布检查
+  清单与本地构造用例步骤。README 同步。
+
 ### Added · 包格式与导入导出（M4.1 · 设计 §13「导入生态」）
 
 - **pack.rs 包内核**（新模块，唯一新增依赖 `zip`，deflate-only）：`pack.json`
