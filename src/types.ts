@@ -818,3 +818,63 @@ export interface WorldbookReport {
   files: string[];
   warnings: string[];
 }
+
+// ---------- 包格式与导入导出（M4.1 · 设计 §13：三包 zip 往返） ----------
+
+/** pack.json 清单（huajing-pack/1） */
+export interface PackManifest {
+  spec: string;
+  kind: "character" | "world" | "script";
+  name: string;
+  creator?: string | null;
+  description?: string | null;
+  requires?: { world?: string } | null;
+}
+
+/** 包内文件（预览清单用） */
+export interface PackFileInfo {
+  name: string;
+  size: number;
+}
+
+/** 包预览（导入弹窗：清单 + 文件 + 提醒 + 冲突标记） */
+export interface PackPreview {
+  manifest: PackManifest;
+  files: PackFileInfo[];
+  warnings: string[];
+  /** 目标位置已有同名安装物（默认并存 -2，可勾选覆盖） */
+  conflict: boolean;
+}
+
+/** 包导入报告 */
+export interface PackImportReport {
+  kind: string;
+  name: string;
+  /** 落盘位置（相对 DataHub，如 characters/月见） */
+  target: string;
+  files: number;
+  overwritten: boolean;
+  warnings: string[];
+}
+
+/** 导出产物（zip 或 ST 世界书 JSON） */
+export interface ExportedPack {
+  kind: string;
+  name: string;
+  path: string;
+}
+
+/** 剧本模板清单条目（建会话向导选择器用） */
+export interface ScriptSummary {
+  name: string;
+  premise: string;
+  has_director: boolean;
+}
+
+/** 剧本模板全文（选中后预填向导） */
+export interface ScriptTemplate {
+  name: string;
+  premise: string;
+  blackboard: import("./types").Blackboard | null;
+  has_director: boolean;
+}

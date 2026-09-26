@@ -10,6 +10,7 @@ mod director; // 导演调度：发言权打分与发言计划（M3.4 · 设计 
 mod event;    // 事件日志：类型化事件流与投影（M2.0 · 设计 §7.3）
 mod ingest;   // 素材规格化管线：清洗分段、机械映射、草稿包、切入点向导（M3.9 · 设计 §6.7）
 mod llm;      // OpenAI 兼容 SSE 客户端（设计 §11）
+mod pack;     // 包格式与导入导出：pack.json + zip，三包往返（M4.1 · 设计 §13）
 mod palace;   // 记忆宫殿：记忆对象、召回与视图（M2.1 · 设计 §5）
 mod prompt;   // Prompt Builder 双槽位组装（设计 §4）
 mod psyche;   // 心理运行时：情绪槽、衰减、意图（M2.5 · 设计 §9）
@@ -99,6 +100,14 @@ pub fn run() {
             commands::ingest_extract,
             commands::ingest_commit,
             commands::import_worldbook,
+            commands::preview_pack,
+            commands::import_pack,
+            commands::export_card_pack,
+            commands::export_world_pack,
+            commands::export_script_pack,
+            commands::export_worldbook_st,
+            commands::list_scripts,
+            commands::get_script,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,

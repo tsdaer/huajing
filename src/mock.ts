@@ -977,6 +977,25 @@ export function setupMock() {
           files: ["note.mock书.0.json", "note.mock书.1.json", "note.mock书.2.json", "note.mock书.3.json"],
           warnings: ["条目的 ST 专属字段（order/sticky/cooldown 等）已保留在 facts.st 作参考"],
         };
+
+      // ---------- 包格式与导入导出（M4.1）：浏览器 mock 无本地文件系统，给可读的降级 ----------
+      case "preview_pack":
+      case "import_pack":
+        throw new Error("浏览器 mock 模式没有本地文件系统——包导入/导出请运行打包版或 pnpm tauri dev");
+      case "export_card_pack":
+      case "export_world_pack":
+      case "export_script_pack":
+      case "export_worldbook_st":
+        throw new Error("浏览器 mock 模式不支持导出——请运行打包版或 pnpm tauri dev");
+      case "list_scripts":
+        return [] as unknown[];
+      case "get_script":
+        return {
+          name: (args as { name?: string } | undefined)?.name ?? "",
+          premise: "",
+          blackboard: null,
+          has_director: false,
+        };
       default:
         throw new Error(`mock 未覆盖命令：${cmd}`);
     }

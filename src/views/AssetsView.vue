@@ -6,6 +6,7 @@ import { cardGeneration, importOpen } from "../cards";
 import { loadSessions, preferredCard, selectSession, sessions } from "../sessions";
 import type { CardDetail, CardSummary, InspectorData } from "../types";
 import EmptyState from "../components/EmptyState.vue";
+import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
 import { statusClass, statusLabel } from "../components/inspector/util";
 
@@ -18,6 +19,7 @@ const emit = defineEmits<{ go: [view: "sessions"] }>();
 // ---------- 角色 ----------
 const cards = ref<CardSummary[]>([]);
 const loading = ref(false);
+const error = ref("");
 
 /** 卡目录为空或读取失败时静默 */
 async function loadCards() {
@@ -46,6 +48,37 @@ function startWith(dirName: string) {
   preferredCard.value = dirName;
   emit("go", "sessions");
 }
+
+// ---------- 导出（M4.1 · 三包与 ST 世界书） ----------
+const exporting = ref("");
+const exportNotice = ref("");
+
+/** 通用导出执行器：成功把产物路径展示成提示，失败进错误提示 */
+async function runExport(key: string, fn: () => Promise<{ path: string; name: string }>) {
+  exporting.value = key;
+  exportNotice.value = "";
+  error.value = "";
+  try {
+    const out = await fn();
+    exportNotice.value = `已导出「${out.name}」→ ${out.path}`;
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    exporting.value = "";
+  }
+}
+
+const exportCard = (dirName: string) =>
+  runExport(`card:${dirName}`, () => api.exportCardPack(dirName));
+const exportWorld = (world: string) =>
+  runExport(`world:${world}`, () => api.exportWorldPack(world));
+const exportWorldbookSt = (world: string) =>
+  runExport(`wb:${world}`, () => api.exportWorldbookSt(world));
+
+/** 当前浏览的会话对应的世界名（缺省 default） */
+const codexWorld = computed(
+  () => sessions.value.find((s) => s.id === codexSid.value)?.world || "default",
+);
 
 // 卡片详情弹窗（getCard：完整卡面 + 出场状态 + hooks 清单）
 const detail = ref<CardDetail | null>(null);
@@ -151,6 +184,13 @@ onMounted(async () => {
         </button>
       </div>
 
+      <!-- 导出结果 / 页面级错误 -->
+      <div v-if="exportNotice" class="alert alert-success alert-soft py-2 text-xs" role="status">
+        <span class="break-all">{{ exportNotice }}</span>
+        <button class="btn btn-ghost btn-xs" @click="exportNotice = ''">知道了</button>
+      </div>
+      <ErrorToast :message="error" @dismiss="error = ''" />
+
       <Transition name="fade" mode="out-in">
         <!-- ============ 角色 ============ -->
         <section v-if="assetTab === 'characters'" key="characters" class="flex flex-col gap-4">
@@ -218,6 +258,15 @@ onMounted(async () => {
                   <button class="btn btn-primary btn-xs flex-1" @click="startWith(c.dir_name)">
                     <Icon name="chat" :size="13" />用它开一场
                   </button>
+                  <button
+                    class="btn btn-xs tooltip tooltip-left"
+                    data-tip="导出角色包（zip，可分享给其他化境用户）"
+                    :disabled="exporting === `card:${c.dir_name}`"
+                    @click="exportCard(c.dir_name)"
+                  >
+                    <span v-if="exporting === `card:${c.dir_name}`" class="loading loading-spinner loading-xs"></span>
+                    <Icon v-else name="download" :size="13" />包
+                  </button>
                 </div>
               </div>
             </article>
@@ -258,6 +307,25 @@ onMounted(async () => {
               <button class="btn btn-ghost btn-sm" :disabled="codexBusy" @click="loadCodex">
                 <span v-if="codexBusy" class="loading loading-spinner loading-xs"></span>
                 <Icon v-else name="refresh" :size="15" />刷新
+              </button>
+              <!-- 世界包与 ST 世界书导出（M4.1）：按当前浏览的会话解析世界名 -->
+              <button
+                class="btn btn-ghost btn-sm tooltip tooltip-left"
+                data-tip="整包导出这个世界（实体 + 正史增量 + 世界时钟 + 世界线），可导入其他化境"
+                :disabled="!codexSid || exporting === `world:${codexWorld}`"
+                @click="exportWorld(codexWorld)"
+              >
+                <span v-if="exporting === `world:${codexWorld}`" class="loading loading-spinner loading-xs"></span>
+                <Icon v-else name="download" :size="15" />世界包
+              </button>
+              <button
+                class="btn btn-ghost btn-sm tooltip tooltip-left"
+                data-tip="反向导出为 SillyTavern 世界书 JSON（仅静态字段，§6.10）"
+                :disabled="!codexSid || exporting === `wb:${codexWorld}`"
+                @click="exportWorldbookSt(codexWorld)"
+              >
+                <span v-if="exporting === `wb:${codexWorld}`" class="loading loading-spinner loading-xs"></span>
+                <Icon v-else name="download" :size="15" />ST 世界书
               </button>
               <button
                 class="btn btn-ghost btn-sm ml-auto tooltip tooltip-left"

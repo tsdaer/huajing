@@ -20,6 +20,11 @@ import type {
   MemRecord,
   Message,
   OptionsEvent,
+  PackPreview,
+  PackImportReport,
+  ExportedPack,
+  ScriptSummary,
+  ScriptTemplate,
   Persona,
   PromptAssembly,
   Provider,
@@ -42,6 +47,8 @@ export type NewSessionOptions = {
   /** 角色阵容（M3.1 群聊）：空/缺省 = 单角色；首个是主角色（默认发言人） */
   characters?: string[];
   persona?: string;
+  /** 剧本模板（M4.1）：scripts/ 下的模板名；初始起因与局面随模板生效 */
+  script?: string;
   day?: number;
   clock?: string;
   place?: string;
@@ -229,6 +236,26 @@ export const api = {
   /** 导入 ST 卡：生成 characters/<名字>/card.lua（同名自动 -2；overwrite 时覆盖） */
   importStCard: (path: string, overwrite = false) =>
     invoke<ImportReport>("import_st_card", { path, overwrite }),
+
+  // ---------- 包格式与导入导出（M4.1 · 设计 §13：三包 zip 往返） ----------
+  /** 包预览（zip：pack.json 清单 + 文件清单 + 提醒 + 冲突标记；只读不落盘） */
+  previewPack: (path: string) => invoke<PackPreview>("preview_pack", { path }),
+  /** 包导入：角色进 characters/、世界进 codex/、剧本进 scripts/；overwrite 覆盖同名 */
+  importPack: (path: string, overwrite = false) =>
+    invoke<PackImportReport>("import_pack", { path, overwrite }),
+  /** 角色包导出：卡目录整打包 → DataHub/exports/ */
+  exportCardPack: (dirName: string) => invoke<ExportedPack>("export_card_pack", { dirName }),
+  /** 世界包导出：codex/<世界>/ 整打包 → DataHub/exports/ */
+  exportWorldPack: (world: string) => invoke<ExportedPack>("export_world_pack", { world }),
+  /** 剧本包导出：从会话抽取 premise/初始黑板/导演树（不含消息历史） */
+  exportScriptPack: (sessionId: string, name?: string) =>
+    invoke<ExportedPack>("export_script_pack", { sessionId, name: name ?? null }),
+  /** ST 世界书反向导出：canon 实体拍平（仅静态字段，§6.10） */
+  exportWorldbookSt: (world: string) => invoke<ExportedPack>("export_worldbook_st", { world }),
+  /** 已安装剧本清单（建会话向导选择器） */
+  listScripts: () => invoke<ScriptSummary[]>("list_scripts"),
+  /** 剧本模板全文（选中后预填向导） */
+  getScript: (name: string) => invoke<ScriptTemplate>("get_script", { name }),
 
   // ---------- 素材规格化管线（M3.9 · 设计 §6.7：wiki 页十分钟成卡） ----------
   /** P0–P11 提示词套件全文（手动模式的文本源；双用途） */

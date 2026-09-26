@@ -583,7 +583,7 @@ pub(crate) fn lua_str(s: &str) -> String {
 }
 
 /// 目录名清洗：去掉路径分隔与 Windows 保留字符，避免写穿 DataHub
-fn sanitize_dir_name(name: &str) -> String {
+pub(crate) fn sanitize_dir_name(name: &str) -> String {
     let mut cleaned: String = name
         .chars()
         .map(|c| match c {
@@ -757,8 +757,10 @@ pub fn import_worldbook_to(
 }
 
 /// 世界书 JSON 的条目收集：`{entries: {…}}` 对象形态 / `{entries: […]}` 数组形态 /
-/// 裸数组三种都认（不同导出工具形态不一）。
+/// 裸数组三种都认（不同导出工具形态不一）。`{"entries": {}}`（空书，反向导出
+/// 空世界时可产生）合法收下为 0 条；连 entries 容器都没有的裸对象才拒绝。
 fn collect_worldbook_entries(v: &serde_json::Value) -> Result<Vec<(usize, serde_json::Value)>, String> {
+    let has_entries_container = v.get("entries").is_some();
     let entries = v.get("entries").unwrap_or(v);
     let mut out: Vec<(usize, serde_json::Value)> = Vec::new();
     match entries {
@@ -772,7 +774,7 @@ fn collect_worldbook_entries(v: &serde_json::Value) -> Result<Vec<(usize, serde_
                 let uid = key.parse::<usize>().unwrap_or(idx);
                 out.push((uid, entry.clone()));
             }
-            if object_entries == 0 {
+            if object_entries == 0 && !has_entries_container {
                 return Err("找不到 entries——不像 SillyTavern 世界书 JSON".into());
             }
         }
@@ -877,6 +879,53 @@ fn sanitize_slug(s: &str) -> String {
     } else {
         cleaned
     }
+}
+
+// ---------- ST 世界书反向导出（M4.1 · 设计 §6.10：仅静态字段可往返）----------
+
+/// canon 实体拍平为 ST 世界书 JSON。
+///
+/// 映射与导入侧严格互逆（[`import_worldbook_to`]）：name→comment、aliases→key、
+/// 文本→content、constant→constant；导入时保留在 `facts.st` 的 ST 专属字段
+/// （order/sticky/cooldown 等）原样带回——ST 圈子导出的书经化境中转不丢信息。
+/// 仅导 canon（draft/retired 不导，§6.9）：retired 的历史形态属于史变留档，
+/// 不该以「现行设定」的面目进别的引擎。文本取 one_liner 的现行值（versions
+/// 按 `day` 生效切换；facet_at 未命中时回退实体自带 one_liner）。
+pub fn worldbook_from_entities(
+    world: &str,
+    entities: &[crate::codex::CodexEntity],
+    day: i64,
+) -> serde_json::Value {
+    let bb = std::collections::BTreeMap::new();
+    let mut entries = serde_json::Map::new();
+    for (uid, e) in entities.iter().filter(|e| e.is_canon()).enumerate() {
+        let content = e
+            .facet_at("one_liner", day, "", &bb)
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| e.one_liner.clone())
+            .trim()
+            .to_string();
+        if content.is_empty() {
+            continue; // 世界书条目没有 content 就没有存在意义（导入侧同样跳过）
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("uid".into(), serde_json::json!(uid));
+        entry.insert("key".into(), serde_json::json!(e.aliases));
+        entry.insert("comment".into(), serde_json::json!(e.name));
+        entry.insert("content".into(), serde_json::json!(content));
+        entry.insert("constant".into(), serde_json::json!(e.constant));
+        entry.insert("disable".into(), serde_json::json!(false));
+        if let Some(st) = e.facts.get("st").and_then(|v| v.as_object()) {
+            for (k, v) in st {
+                entry.insert(k.clone(), v.clone());
+            }
+        }
+        entries.insert(uid.to_string(), serde_json::Value::Object(entry));
+    }
+    serde_json::json!({ "name": world, "entries": entries })
 }
 
 
@@ -1305,5 +1354,109 @@ mod tests {
         let report = import_worldbook_to(dir.path(), "default", bare, None).unwrap();
         assert_eq!(report.imported, 1);
         assert!(import_worldbook_to(dir.path(), "default", "{\"nope\": 1}", None).is_err());
+    }
+
+    // ---------- ST 世界书反向导出（M4.1 · 对拍）----------
+
+    /// 构造一个实体集合：普通 note、带 ST 专属字段留档的 note、带 versions 史变、
+    /// draft / retired / 空文本各一——覆盖导出侧全部分支
+    fn export_entities() -> Vec<crate::codex::CodexEntity> {
+        [
+            serde_json::json!({
+                "id": "note.夜市", "type": "note", "name": "夜市", "aliases": ["夜街"],
+                "one_liner": "夜市在旧运河边开张。",
+                "facts": { "st": { "order": 100, "cooldown": 3, "keysecondary": ["晚上"] } },
+                "status": "canon"
+            }),
+            serde_json::json!({
+                "id": "place.钟楼", "type": "place", "name": "钟楼",
+                "one_liner": "钟楼报旧时的曲子。",
+                "versions": [
+                    { "from_day": 1, "facet": "one_liner", "value": "钟楼每晚整点敲响。" },
+                    { "from_day": 10, "facet": "one_liner", "value": "钟楼已在大火中塌了半边。" }
+                ],
+                "status": "canon"
+            }),
+            serde_json::json!({
+                "id": "char.摆渡人", "type": "char", "name": "摆渡人", "constant": true,
+                "one_liner": "渡船午夜后不摆渡。", "status": "canon"
+            }),
+            serde_json::json!({
+                "id": "item.草稿", "type": "note", "name": "草稿",
+                "one_liner": "还没定稿的事实。", "status": "draft"
+            }),
+            serde_json::json!({
+                "id": "place.旧渡口", "type": "place", "name": "旧渡口",
+                "one_liner": "早已废弃。", "status": "retired"
+            }),
+            serde_json::json!({
+                "id": "item.空条", "type": "note", "name": "空条", "status": "canon"
+            }),
+        ]
+        .iter()
+        .map(|v| crate::codex::CodexEntity::from_value(v).unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn worldbook_export_is_inverse_of_import() {
+        // 对拍：导出 → parse_worldbook（import_worldbook_to）→ 实体读回语义一致
+        let entities = export_entities();
+        let book = worldbook_from_entities("夜城", &entities, 3);
+        assert_eq!(book.get("name").and_then(|n| n.as_str()), Some("夜城"));
+
+        let entries = book.get("entries").and_then(|e| e.as_object()).unwrap();
+        // canon 且文本非空的三个：夜市 / 钟楼 / 摆渡人；draft、retired、空条不导
+        assert_eq!(entries.len(), 3, "draft/retired/空 one_liner 不导：{entries:?}");
+        assert_eq!(entries.keys().collect::<Vec<_>>(), vec!["0", "1", "2"], "uid 连续编号");
+
+        let json = serde_json::to_string_pretty(&book).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let report = import_worldbook_to(dir.path(), "回读", &json, Some("夜城")).unwrap();
+        assert_eq!(report.imported, 3, "导出的书应被自家导入侧全量收下：{report:?}");
+        assert_eq!(report.disabled, 0);
+        assert_eq!(report.skipped, 0);
+
+        // 导回的实体与原实体逐字段对上（id 按导入侧规则重生成，比对语义字段）
+        let back = crate::commands::parse_entities(&dir.path().join("codex/回读/entities"));
+        assert_eq!(back.len(), 3);
+        let night = back.iter().find(|e| e.name == "夜市").unwrap();
+        assert_eq!(night.aliases, vec!["夜街".to_string()], "aliases↔key 互逆");
+        assert_eq!(night.one_liner, "夜市在旧运河边开张。");
+        assert!(!night.constant);
+        // facts.st 原样往返（ST 专属字段经化境中转不丢）
+        let st = night.facts.get("st").unwrap();
+        assert_eq!(st.get("order").and_then(|v| v.as_i64()), Some(100));
+        assert_eq!(st.get("cooldown").and_then(|v| v.as_i64()), Some(3));
+        assert!(st.get("keysecondary").is_some());
+
+        // versions 取现行值：第 3 天 → 1 生效的版本；第 30 天 → 10 生效的版本
+        let tower_day3 = back.iter().find(|e| e.name == "钟楼").unwrap();
+        assert_eq!(tower_day3.one_liner, "钟楼每晚整点敲响。");
+        let book_day30 = worldbook_from_entities("夜城", &entities, 30);
+        let json30 = serde_json::to_string(&book_day30).unwrap();
+        let dir30 = tempfile::tempdir().unwrap();
+        import_worldbook_to(dir30.path(), "回读", &json30, Some("夜城")).unwrap();
+        let back30 = crate::commands::parse_entities(&dir30.path().join("codex/回读/entities"));
+        let tower_day30 = back30.iter().find(|e| e.name == "钟楼").unwrap();
+        assert_eq!(tower_day30.one_liner, "钟楼已在大火中塌了半边。");
+
+        // constant 往返
+        let ferry = back.iter().find(|e| e.name == "摆渡人").unwrap();
+        assert!(ferry.constant);
+    }
+
+    #[test]
+    fn worldbook_export_of_empty_world_is_empty_book() {
+        let book = worldbook_from_entities("空世界", &[], 1);
+        assert_eq!(
+            book.get("entries").and_then(|e| e.as_object()).map(|m| m.len()),
+            Some(0)
+        );
+        // 空书照样能被导入侧吃下（0 条，不报错）
+        let json = serde_json::to_string(&book).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let report = import_worldbook_to(dir.path(), "空世界", &json, None).unwrap();
+        assert_eq!(report.imported, 0);
     }
 }

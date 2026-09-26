@@ -119,6 +119,7 @@ pub fn new_session(
     clock: Option<String>,
     place: Option<String>,
     premise: Option<String>,
+    script: Option<String>,
     log: State<'_, store::EventLog>,
 ) -> Result<store::SessionMeta, String> {
     let root = root();
@@ -139,6 +140,7 @@ pub fn new_session(
         clock,
         place,
         premise,
+        script,
     };
     let meta = store::new_session(&root, &req).map_err(|e| e.to_string())?;
 
@@ -6759,6 +6761,7 @@ return {
                 clock: Some("20:00".into()),
                 place: Some("自习区".into()),
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -6840,6 +6843,7 @@ return {
                 clock: Some("20:00".into()),
                 place: Some("自习区".into()),
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -6945,6 +6949,7 @@ return {
                 clock: Some("20:55".into()),
                 place: Some("自习区".into()),
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -7012,6 +7017,7 @@ return {
                 clock: Some("20:55".into()),
                 place: Some("自习区".into()),
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -7523,6 +7529,7 @@ return {
             clock: Some("20:00".into()),
             place: None,
             premise: None,
+            script: None,
         })
         .unwrap();
         assert!(!fresh.novel_mode, "缺省关");
@@ -11200,6 +11207,7 @@ return {
                 clock: Some("09:00".into()),
                 place: Some("公告栏".into()),
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -11254,6 +11262,7 @@ return {
                 clock: Some("09:00".into()),
                 place: Some("回忆里的自习区".into()),
                 premise: None,
+                script: None,
             },
         )
         .unwrap();

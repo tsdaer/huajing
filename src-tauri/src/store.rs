@@ -127,9 +127,9 @@ fn user_data_root() -> PathBuf {
     base.join("huajing").join("DataHub")
 }
 
-/// 确保数据目录骨架存在（设计 §12 目录树）
+/// 确保数据目录骨架存在（设计 §12 目录树；scripts/ 是 M4.1 的剧本模板目录）
 pub fn ensure_layout(root: &Path) -> std::io::Result<()> {
-    for d in ["personas", "characters", "codex", "sessions"] {
+    for d in ["personas", "characters", "codex", "sessions", "scripts"] {
         std::fs::create_dir_all(root.join(d))?;
     }
     Ok(())
@@ -521,6 +521,9 @@ pub struct NewSessionRequest {
     pub clock: Option<String>,
     pub place: Option<String>,
     pub premise: Option<String>,
+    /// 剧本模板（M4.1 · 决断 3）：给出时初始 premise 与黑板从 `scripts/<名>/`
+    /// 取——向导显式填写的字段覆盖剧本值，阵容永远用本会话的
+    pub script: Option<String>,
 }
 
 pub fn session_dir(root: &Path, id: &str) -> PathBuf {
@@ -545,6 +548,24 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         }
         seen
     };
+    // 剧本模板（M4.1）：premise/初始黑板从模板取底，向导显式字段覆盖
+    let script = match req.script.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => Some(
+            crate::pack::load_script_template(root, name)
+                .map_err(|e| StoreError::NotFound(e))?,
+        ),
+        None => None,
+    };
+    let premise = req
+        .premise
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .or_else(|| {
+            script
+                .as_ref()
+                .map(|s| s.premise.clone())
+                .filter(|p| !p.trim().is_empty())
+        });
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -557,7 +578,7 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         persona: req.persona.clone(),
         world: None,
         seed: seed_now(),
-        premise: req.premise.clone(),
+        premise,
         max_speakers: None,
         theater: None,
         improv: false,
@@ -573,17 +594,39 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
     std::fs::write(dir.join("messages.jsonl"), "")?;
     // 各角色 Lua state 快照（M1.2 卡片加载后由 hooks 写入，初始为空表）
     std::fs::write(dir.join("state.json"), "{}\n")?;
+    let script_board = script.as_ref().and_then(|s| s.blackboard.clone());
     let blackboard = Blackboard {
-        day: req.day.unwrap_or(1),
-        clock: req.clock.clone().unwrap_or_default(),
-        place: req.place.clone().unwrap_or_default(),
+        day: req.day.or(script_board.as_ref().map(|b| b.day)).filter(|d| *d >= 1).unwrap_or(1),
+        clock: match req.clock.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) => c.to_string(),
+            None => script_board
+                .as_ref()
+                .map(|b| b.clock.clone())
+                .unwrap_or_default(),
+        },
+        place: match req.place.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => p.to_string(),
+            None => script_board
+                .as_ref()
+                .map(|b| b.place.clone())
+                .unwrap_or_default(),
+        },
         actors: cast,
-        extra: std::collections::BTreeMap::new(),
+        // 剧本初始黑板的实体作用域键（设计 §6.4）原样带来；没有剧本则空表
+        extra: script_board.map(|b| b.extra).unwrap_or_default(),
     };
     std::fs::write(
         dir.join("blackboard.json"),
         serde_json::to_string_pretty(&blackboard)? + "\n",
     )?;
+    // 剧本模板的自定义导演树落进会话（既有机制：sessions/<id>/director.lua 覆盖
+    // 内置起承转合树）；模板没带树就落回内置，无需动作
+    if let Some(tpl) = &script {
+        if tpl.has_director {
+            let src = crate::pack::scripts_dir(root).join(&tpl.name).join("director.lua");
+            std::fs::copy(&src, dir.join("director.lua"))?;
+        }
+    }
     Ok(meta)
 }
 
@@ -1286,6 +1329,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1364,6 +1408,7 @@ mod tests {
                 clock: Some("21:30".into()),
                 place: Some("图书馆自习区".into()),
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1428,6 +1473,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1451,6 +1497,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1520,6 +1567,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1585,6 +1633,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1633,6 +1682,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1681,6 +1731,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1777,6 +1828,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1838,6 +1890,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1902,6 +1955,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();
@@ -1969,6 +2023,7 @@ mod tests {
                 clock: None,
                 place: None,
                 premise: None,
+                script: None,
             },
         )
         .unwrap();

@@ -548,3 +548,128 @@ pub fn import_worldbook(
 }
 
 
+
+// ---------- 包格式与导入导出（M4.1 · 设计 §13：三包 zip 往返）----------
+//
+// 内核在 crate::pack（纯函数可单测）；命令层只负责拿默认 DataHub 与诊断留痕。
+// 重复导入的冲突处理沿 stimport 先例：预览阶段报冲突，导入默认并存「-2」，
+// 显式 overwrite 才覆盖。
+
+/// 包预览（导入弹窗：清单 + 文件清单 + 提醒 + 冲突标记；只读不落盘）
+#[tauri::command]
+pub fn preview_pack(path: String) -> Result<crate::pack::PackPreview, String> {
+    let path = std::path::PathBuf::from(path.trim());
+    let outcome = crate::pack::preview_pack(&root(), &path);
+    crate::diag::record(
+        if outcome.is_ok() { "import" } else { "error" },
+        match &outcome {
+            Ok(p) => format!(
+                "包预览：{}（{}，{} 个文件）← {}",
+                p.manifest.name, p.manifest.kind, p.files.len(), path.display()
+            ),
+            Err(e) => format!("包预览失败：{}：{e}", path.display()),
+        },
+    );
+    outcome
+}
+
+/// 包导入：识别 kind → 角色进 characters/、世界进 codex/、剧本进 scripts/ →
+/// 热加载生效（卡走 watch 通道、世界按指纹自动重建）
+#[tauri::command]
+pub fn import_pack(path: String, overwrite: Option<bool>) -> Result<crate::pack::PackImportReport, String> {
+    let path = std::path::PathBuf::from(path.trim());
+    let outcome = crate::pack::import_pack_to(&root(), &path, overwrite.unwrap_or(false));
+    if outcome.is_err() {
+        crate::diag::record(
+            "error",
+            format!("包导入失败：{}：{}", path.display(), outcome.as_ref().unwrap_err()),
+        );
+    }
+    outcome
+}
+
+/// 角色包导出：卡目录整打包 → DataHub/exports/
+#[tauri::command]
+pub fn export_card_pack(dir_name: String) -> Result<crate::pack::ExportedPack, String> {
+    let out = crate::pack::export_card_pack(&root(), dir_name.trim());
+    diag_export(&out);
+    out
+}
+
+/// 世界包导出：codex/<世界>/ 整打包 → DataHub/exports/
+#[tauri::command]
+pub fn export_world_pack(world: String) -> Result<crate::pack::ExportedPack, String> {
+    let out = crate::pack::export_world_pack(&root(), world.trim());
+    diag_export(&out);
+    out
+}
+
+/// 剧本包导出：从既有会话抽取 premise/初始黑板/导演树（不含消息历史）→ exports/
+#[tauri::command]
+pub fn export_script_pack(
+    session_id: String,
+    name: Option<String>,
+) -> Result<crate::pack::ExportedPack, String> {
+    let out = crate::pack::export_script_pack(&root(), session_id.trim(), name.as_deref());
+    diag_export(&out);
+    out
+}
+
+fn diag_export(out: &Result<crate::pack::ExportedPack, String>) {
+    crate::diag::record(
+        if out.is_ok() { "export" } else { "error" },
+        match out {
+            Ok(p) => format!("包导出：{}（{}）→ {}", p.name, p.kind, p.path),
+            Err(e) => format!("包导出失败：{e}"),
+        },
+    );
+}
+
+/// ST 世界书反向导出（§6.10）：canon 实体拍平 → exports/<世界>-worldbook.st.json
+#[tauri::command]
+pub fn export_worldbook_st(world: String) -> Result<crate::pack::ExportedPack, String> {
+    let root = root();
+    let name = if world.trim().is_empty() { "default".into() } else { world.trim().to_string() };
+    let entities_dir = root.join("codex").join(&name).join("entities");
+    if !entities_dir.is_dir() {
+        return Err(format!("世界「{name}」不存在"));
+    }
+    // 导出的世界口径与注入一致：实体文件解析 + grown.json 正史增量应用
+    let entities = crate::codex::apply_grown(
+        parse_entities(&entities_dir),
+        &crate::store::load_grown(&root, &name),
+    );
+    let day = crate::store::load_world(&root, &name).day;
+    let book = crate::stimport::worldbook_from_entities(&name, &entities, day);
+    let count = book
+        .get("entries")
+        .and_then(|e| e.as_object())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let dir = crate::pack::exports_dir(&root);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{name}-worldbook.st.json"));
+    let body = serde_json::to_string_pretty(&book).map_err(|e| e.to_string())?;
+    std::fs::write(&path, body + "\n").map_err(|e| e.to_string())?;
+    crate::diag::record(
+        "export",
+        format!("ST 世界书导出：{name}（{count} 条）→ {}", path.display()),
+    );
+    Ok(crate::pack::ExportedPack {
+        kind: "worldbook".into(),
+        name,
+        path: path.display().to_string(),
+    })
+}
+
+/// 已安装剧本清单（建会话向导的选择器数据源）
+#[tauri::command]
+pub fn list_scripts() -> Result<Vec<crate::pack::ScriptSummary>, String> {
+    Ok(crate::pack::list_scripts(&root()))
+}
+
+/// 剧本模板全文（选中后预填向导：premise/天/时间/地点）
+#[tauri::command]
+pub fn get_script(name: String) -> Result<crate::pack::ScriptTemplate, String> {
+    crate::pack::load_script_template(&root(), name.trim())
+}

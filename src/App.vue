@@ -114,8 +114,8 @@ async function startDropWatch() {
         requestImport(hit);
       } else if (paths.length > 0) {
         // 拖了别的文件：说清楚为什么不理会（并留痕，便于事后排查）
-        importNotice.value = `只支持 SillyTavern 的 PNG / JSON 角色卡，已忽略：${paths[0]}`;
-        void api.recordDiagnostic("import", `拖放被忽略（非 PNG/JSON）：${paths[0]}`);
+        importNotice.value = `只支持角色卡（PNG/JSON）、化境包（zip）与世界书（JSON），已忽略：${paths[0]}`;
+        void api.recordDiagnostic("import", `拖放被忽略（非卡/包文件）：${paths[0]}`);
       }
     });
   } catch {
@@ -157,8 +157,8 @@ onUnmounted(() => {
       >
         <div class="pop-in rounded-box border-2 border-dashed border-primary bg-base-100 px-8 py-6 text-center">
           <Icon name="sparkle" :size="24" class="mx-auto text-primary" />
-          <p class="mt-2 mb-0 text-sm font-medium">松手导入角色卡</p>
-          <p class="mb-0 text-xs text-base-content/50">SillyTavern 的 PNG 或 JSON</p>
+          <p class="mt-2 mb-0 text-sm font-medium">松手导入</p>
+          <p class="mb-0 text-xs text-base-content/50">角色卡（PNG / JSON）、化境包（zip）、世界书（JSON）</p>
         </div>
       </div>
     </Transition>

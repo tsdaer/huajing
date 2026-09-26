@@ -29,8 +29,8 @@ export function requestImport(path: string): void {
   void api.recordDiagnostic("import", `收到导入请求：${path}`);
 }
 
-/// 待导入的卡文件扩展名（拖放过滤）
-export const CARD_FILE_RE = /\.(png|json)$/i;
+/// 待导入文件的扩展名（拖放过滤）：ST 卡（PNG/JSON）与化境包（zip）
+export const CARD_FILE_RE = /\.(png|json|zip)$/i;
 
 /// 拖放被拒绝时的提示（非 PNG/JSON 的文件）：静默忽略会让人以为「拖了没反应」
 export const importNotice = ref("");

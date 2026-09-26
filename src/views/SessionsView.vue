@@ -11,7 +11,7 @@ import {
   selectedSession,
   selectSession,
 } from "../sessions";
-import type { CardSummary, Persona } from "../types";
+import type { CardSummary, Persona, ScriptSummary } from "../types";
 import ErrorToast from "../components/ErrorToast.vue";
 import EmptyState from "../components/EmptyState.vue";
 import Icon from "../components/Icon.vue";
@@ -22,6 +22,7 @@ import SessionView from "./SessionView.vue";
 
 const cards = ref<CardSummary[]>([]);
 const personas = ref<Persona[]>([]);
+const scripts = ref<ScriptSummary[]>([]);
 const error = ref("");
 const newEl = ref<HTMLDialogElement | null>(null);
 
@@ -30,6 +31,8 @@ const form = reactive({
   /** 群聊阵容（M3.1）：勾选的目录名；空 = 只用主角色 */
   extra: [] as string[],
   persona: "",
+  /** 剧本模板（M4.1）：选中即预填起因/天/时间/地点，模板里的实体状态随会话生效 */
+  script: "",
   /** 第几天（M3.7：空 = 从世界时钟出发，回写是 max 不会拉低世界） */
   day: null as number | null,
   clock: "",
@@ -40,6 +43,7 @@ const form = reactive({
 onMounted(async () => {
   void loadSessions();
   await loadCardsAndPersonas();
+  void loadScripts();
   // 从别处（资产页「用它开一场」等）带着打开标记进来：dialog 引用此刻才就绪，补一次打开
   if (newSessionOpen.value && !newEl.value?.open) newEl.value?.showModal();
 });
@@ -59,6 +63,34 @@ async function loadCardsAndPersonas() {
     preferredCard.value = "";
   }
 }
+
+async function loadScripts() {
+  try {
+    scripts.value = await api.listScripts();
+  } catch {
+    scripts.value = [];
+  }
+}
+
+/** 选剧本：预填起因/天/时间/地点（用户仍可改；实体作用域状态由后端随会话生效） */
+watch(
+  () => form.script,
+  async (name) => {
+    if (!name) return;
+    try {
+      const tpl = await api.getScript(name);
+      form.premise = tpl.premise || form.premise;
+      const bb = tpl.blackboard;
+      if (bb) {
+        if (bb.day >= 1) form.day = bb.day;
+        if (bb.clock) form.clock = bb.clock;
+        if (bb.place) form.place = bb.place;
+      }
+    } catch {
+      /* 模板读取失败不阻塞向导 */
+    }
+  },
+);
 
 /** 主角色切换时把它从「同台」勾选里摘掉（不能自己陪自己） */
 watch(
@@ -90,6 +122,7 @@ async function create() {
       character: form.character,
       characters: characters.length > 1 ? characters : undefined,
       persona: form.persona || undefined,
+      script: form.script || undefined,
       day: form.day || undefined,
       clock: form.clock || undefined,
       place: form.place || undefined,
@@ -163,6 +196,18 @@ async function create() {
             <select id="new-persona" class="select select-sm w-full" v-model="form.persona">
               <option value="">（不使用）</option>
               <option v-for="p in personas" :key="p.name" :value="p.name">{{ p.name }}</option>
+            </select>
+          </div>
+          <!-- 剧本（M4.1）：包导入落进 scripts/ 的会话模板；选中即预填起因与开局局面 -->
+          <div v-if="scripts.length > 0">
+            <label class="label" for="new-script">
+              剧本<span class="ml-1 text-base-content/45">（开局模板：起因 + 初始局面 + 导演树）</span>
+            </label>
+            <select id="new-script" class="select select-sm w-full" v-model="form.script">
+              <option value="">（不用剧本）</option>
+              <option v-for="s in scripts" :key="s.name" :value="s.name">
+                {{ s.name }}{{ s.has_director ? " · 有导演树" : "" }}
+              </option>
             </select>
           </div>
           <div class="grid grid-cols-2 gap-3">

@@ -147,6 +147,36 @@ async function chooseOption(o: StoryOption) {
   await sendText(o.gist);
 }
 
+// ---------- 剧本导出（M4.1 · 决断 3：剧本是会话模板不是存档） ----------
+// 抽取 premise + 当前黑板投影（作为模板初始黑板）+ 自定义导演树；不含消息历史。
+const scriptDlgOpen = ref(false);
+const scriptName = ref("");
+const scriptBusy = ref(false);
+
+function openScriptDialog() {
+  // 缺省名 = 起因（与后端导出侧的兜底一致）
+  scriptName.value = props.meta.premise?.trim() ?? "";
+  scriptDlgOpen.value = true;
+}
+
+async function exportScript() {
+  scriptBusy.value = true;
+  try {
+    const out = await api.exportScriptPack(
+      props.meta.id,
+      scriptName.value.trim() || undefined,
+    );
+    scriptDlgOpen.value = false;
+    void api.recordDiagnostic("export", `剧本导出：${out.name} → ${out.path}`);
+    scriptDonePath.value = out.path;
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    scriptBusy.value = false;
+  }
+}
+const scriptDonePath = ref("");
+
 // ---------- M3.2 场景与多线（设计 §10.3）：场景条 + 消息按场景分段 ----------
 const scenes = ref<Scene[]>([]);
 const activeScene = ref("");
@@ -692,6 +722,13 @@ watch(
         <div class="flex flex-none items-center gap-1">
           <button
             class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
+            data-tip="存为剧本包：premise + 初始黑板 + 导演树（不含聊天记录），可分享"
+            @click="openScriptDialog"
+          >
+            <Icon name="download" :size="16" />
+          </button>
+          <button
+            class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
             data-tip="黑板"
             :class="{ 'btn-active': panel === 'board' }"
             @click="togglePanel('board')"
@@ -1172,5 +1209,41 @@ watch(
       :busy="sceneBusy"
       @submit="onSceneSubmit"
     />
+
+    <!-- 剧本导出弹窗（M4.1）：命名后抽取 premise/初始黑板/导演树 -->
+    <dialog class="modal" :open="scriptDlgOpen">
+      <div class="modal-box max-w-md">
+        <h3 class="text-base font-semibold">存为剧本包</h3>
+        <p class="mt-1 text-xs text-base-content/50">
+          抽取起因、当前黑板（作为新会话的初始局面）与自定义导演树——
+          <span class="text-base-content/60">不包含聊天记录</span>。分享给别人导入后，
+          建会话向导可选这个剧本开局。
+        </p>
+        <label class="label mt-3" for="script-name">剧本名</label>
+        <input
+          id="script-name"
+          v-model="scriptName"
+          class="input input-sm w-full"
+          placeholder="老图书馆月底拆除"
+          @keydown.enter.prevent="exportScript"
+        />
+        <div class="modal-action">
+          <button class="btn btn-sm" type="button" @click="scriptDlgOpen = false">取消</button>
+          <button class="btn btn-primary btn-sm" type="button" :disabled="scriptBusy" @click="exportScript">
+            <span v-if="scriptBusy" class="loading loading-spinner loading-xs"></span>
+            导出
+          </button>
+        </div>
+      </div>
+      <div class="modal-backdrop" @click="scriptDlgOpen = false"></div>
+    </dialog>
+
+    <!-- 剧本导出成功提示 -->
+    <div v-if="scriptDonePath" class="fixed inset-x-0 bottom-4 z-40 mx-auto w-fit max-w-[92vw]" role="status">
+      <div class="alert alert-success shadow-lg">
+        <span class="text-xs break-all">剧本已导出 → {{ scriptDonePath }}</span>
+        <button class="btn btn-ghost btn-xs" @click="scriptDonePath = ''">知道了</button>
+      </div>
+    </div>
   </div>
 </template>
