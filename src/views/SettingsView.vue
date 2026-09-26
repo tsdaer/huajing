@@ -713,6 +713,9 @@ async function confirmRemove() {
               清单可托管在 GitHub Releases 或任意静态站点（发布流程见
               <code class="font-mono">docs/release.md</code>）。
             </p>
+            <p v-if="!updaterConfigured" class="m-0 text-xs text-warning">
+              自动更新未启用：打开上方开关并填入清单地址后，才可检查更新。
+            </p>
           </div>
 
           <!-- 检查结论：四态之一（available 给出下载入口） -->
