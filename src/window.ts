@@ -5,6 +5,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
 
+/** 移动端（M4.5）：Android/iOS WebView 里没有窗口装饰的概念，自定义标题栏要整体隐藏 */
+export const isMobile = /android|iphone|ipad|ipod/i.test(navigator.userAgent);
+
 export async function minimizeWindow(): Promise<void> {
   if (isTauri) await getCurrentWindow().minimize();
 }

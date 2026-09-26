@@ -273,6 +273,13 @@ export const api = {
   /** 导入 ST 卡：生成 characters/<名字>/card.lua（同名自动 -2；overwrite 时覆盖） */
   importStCard: (path: string, overwrite = false) =>
     invoke<ImportReport>("import_st_card", { path, overwrite }),
+  /**
+   * 导入统一入口的暂存步（M4.5 · 决断 6）：把文件选择器拿到的字节落到
+   * DataHub/imports/（24h 过期自洁），返回路径——既有 path 版预览/导入原样可用。
+   * 移动端拿不到本地路径，拖放通道不存在，这是它的替代通道（桌面双通道并存）。
+   */
+  stageImport: (filename: string, data: number[]) =>
+    invoke<string>("stage_import", { filename, data }),
 
   // ---------- 包格式与导入导出（M4.1 · 设计 §13：三包 zip 往返） ----------
   /** 包预览（zip：pack.json 清单 + 文件清单 + 提醒 + 冲突标记；只读不落盘） */

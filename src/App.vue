@@ -68,6 +68,29 @@ function onImported() {
   cardGeneration.value += 1;
 }
 
+// ---------- 导入统一入口（M4.5 · 决断 6）：顶栏文件选择器，移动端没有拖放 ----------
+// 字节经 stage_import 落 DataHub/imports/ 临时文件后，既有 path 版弹窗流程原样复用。
+const importFileInput = ref<HTMLInputElement | null>(null);
+
+async function onImportFilePicked(ev: Event) {
+  const input = ev.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = ""; // 允许重复选同一个文件
+  if (!file) return;
+  if (!CARD_FILE_RE.test(file.name)) {
+    importNotice.value = `只支持角色卡（PNG/JSON）、化境包（zip）与世界书（JSON），已忽略：${file.name}`;
+    void api.recordDiagnostic("import", `选择器导入被忽略（非卡/包文件）：${file.name}`);
+    return;
+  }
+  try {
+    const data = Array.from(new Uint8Array(await file.arrayBuffer()));
+    const path = await api.stageImport(file.name, data);
+    requestImport(path);
+  } catch (e) {
+    importNotice.value = `导入暂存失败：${String(e)}`;
+  }
+}
+
 const info = ref<Awaited<ReturnType<typeof api.appInfo>> | null>(null);
 
 /** 构建时间（本地时区，精确到分钟）：真机排查时先看它——旧构建一眼可见 */
@@ -188,6 +211,21 @@ onUnmounted(() => {
             </button>
           </div>
           <div class="navbar-end gap-3">
+            <!-- 导入统一入口（M4.5）：文件选择器 + 字节暂存；桌面拖放双通道并存 -->
+            <input
+              ref="importFileInput"
+              type="file"
+              accept=".png,.json,.zip"
+              class="hidden"
+              @change="onImportFilePicked"
+            />
+            <button
+              class="btn btn-ghost btn-sm"
+              title="从文件导入角色卡（PNG/JSON）、世界书（JSON）或化境包（zip）"
+              @click="importFileInput?.click()"
+            >
+              <Icon name="plus" :size="15" />导入
+            </button>
             <div class="breadcrumbs hidden text-xs text-base-content/45 sm:block">
               <ul>
                 <li>化境</li>

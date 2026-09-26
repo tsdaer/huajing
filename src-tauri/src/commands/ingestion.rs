@@ -673,3 +673,46 @@ pub fn list_scripts() -> Result<Vec<crate::pack::ScriptSummary>, String> {
 pub fn get_script(name: String) -> Result<crate::pack::ScriptTemplate, String> {
     crate::pack::load_script_template(&root(), name.trim())
 }
+
+// ---------- 导入暂存（M4.5 · 决断 6「导入入口统一」） ----------
+
+/// 暂存目录的最长保留期：暂存文件只服务于「选择文件 → 弹窗预览 → 导入」这一小段
+/// 流程，超过 24 小时的遗留（导入中途关应用等）在下次暂存时顺手清掉。
+const STAGE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// 把前端交来的文件字节落成 DataHub/imports/ 下的暂存文件，返回路径。
+/// 移动端 / HTML 文件选择器拿不到本地路径，字节交后端后既有 path 版
+/// preview/import 命令原样可用；桌面拖放双通道保留不受影响。
+#[tauri::command]
+pub fn stage_import(filename: String, data: Vec<u8>) -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    if data.is_empty() {
+        return Err("文件内容为空".into());
+    }
+    if data.len() > 512 * 1024 * 1024 {
+        return Err("文件超过 512MB 上限".into());
+    }
+    let root = root();
+    let dir = root.join("imports");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 顺手清掉过期暂存（明文数据层的自洁，失败不阻塞本次暂存）
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        if let Ok(meta) = entry.metadata() {
+            let age = now.saturating_sub(meta.modified().ok().and_then(|m| m.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(now));
+            if age > STAGE_MAX_AGE_SECS {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    // 文件名只取末段 + sanitize（防路径成分），加时间戳前缀防同名覆盖
+    let base = crate::stimport::sanitize_dir_name(&filename);
+    let stem = format!("{}-{}", now, base);
+    let path = dir.join(&stem);
+    std::fs::write(&path, &data).map_err(|e| e.to_string())?;
+    crate::diag::record(
+        "import",
+        format!("文件选择器暂存：{}（{} 字节）→ {}", base, data.len(), path.display()),
+    );
+    Ok(path.display().to_string())
+}

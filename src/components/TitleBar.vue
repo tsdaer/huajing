@@ -3,6 +3,7 @@ import { onMounted, onUnmounted, ref } from "vue";
 import Icon from "./Icon.vue";
 import {
   closeWindow,
+  isMobile,
   isTauri,
   isWindowMaximized,
   minimizeWindow,
@@ -30,7 +31,9 @@ onUnmounted(() => unlisten?.());
 </script>
 
 <template>
+  <!-- 移动端（M4.5）：没有窗口装饰的概念，标题栏整体不渲染 -->
   <div
+    v-if="!isMobile"
     class="flex h-9 flex-none items-center gap-2 border-b border-base-300 bg-base-200 pr-1.5 pl-3 select-none"
     data-tauri-drag-region
   >

@@ -4,6 +4,28 @@
 
 ## [Unreleased]
 
+### Added · 移动端 alpha 桌面半场（M4.5 前半 · 决断 6「导入统一入口」）
+
+- **导入文件选择器统一入口**（新命令 `stage_import`，零新依赖）：顶栏「导入」按钮 +
+  HTML 文件选择器（桌面/移动同一条通道）→ 字节落 `DataHub/imports/`（24h 过期
+  自洁）→ 返回路径 → **既有 path 版预览/导入弹窗原样复用**；桌面拖放双通道保留。
+  移动端拿不到本地路径、拖放不存在，这是它的替代通道。
+- **移动端形态**：Android/iOS UA 下自定义标题栏整体不渲染（`window.ts` 增 `isMobile`
+  探测——WebView 无窗口装饰概念）；桌面行为不变。
+- **真机走查 12 断言全过**（temp/m45，移动 UA + 480×800 视口模拟，`tauri build
+  --debug` 嵌入前端）：标题栏隐藏 / 首页与会话页无横向溢出 / 输入区 textarea+发送键
+  在视口内 / 文件选择器→stage_import→弹窗预览→导入落盘全链 / 检查器抽屉 480px 可用；
+  触摸目标抽样留档（btn-sm≈32px，真机验收按 ≥40px 复核）。
+- **Android 环境受阻记录**（计划风险 3 预案）：本机无 SDK/NDK（JDK 26 在但与 AGP
+  兼容性存疑），环境搭建（数 GB 下载 + 许可协议 + rustup android targets）顺延——
+  `tauri android init` / APK 构建与模拟器全链走查待环境就绪后补录；软键盘遮挡项
+  只能在真机验证，同批顺延。
+- **方法论记录**：裸 `cargo build` 的 debug exe 在 Tauri v2 下连 devUrl（vite dev
+  server）而非嵌入 dist——「rebuild exe 嵌前端」必须用 `tauri build --debug
+  --no-bundle`；此前 M4.2–M4.4 走查全绿实为 dev server 直读工作区源码（源码 ==
+  HEAD 时等价，但认知要纠正）。另外 WebView2 的 additional browser arguments
+  只在**新建**浏览器进程时生效——走查实例必须配全新 user data folder。
+
 ### Added · 宫殿睡眠整理（M4.4 · 设计 §5.4 · 决断 4「管线产物」/ 决断 5「归档不复活」）
 
 - **宿主确定性候选与分组**（新模块 `consolidate.rs`，单测钉死同输入同输出）：候选 =

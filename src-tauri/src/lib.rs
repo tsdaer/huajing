@@ -123,6 +123,7 @@ pub fn run() {
             commands::theme_parse_import,
             commands::theme_export_file,
             commands::consolidate_now,
+            commands::stage_import,
             watch::watch_cards,
             watch::unwatch_cards,
             stimport::import_st_card,
