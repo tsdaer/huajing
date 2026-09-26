@@ -134,7 +134,10 @@ pub struct WorldlineProgress {
 /// 轮末回写 `max(世界, 本会话)`——多线并行不回退，flashback 会话不拉低它。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldState {
-    /// 世界时钟（故事天）。缺省 1（与建会话缺省一致——没有 world.json 时行为不变）
+    /// 世界时钟（故事天）。缺省 1（与建会话缺省一致——没有 world.json 时行为不变）。
+    /// 必须带 default：仓库示例与玩家手写的 world.json 可以只有元信息没有时钟，
+    /// 解析失败会让 load_world 整体退回缺省，轮末回写把元信息一并抹掉
+    #[serde(default = "default_day")]
     pub day: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tone: Option<String>,
@@ -155,10 +158,14 @@ pub struct WorldState {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+fn default_day() -> i64 {
+    1
+}
+
 impl Default for WorldState {
     fn default() -> Self {
         WorldState {
-            day: 1,
+            day: default_day(),
             tone: None,
             style: None,
             worldline: None,
@@ -324,6 +331,38 @@ mod tests {
         assert!(!sync(&mut world, "s2", 3, None, &[], 101));
         assert_eq!(world.day, 15);
         assert_eq!(world.updated_by.as_deref(), Some("s1"), "无变化不盖章");
+    }
+
+    /// 仓库示例与玩家手写的 world.json 只有元信息没有时钟字段（day 缺省）——
+    /// 解析失败会让 load_world 静默退回缺省，轮末回写把元信息一并抹掉
+    /// （实锤过 world.json 被写剩三个时钟字段的缺陷）。day 必须带 serde default。
+    #[test]
+    fn hand_written_world_metadata_survives_round_end_write_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("codex").join("default")).unwrap();
+        crate::store::atomic_write(
+            &crate::store::world_path(dir.path(), "default"),
+            r#"{ "spec": "world/1.0", "name": "default", "tone": "现代都市 · 温柔日常" }"#.as_bytes(),
+        )
+        .unwrap();
+        let mut world = crate::store::load_world(dir.path(), "default");
+        assert_eq!(
+            world.tone.as_deref(),
+            Some("现代都市 · 温柔日常"),
+            "缺 day 的手写文件要读得进来"
+        );
+        // 轮末回写（sync + save）后元信息原样保留，时钟字段补上
+        assert!(sync(&mut world, "s1", 5, None, &[], 100));
+        crate::store::save_world(dir.path(), "default", &world).unwrap();
+        let reread = crate::store::load_world(dir.path(), "default");
+        assert_eq!(reread.day, 5);
+        assert_eq!(reread.tone.as_deref(), Some("现代都市 · 温柔日常"));
+        assert_eq!(
+            reread.extra.get("spec").and_then(|v| v.as_str()),
+            Some("world/1.0"),
+            "未知键经 flatten 原样保留"
+        );
+        assert_eq!(reread.extra.get("name").and_then(|v| v.as_str()), Some("default"));
     }
 
     #[test]

@@ -40,3 +40,6 @@ temp/
 *.sln
 *.sw?
 .zcode/
+
+# 导出产物（三包导出的 zip 与 ST 世界书，属运行时用户数据）
+DataHub/exports/

@@ -35,6 +35,16 @@
   包」、每个世界「世界包 / ST 世界书」按钮（产物路径提示）；会话页「存为剧本」；
   新建会话向导剧本下拉。浏览器 mock 对包命令给出可读降级提示。
 
+### Fixed · 世界时钟回写抹掉手写世界元信息
+
+- **`codex/<世界>/world.json` 的世界元信息被轮末回写整体覆盖**（`worldline.rs`）：仓库示例与
+  玩家手写的 world.json 可以只有 `spec`/`name`/`tone` 一类元信息、没有时钟字段，而
+  `WorldState.day` 没带 serde default——解析失败让 `load_world` 静默退回缺省（第 1 天），
+  轮末 `sync` 回写把整个文件写剩 `{day, updated_at, updated_by}` 三个字段，手写元信息全灭
+  （真机 DataHub 的 default 世界实锤被抹，违背「玩家手写的元信息不因回写丢失」的设计注释）。
+  修复：`day` 补 `#[serde(default = "default_day")]`（缺省 1），`spec`/`name` 走既有
+  `extra` flatten 原样保留；「手写元信息 → 轮末回写 → 读回一致」单测钉死，仓库示例文件恢复原貌。
+
 ### Fixed · 真机走查四处（界面整页闪烁 / 边缘 tooltip 裁剪 / 提示词浮点噪声 / 剧场停摆）
 
 - **每轮回复后界面整页闪烁（dev 模式）**（`vite.config.ts`）：`tauri dev` 下 vite 监听
