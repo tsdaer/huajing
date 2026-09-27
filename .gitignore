@@ -43,3 +43,6 @@ temp/
 
 # 导出产物（三包导出的 zip 与 ST 世界书，属运行时用户数据）
 DataHub/exports/
+
+# 主题（自定义活动主题与主题库，M4.3 起落 DataHub/themes/，属运行时用户数据）
+DataHub/themes/

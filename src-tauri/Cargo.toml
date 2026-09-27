@@ -1,6 +1,6 @@
 [package]
 name = "huajing"
-version = "0.3.1"
+version = "0.4.0"
 description = "化境 — 本地优先的智能体角色扮演客户端（化万千相，随心入境）"
 authors = ["huajing"]
 edition = "2021"
