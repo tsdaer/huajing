@@ -1063,6 +1063,7 @@ mod tests {
                 place: Some("天文台".into()),
                 premise: Some("流星雨之夜".into()),
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -1132,6 +1133,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: Some("流星雨夜".into()),
+                world: None,
             },
         )
         .unwrap();
@@ -1159,6 +1161,7 @@ mod tests {
                 place: None,
                 premise: Some("老图书馆月底拆除".into()),
                 script: None,
+                world: None,
             },
         )
         .unwrap();

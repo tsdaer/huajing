@@ -1125,6 +1125,10 @@ pub struct ActivationContext<'a> {
     /// 语义源候选（M3.10 · §6.13，可选）：宿主旁路算好的嵌入召回（id + 余弦分）。
     /// 本模块不碰网络；切片为空 = 语义层关闭，行为与纯确定性版一字不差。
     pub semantic_hits: &'a [crate::semantic::SemanticHit],
+    /// 绑定剔除（M5.4）：本视角已进身份层的实体 id（阵容成员的 char 实体），
+    /// B3 不再重复注入——剔除按视角进行，其他视角仍可经在场/提及正常激活这些实体。
+    /// 空切片 = 无绑定，行为与 M5.4 之前一字不差。
+    pub exclude_ids: &'a [String],
 }
 
 /// 一张注入卡（检查器逐层可见：激活原因、深度、token）
@@ -1392,6 +1396,45 @@ impl Codex {
         self.by_ref
             .get(&fold_str(s))
             .and_then(|v| v.iter().copied().min())
+    }
+
+    /// 视角化渲染（M5.4）：绑定实体进身份层的「自身设定」文本。
+    /// 与 B3 深卡同一条渲染管线（render_entity）与秘密门控（secret_visible）——
+    /// known_by 含本人/`*`、或本人揭示集里的秘密进卡；她不知道的秘密不进（戏剧反讽保留）。
+    /// 只认正史实体；id 不存在/非正史返回 None（宿主侧跳过注入）。
+    pub fn render_for_viewer(&self, id: &str, ctx: &ActivationContext<'_>) -> Option<String> {
+        let e = self.get(id)?;
+        if !e.is_canon() {
+            return None;
+        }
+        // 与 activate 同款：显式地点优先，黑板兜底（live/variants/{{bb.*}} 取值口径一致）
+        let place: Option<&str> = ctx
+            .place
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                ctx.blackboard
+                    .get("place")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+        let mut bb = ctx.blackboard.clone();
+        if let Some(p) = place {
+            bb.insert("place".to_string(), Value::String(p.to_string()));
+        }
+        let affects = affects_from_bb(&bb);
+        let known = known_secrets(e, ctx);
+        let cx = RenderCtx {
+            bb: &bb,
+            day: ctx.day,
+            clock: ctx.clock,
+            affects: &affects,
+            known: &known,
+        };
+        // Deep 档：秘密行只在 Deep 渲染，而自身设定里「她知道的自己的秘密」是
+        // 核心内容——known_secrets 已经按视角门控过，这里直接给满档
+        Some(render_entity(e, Stage::Deep, &cx))
     }
 }
 
@@ -1765,6 +1808,15 @@ impl Codex {
                     Depth::Card,
                     "滞回:上一轮激活（保底卡片）".to_string(),
                 );
+            }
+        }
+
+        // ---- 绑定剔除（M5.4）：所有激活源（含滞回）之后、渲染之前——
+        // 本视角已进身份层的实体不再进 B3，预算让给真正需要激活的设定；
+        // 滞回也拉不回它（剔除在 bump 汇总之后） ----
+        for id in ctx.exclude_ids {
+            if let Some(&i) = self.by_id.get(id.trim()) {
+                hits.remove(&i);
             }
         }
 
@@ -2383,6 +2435,7 @@ mod tests {
                 blackboard: &self.bb,
                 viewer: &self.viewer,
                 semantic_hits: &self.semantic,
+                exclude_ids: &[],
             }
         }
     }

@@ -659,11 +659,15 @@ pub(crate) fn theater_view_of(
 
 /// 世界时钟基准（new_session 的内核，可单测）：显式天优先；没有显式天就从世界时钟
 /// 出发（世界还没走过第 1 天 = None，保持建会话缺省——没有 world.json 时行为不变）。
-pub(crate) fn baseline_day_from_world(root: &std::path::Path, day: Option<i64>) -> Option<i64> {
+pub(crate) fn baseline_day_from_world(
+    root: &std::path::Path,
+    day: Option<i64>,
+    world: &str,
+) -> Option<i64> {
     match day {
         Some(d) => Some(d),
         None => {
-            let w = store::load_world(root, "default");
+            let w = store::load_world(root, world);
             (w.day > 1).then_some(w.day)
         }
     }

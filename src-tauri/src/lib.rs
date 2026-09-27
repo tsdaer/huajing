@@ -59,6 +59,8 @@ pub fn run() {
             commands::list_personas,
             commands::list_cards,
             commands::get_card,
+            commands::list_worlds,
+            commands::codex_world_entities,
             commands::new_session,
             commands::list_sessions,
             commands::read_messages,

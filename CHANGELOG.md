@@ -4,6 +4,40 @@
 
 ## [Unreleased]
 
+### Added · 体验四连：舞台栏 / hover-3d 世界卡片 / 新建会话向导 / char 绑定身份层（M5.1–M5.4）
+
+- **M5.1 舞台栏**：会话头与场景条并进左侧可折叠竖栏（新组件 `SessionRail`，`SceneBar`
+  退役）——阵容**逐行**展示（稳定取色头像 + 生成中/在场/候场 + 点击=点名发言，与发言权
+  tabs 同 ref 双向同步；多角色不再是「+N 同台」徽标）、场景垂直列表（切换/编辑/新建/
+  分场/合场）、底部工具（导出剧本包/黑板/检查器）。宽屏折叠成图标条（偏好
+  `huajing.railCollapsed` 持久化）；窄屏（`max-[900px]:`）转浮层抽屉 + 顶部细条
+  （唤出钮 + 阵容头像组 + 时间地点 + 面板开关）。聊天流拿回全部纵向空间。
+  附带：`src/avatar.ts` 共享头像工具；阵容全员卡名装载（原只取第一张卡）。
+- **M5.2 hover-3d + 设定集按世界分组**：零依赖 `v-tilt` 指令（pointermove 写 CSS 变量，
+  `prefers-reduced-motion`/触屏自禁用且判定不缓存）+ `.tilt-card`（perspective 倾斜 +
+  跟手高光），角色卡与世界卡应用；后端新命令 `list_worlds`（目录扫描 + 文件名前缀计数 +
+  grown 新实体 + 世界钟 + 主线存在性，不解析 Lua）与 `codex_world_entities`（检查器同形
+  实体投影，会话无关只读）——资产页设定集页签从「选会话」重构为**世界卡片网格 → 下钻
+  实体清单**（搜索/刷新/世界包/ST 世界书导出保留；揭示集收敛到会话检查器）。
+- **M5.3 新建会话向导**：弹窗加宽（max-w-3xl）；角色选择升级为**卡片多选组阵容**
+  （点击进/出 + 有序 chips + 「设为主角色」提升 + 移出；后端保序去重复用）；新增
+  **设定集（世界）下拉**——`new_session` 命令与 `NewSessionRequest` 加 `world` 字段
+  （校验 `DataHub/codex/<world>/` 存在才落 `meta.world`，空/不存在回落 default，旧会话
+  兼容）；`baseline_day_from_world` 随所选世界取基准（原硬编码 default）；主角色变更
+  预填其卡声明的世界（仅当真实存在）。
+- **M5.4 char 绑定进身份层**：设定集里与阵容成员对上的 `char` 实体（id 后缀==角色目录名
+  优先 → name/别名==卡显示名兜底；只认 canon）不再走普通激活——渲染卡以「自身设定」
+  附录进**该角色自己**的 A3 身份锚（`codex::render_for_viewer` 与 B3 同一渲染管线，
+  秘密照 `known_by`/揭示集门控——她自己不知道的秘密不进，戏剧反讽保留），并从她视角的
+  B3 激活池剔除（`ActivationContext.exclude_ids`，滞回也拉不回，双份注入不存在）；
+  其他视角经在场/提及照常激活该实体，NPC char 条目行为不变。design §6.3 补小节说明
+  数据为何住设定集（ST 兼容静态卡 vs secrets/生命周期/grown/补全模板全在实体模型上）。
+- **验证**：`cargo test` 531 全绿（+5：list_worlds 扫描、world 落盘往返、char 绑定四断言
+  族；既有 codex 注入测试按绑定新语义更新）+ `pnpm build` 双绿；浏览器走查（mock，宽屏
+  1280 + 窄屏 480）：舞台栏阵容/点名三处联动/折叠持久化/窄屏浮层开合/无横向溢出、
+  hover-3d 正向路径（CSS 变量 + matrix3d）与 reduced-motion 自禁用、世界卡片下钻、
+  新建会话卡片选角/保序 chips/设定集选择全链点验（记录见 [docs/plan/m5.md](docs/plan/m5.md)）。
+
 ### Added · 移动端 alpha 桌面半场（M4.5 前半 · 决断 6「导入统一入口」）
 
 - **导入文件选择器统一入口**（新命令 `stage_import`，零新依赖）：顶栏「导入」按钮 +

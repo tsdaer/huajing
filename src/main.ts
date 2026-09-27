@@ -2,6 +2,7 @@ import { createApp } from "vue";
 import App from "./App.vue";
 import "./style.css";
 import { applyVars, initCustomTheme } from "./theme";
+import { vTilt } from "./composables/useTilt";
 
 // 界面主题：先用 daisyUI 默认主题（light / dark，留空即跟随系统），
 // 再叠加「主题」页保存的自定义令牌（:root 内联变量优先于主题规则）。
@@ -25,4 +26,4 @@ if (savedCustom) {
   document.documentElement.style.colorScheme = savedCustom.colorScheme;
 }
 
-createApp(App).mount("#app");
+createApp(App).directive("tilt", vTilt).mount("#app");

@@ -42,6 +42,8 @@ import type {
   TimelineEntry,
   WorldbookReport,
   WorldlineView,
+  WorldSummary,
+  InspectorEntity,
 } from "./types";
 import type { CustomTheme, ParsedThemeImport } from "./theme";
 import type { ConsolidateProgress, ConsolidateReport } from "./types";
@@ -53,6 +55,8 @@ export type NewSessionOptions = {
   persona?: string;
   /** 剧本模板（M4.1）：scripts/ 下的模板名；初始起因与局面随模板生效 */
   script?: string;
+  /** 启用的设定集（世界）名（M5.3）：空/缺省 = default（DataHub/codex/ 下须存在该目录） */
+  world?: string;
   day?: number;
   clock?: string;
   place?: string;
@@ -111,6 +115,10 @@ export const api = {
 
   listCards: () => invoke<CardSummary[]>("list_cards"),
   getCard: (dirName: string) => invoke<CardDetail>("get_card", { dirName }),
+
+  /** 世界浏览（M5.2）：设定集按世界分组——世界概览 + 会话无关的实体只读清单 */
+  listWorlds: () => invoke<WorldSummary[]>("list_worlds"),
+  codexWorldEntities: (world: string) => invoke<InspectorEntity[]>("codex_world_entities", { world }),
 
   newSession: (opts: NewSessionOptions) => invoke<SessionMeta>("new_session", opts),
   listSessions: () => invoke<SessionMeta[]>("list_sessions"),

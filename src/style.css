@@ -117,3 +117,29 @@
 .pop-in {
   animation: pop-in 0.18s ease-out;
 }
+
+/* hover-3d（M5.2）：v-tilt 指令写 CSS 变量，本类承接视觉——倾斜 + 跟手高光。
+   变量缺席（未 hover / 指令未挂 / 触屏）时回落 0deg，纯类名也安全 */
+.tilt-card {
+  position: relative;
+  transform: perspective(900px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg)) translateZ(0);
+  transition: transform 0.12s ease-out;
+  will-change: transform;
+}
+.tilt-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at var(--glow-x, 50%) var(--glow-y, 50%),
+    color-mix(in oklab, var(--color-base-content) 8%, transparent),
+    transparent 55%
+  );
+  opacity: 0;
+  transition: opacity 0.25s ease-out;
+}
+.tilt-card:hover::after {
+  opacity: 1;
+}

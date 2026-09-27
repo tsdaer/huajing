@@ -1123,6 +1123,7 @@ mod consolidate_tests {
                 place: Some("图书馆".into()),
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();

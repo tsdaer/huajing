@@ -124,13 +124,21 @@ pub fn new_session(
     place: Option<String>,
     premise: Option<String>,
     script: Option<String>,
+    world: Option<String>,
     log: State<'_, store::EventLog>,
 ) -> Result<store::SessionMeta, String> {
     let root = root();
-    // 世界时钟基准（M3.7 · 设计 §6.6）：没有显式指定天就从世界时钟出发——
+    // 启用的设定集（M5.3）：显式指定且目录存在的世界才落 meta；空/不存在的名字
+    // 回落 None（读侧取 default，老行为不变）——向导只列真实世界，这里兜手改的 session.json
+    let world = world
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty() && root.join("codex").join(w).is_dir())
+        .map(str::to_string);
+    // 世界时钟基准（M3.7 · 设计 §6.6）：没有显式指定天就从**所选世界**的时钟出发——
     // 新会话开局即续上世界的大势（「各会话读取为开局基准」）；显式天 = 玩家指定的
     // 时点（flashback 由此成立——回写是 max，更早的会话拉不低世界）
-    let day = baseline_day_from_world(&root, day);
+    let day = baseline_day_from_world(&root, day, world.as_deref().unwrap_or("default"));
     // 角色阵容（M3.1）：显式给的全量用（首个是主角色），没给就单角色——1v1 行为不变
     let mut cast = characters.unwrap_or_default();
     if !cast.contains(&character) {
@@ -145,6 +153,7 @@ pub fn new_session(
         place,
         premise,
         script,
+        world,
     };
     let meta = store::new_session(&root, &req).map_err(|e| e.to_string())?;
 
@@ -1430,6 +1439,117 @@ fn session_world(meta: &store::SessionMeta) -> String {
     meta.world.clone().unwrap_or_else(|| "default".into())
 }
 
+// ---------- 世界浏览（M5.2）：设定集按世界分组展示，不再借道会话 ----------
+
+/// 世界概览（资产页设定集页签的卡片数据源）。计数走文件名前缀与 grown.json 键，
+/// 不逐个解析 Lua——概览要的是一眼可扫的规模感，不是全量投影。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldSummary {
+    pub name: String,
+    pub entities: u32,
+    pub by_type: std::collections::BTreeMap<String, u32>,
+    /// 世界时钟当前天数（world.json；缺省 1）
+    pub day: i64,
+    /// 有没有世界主线（worldline.lua 存在即算，不解析）
+    pub has_worldline: bool,
+}
+
+/// 实体文件名/实体 id 的类型前缀（`char.小雨.lua` → `char`；无前缀落 `note`）
+fn id_type_prefix(id: &str) -> String {
+    match id.split_once('.') {
+        Some((ty, _)) if codex::ENTITY_TYPES.contains(&ty) => ty.to_string(),
+        _ => "note".to_string(),
+    }
+}
+
+/// 枚举 DataHub/codex/ 下的世界（每子目录一个世界）
+#[tauri::command]
+pub fn list_worlds() -> Result<Vec<WorldSummary>, String> {
+    let codex_root = root().join("codex");
+    let worlds = list_worlds_core(&codex_root);
+    Ok(worlds)
+}
+
+fn list_worlds_core(codex_root: &std::path::Path) -> Vec<WorldSummary> {
+    let data_root = codex_root
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| codex_root.to_path_buf());
+    let mut worlds: Vec<WorldSummary> = std::fs::read_dir(codex_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let dir = codex_entities_dir(&data_root, &name);
+            let mut by_type = std::collections::BTreeMap::new();
+            let mut entities = 0u32;
+            // 磁盘实体文件（<类型>.<名>.lua/.json）
+            for path in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let is_entity = path
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "lua" || ext == "json");
+                if !is_entity {
+                    continue;
+                }
+                let stem = path.path().file_stem().map(|s| s.to_string_lossy().to_string());
+                let ty = id_type_prefix(&stem.unwrap_or_default());
+                *by_type.entry(ty).or_insert(0u32) += 1;
+                entities += 1;
+            }
+            // grown.json 里文件上还没有的新实体（补丁可新增实体）
+            let known: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|p| p.path().file_stem().map(|s| s.to_string_lossy().to_string()))
+                .collect();
+            for id in store::load_grown(&data_root, &name).entities.keys() {
+                if !known.contains(id) {
+                    *by_type.entry(id_type_prefix(id)).or_insert(0u32) += 1;
+                    entities += 1;
+                }
+            }
+            let day = store::load_world(&data_root, &name).day;
+            let has_worldline = codex_root.join(&name).join("worldline.lua").is_file();
+            Some(WorldSummary {
+                name,
+                entities,
+                by_type,
+                day,
+                has_worldline,
+            })
+        })
+        .collect();
+    worlds.sort_by(|a, b| a.name.cmp(&b.name));
+    worlds
+}
+
+/// 实体清单投影（检查器与资产页世界浏览共用）：草稿与正史都列，注入只认 canon；
+/// missing 带缺失 facet 清单（「补全」按钮的数据源）
+fn entity_json(e: &codex::CodexEntity) -> serde_json::Value {
+    serde_json::json!({
+        "id": e.id, "name": e.name, "type": e.ty, "status": e.status,
+        "oneLiner": e.one_liner, "anchors": e.anchors(),
+        "missing": complete::missing_paths(e),
+    })
+}
+
+/// 按世界列实体（资产页设定集页签：不借道会话的只读浏览）
+#[tauri::command]
+pub fn codex_world_entities(world: String) -> Result<Vec<serde_json::Value>, String> {
+    let root = root();
+    Ok(codex_world_entities_core(&root, &world))
+}
+
+fn codex_world_entities_core(root: &std::path::Path, world: &str) -> Vec<serde_json::Value> {
+    let cx = load_codex(root, None, world);
+    cx.entities().iter().map(entity_json).collect()
+}
+
 fn codex_entities_dir(root: &std::path::Path, world: &str) -> std::path::PathBuf {
     root.join("codex").join(world).join("entities")
 }
@@ -2431,6 +2551,39 @@ fn run_message_hook_at(
 /// 落盘：`log` = Some（真实组装）时把 on_context 的副作用记成事件并落派生文件；
 /// `log` = None（预览干跑）时只在内存里生效，不落盘——理由见 [PromptRun]。
 #[allow(clippy::too_many_arguments)]
+/// 阵容成员 → 绑定的设定集 char 实体 id（M5.4）。匹配优先级：
+/// ① id 后缀 == 角色目录名（既有命名约定 `char.小雨`，最稳）；
+/// ② 实体 name == 卡显示名；③ 别名命中卡显示名。
+/// 只认 `type=char` 且 canon 的实体（草稿不进注入，§6.9 纪律一致）；
+/// 一个成员至多绑定一条（先到先得，按实体表序），NPC（不在阵容）永不绑定。
+fn char_bindings(
+    cx: &codex::Codex,
+    members: &[(String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (dir, display) in members {
+        let bound = cx
+            .get(&format!("char.{dir}"))
+            .filter(|e| e.ty == "char" && e.is_canon())
+            .map(|e| e.id.clone())
+            .or_else(|| {
+                cx.entities()
+                    .iter()
+                    .find(|e| {
+                        e.ty == "char"
+                            && e.is_canon()
+                            && (e.name.trim() == display.trim()
+                                || e.aliases.iter().any(|a| a.trim() == display.trim()))
+                    })
+                    .map(|e| e.id.clone())
+            });
+        if let Some(id) = bound {
+            out.insert(dir.clone(), id);
+        }
+    }
+    out
+}
+
 fn assemble_prompt_core(
     sink: &card::UiSink,
     root: &std::path::Path,
@@ -2552,6 +2705,23 @@ fn assemble_prompt_core(
     // ---- B3 设定集：别名扫描 → 五激活源 → 分级注入（设计 §6.3）----
     let world = session_world(meta);
     let cx = load_codex(root, codex_cache, &world);
+    // ---- M5.4 绑定：阵容成员 ↔ 设定集 char 实体。绑定者的实体进她自己的身份层
+    // （A3「自身设定」，见 identity_extra），本视角的 B3 剔除它避免双份注入；
+    // 其他视角不受影响——阿澈那边的 char.小雨 仍可经在场/提及正常激活 ----
+    let cast_refs: Vec<(String, String)> = cast
+        .members
+        .iter()
+        .map(|m| {
+            let display = if m.loaded.card.name.trim().is_empty() {
+                m.dir.clone()
+            } else {
+                m.loaded.card.name.clone()
+            };
+            (m.dir.clone(), display)
+        })
+        .collect();
+    let bindings = char_bindings(&cx, &cast_refs);
+    let bound_self: Vec<String> = bindings.get(&character).cloned().into_iter().collect();
     let window_text = scan_window_text(history, &loaded.card.name);
     let place = {
         let p = blackboard.place.trim();
@@ -2584,7 +2754,14 @@ fn assemble_prompt_core(
         blackboard: &bb_map,
         viewer: &character,
         semantic_hits: semantic,
+        exclude_ids: &bound_self,
     };
+    // A3 附录（M5.4）：本人绑定实体的「自身设定」渲染——秘密按同一门控（她自己
+    // 不知道的秘密不进，戏剧反讽保留）；无绑定 = None，A3 与之前一字不差
+    let identity_extra: Option<String> = bindings.get(&character).and_then(|id| {
+        cx.render_for_viewer(id, &activation)
+            .map(|text| format!("【自身设定】（来自设定集 {id}，你是它的正主）\n{text}"))
+    });
     let activated = cx.activate(
         &activation,
         &codex::CodexBudget {
@@ -2756,6 +2933,7 @@ fn assemble_prompt_core(
         cast_note: cast_note.as_deref(),
         tools_contract: tools_contract.as_deref(),
         novel_mode: meta.novel_mode,
+        identity_extra: identity_extra.as_deref(),
         history,
         user_content,
     };
@@ -6328,17 +6506,7 @@ fn inspector_payload(
 
     // 设定集：世界清单（草稿与正史都列，注入只认 canon）
     // M3.8：每个实体带缺失 facet 清单（实体编辑器高亮 +「补全」按钮的数据源）
-    let entities: Vec<serde_json::Value> = cx
-        .entities()
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id, "name": e.name, "type": e.ty, "status": e.status,
-                "oneLiner": e.one_liner, "anchors": e.anchors(),
-                "missing": complete::missing_paths(e),
-            })
-        })
-        .collect();
+    let entities: Vec<serde_json::Value> = cx.entities().iter().map(entity_json).collect();
 
     // 收件箱富化（M3.8 · DoD 8「冲突双源呈现」）：codex 类提案带正史现值——
     // 收件箱里「现状 vs 提案」两边都有出处
@@ -6772,6 +6940,7 @@ return {
                 place: Some("自习区".into()),
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -6854,6 +7023,7 @@ return {
                 place: Some("自习区".into()),
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -6960,6 +7130,7 @@ return {
                 place: Some("自习区".into()),
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -7028,6 +7199,7 @@ return {
                 place: Some("自习区".into()),
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -7540,6 +7712,7 @@ return {
             place: None,
             premise: None,
             script: None,
+            world: None,
         })
         .unwrap();
         assert!(!fresh.novel_mode, "缺省关");
@@ -8523,27 +8696,31 @@ return {
 
         let loaded = card::load_card(&root, "小雨").unwrap();
         let log = store::EventLog::new();
-        // 第一轮：用户提到别名「夜班管理员」→ 提及激活；黑板地点「自习区」→ 在场激活
+        // 第一轮：用户提到别名「夜班管理员」→ 提及激活；黑板地点「自习区」→ 在场激活。
+        // M5.4 起：char.小雨 与阵容成员同名自动绑定——她的实体改道身份层（A3 自身设定），
+        // 本视角的 B3 不再出现（别名提及的命中也一并剔除，双份注入不存在）
         let (assembly, _) = simulate_turn(&root, &meta, &loaded, &log, 1, "夜班管理员今天在吗？");
+        let a3 = assembly
+            .layers
+            .iter()
+            .find(|l| l.id == "A3")
+            .expect("A3 身份层应出现");
+        assert!(
+            a3.content.contains("【自身设定】") && a3.content.contains("左眼角一颗泪痣"),
+            "绑定实体的 anchors 应随「自身设定」进身份层：{}",
+            a3.content
+        );
         let b3 = assembly
             .layers
             .iter()
             .find(|l| l.id == "B3")
             .expect("B3 实体卡层应出现");
         assert!(b3.content.starts_with("<world>") && b3.content.ends_with("</world>"));
-        assert!(b3.content.contains("小雨"), "提及即激活：{}", b3.content);
         assert!(b3.content.contains("自习区"), "在场即激活：{}", b3.content);
         assert!(
-            b3.content.contains("左眼角一颗泪痣"),
-            "anchors 必须恒注入（设计 §6.3）：{}",
+            !b3.content.contains("小雨"),
+            "绑定者自己的实体不再进本视角 B3（M5.4 改道身份层）：{}",
             b3.content
-        );
-        assert!(
-            b3.sources
-                .iter()
-                .any(|s| s.contains("小雨") && s.contains("提及")),
-            "逐卡激活原因（设计 §6.11）：{:?}",
-            b3.sources
         );
 
         // 第二轮说到「谢谢」→ 卡内写记忆；第三轮的 B4 应召回它（视角过滤后仍命中）
@@ -8571,15 +8748,16 @@ return {
             bb.extra.get("char.小雨.mood"),
             Some(&serde_json::json!("心情不错"))
         );
-        let b3_now = assembly
+        // ▸当前 随绑定实体进身份层（M5.4：她自己的实体现走 A3）
+        let a3_now = assembly
             .layers
             .iter()
-            .find(|l| l.id == "B3")
-            .expect("B3 实体卡层");
+            .find(|l| l.id == "A3")
+            .expect("A3 身份层");
         assert!(
-            b3_now.content.contains("▸当前") && b3_now.content.contains("心情不错"),
-            "live 应把黑板现状拼进实体卡：{}",
-            b3_now.content
+            a3_now.content.contains("▸当前") && a3_now.content.contains("心情不错"),
+            "live 应把黑板现状拼进绑定实体的自身设定：{}",
+            a3_now.content
         );
         // 作用域键也进 hook / 设定集的读侧（平铺 + 嵌套两种形态都给）
         let env = blackboard_env(&bb);
@@ -11215,11 +11393,12 @@ return {
                 character: "小雨".into(),
                 characters: vec!["小雨".into()],
                 persona: None,
-                day: baseline_day_from_world(&root, None),
+                day: baseline_day_from_world(&root, None, "default"),
                 clock: Some("09:00".into()),
                 place: Some("公告栏".into()),
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -11270,11 +11449,12 @@ return {
                 character: "小雨".into(),
                 characters: vec!["小雨".into()],
                 persona: None,
-                day: baseline_day_from_world(&root, Some(1)),
+                day: baseline_day_from_world(&root, Some(1), "default"),
                 clock: Some("09:00".into()),
                 place: Some("回忆里的自习区".into()),
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -11304,8 +11484,8 @@ return {
         );
 
         // 基准函数的直接点验：显式天优先、无世界文件回 None
-        assert_eq!(baseline_day_from_world(&root, Some(7)), Some(7));
-        assert_eq!(baseline_day_from_world(&root, None), Some(3));
+        assert_eq!(baseline_day_from_world(&root, Some(7), "default"), Some(7));
+        assert_eq!(baseline_day_from_world(&root, None, "default"), Some(3));
     }
 
     /// 可选层纪律：没有 worldline.lua 的世界一切照旧——无走位、无时代行、无世界段，
@@ -12206,5 +12386,159 @@ return { state_tree = {
         for turn in 0..=6u64 {
             assert_eq!(tl.at(turn), naive(&bad, turn), "乱序 turn={turn}");
         }
+    }
+
+    /// M5.2 世界浏览：list_worlds 从目录结构出概览（文件名前缀计数 + grown 新实体 +
+    /// 世界钟 + 主线存在性），codex_world_entities 给出与检查器同形的实体投影
+    #[test]
+    fn list_worlds_scans_codex_dirs_and_world_browse_serves_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mk = |w: &str, files: &[&str]| {
+            let d = root.join("codex").join(w).join("entities");
+            std::fs::create_dir_all(&d).unwrap();
+            for f in files {
+                let id = f.trim_end_matches(".lua");
+                std::fs::write(
+                    d.join(f),
+                    format!("return {{ id = '{id}', type = 'char', name = 'x' }}"),
+                )
+                .unwrap();
+            }
+        };
+        mk("default", &["char.小雨.lua", "place.图书馆.lua"]);
+        mk("魔女之城", &["char.魔女.lua"]);
+        std::fs::write(root.join("codex/魔女之城/world.json"), r#"{"day": 7}"#).unwrap();
+        std::fs::write(root.join("codex/魔女之城/worldline.lua"), "return {}").unwrap();
+        // grown.json 新增一条文件上还没有的实体（补丁可新增）
+        std::fs::write(
+            root.join("codex/default/grown.json"),
+            r#"{"entities": {"item.新便签": {"id": "item.新便签", "type": "item", "name": "新便签"}}}"#,
+        )
+        .unwrap();
+
+        let worlds = list_worlds_core(&root.join("codex"));
+        assert_eq!(worlds.len(), 2);
+        let default = worlds.iter().find(|w| w.name == "default").unwrap();
+        assert_eq!(default.entities, 3, "2 个文件实体 + grown 新增 1 条");
+        assert_eq!(default.by_type.get("char"), Some(&1));
+        assert_eq!(default.by_type.get("item"), Some(&1));
+        assert_eq!(default.day, 1, "无 world.json 缺省第 1 天");
+        assert!(!default.has_worldline);
+        let witch = worlds.iter().find(|w| w.name == "魔女之城").unwrap();
+        assert_eq!(witch.day, 7);
+        assert!(witch.has_worldline);
+
+        let entities = codex_world_entities_core(root, "default");
+        assert_eq!(entities.len(), 3);
+        assert!(entities.iter().any(|e| e["id"] == "char.小雨"));
+    }
+
+    /// M5.4 char 绑定：阵容成员的设定集实体进她自己的身份层（A3「自身设定」），
+    /// 本视角 B3 剔除避免双份；他人视角经在场源照常激活；秘密按知情门控
+    /// （她自己不知道的秘密不进——戏剧反讽保留）；NPC char 实体照旧普通激活。
+    #[test]
+    fn char_entities_bind_to_cast_identity_and_stay_ordinary_for_npcs() {
+        let (_dir, meta, root) = setup_cast2(XY_PLAIN, AC_PLAIN);
+        let dir = root.join("codex/default/entities");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 小雨：绑定者——外貌 + 两把秘密（自己知道的 / 只阿澈知道的）
+        std::fs::write(
+            dir.join("char.小雨.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'char.小雨', type = 'char', name = '小雨',
+  one_liner = '大学图书馆夜班管理员。',
+  facts = { look = { impression = '旧毛衣袖口的铅笔灰', anchors = { '左眼角一颗泪痣' } } },
+  secrets = {
+    ['工作牌'] = { content = '旧胸牌其实是已故母亲的。', known_by = { '小雨' } },
+    ['日记本'] = { content = '日记本锁在值班室柜子里。', known_by = { '阿澈' } },
+  },
+}
+"#,
+        )
+        .unwrap();
+        // 阿澈：同是阵容——验证双绑定互不串台
+        std::fs::write(
+            dir.join("char.阿澈.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'char.阿澈', type = 'char', name = '阿澈',
+  one_liner = '隔壁班的运动少女。',
+  facts = { look = { impression = '马尾辫和运动护腕' } },
+}
+"#,
+        )
+        .unwrap();
+        // NPC：不在阵容——必须仍走普通激活（提及），不进任何人的身份层
+        std::fs::write(
+            dir.join("char.路人.lua"),
+            r#"
+return {
+  spec = 'codex/1.0', id = 'char.路人', type = 'char', name = '路人',
+  one_liner = '总在便利店夜班出现的陌生人。',
+}
+"#,
+        )
+        .unwrap();
+
+        let log = store::EventLog::new();
+        let cast = cast_of(&root, &meta);
+
+        // 第 1 轮小雨发言（消息里提「路人」，为第 2 轮的提及激活留历史）
+        let a = simulate_turn_as(&root, &meta, &cast, "小雨", &log, 1, "顺便问一句，路人今天来吗？");
+        let a3 = a.layers.iter().find(|l| l.id == "A3").expect("A3 层");
+        assert!(
+            a3.content.contains("【自身设定】") && a3.content.contains("旧毛衣"),
+            "绑定实体应进小雨的身份层：{}",
+            a3.content
+        );
+        assert!(
+            a3.content.contains("已故母亲"),
+            "她自己知道的秘密应进自身设定：{}",
+            a3.content
+        );
+        assert!(
+            !a3.content.contains("日记本锁在值班室"),
+            "她不知道的秘密（known_by 只列阿澈）不得进她的提示词：{}",
+            a3.content
+        );
+        assert!(
+            !a3.content.contains("马尾辫"),
+            "他人的绑定实体不进我的身份层：{}",
+            a3.content
+        );
+        let b3 = a.layers.iter().find(|l| l.id == "B3").expect("B3 层");
+        assert!(
+            !b3.content.contains("旧毛衣"),
+            "本视角的绑定实体应从 B3 剔除（防双份注入）：{}",
+            b3.content
+        );
+
+        // 第 2 轮阿澈发言：她的身份层是自己的绑定；小雨的实体经在场源照常进她的 B3；
+        // 历史里的「路人」触发 NPC 的普通提及激活
+        let b = simulate_turn_as(&root, &meta, &cast, "阿澈", &log, 2, "嗯，那先这样。");
+        let a3b = b.layers.iter().find(|l| l.id == "A3").expect("A3 层");
+        assert!(
+            a3b.content.contains("【自身设定】") && a3b.content.contains("马尾辫"),
+            "阿澈的绑定实体应进她自己的身份层：{}",
+            a3b.content
+        );
+        assert!(
+            !a3b.content.contains("旧毛衣"),
+            "小雨的绑定实体不进阿澈的身份层：{}",
+            a3b.content
+        );
+        let b3b = b.layers.iter().find(|l| l.id == "B3").expect("B3 层");
+        assert!(
+            b3b.content.contains("旧毛衣"),
+            "他人视角经在场源照常激活小雨的实体（剔除只按视角）：{}",
+            b3b.content
+        );
+        assert!(
+            b3b.content.contains("便利店"),
+            "NPC char 实体照旧普通激活（提及）：{}",
+            b3b.content
+        );
     }
 }

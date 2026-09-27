@@ -24,6 +24,8 @@ import type {
   StreamEvent,
   TheaterView,
   WorldlineView,
+  WorldSummary,
+  InspectorEntity,
 } from "./types";
 
 const sessionId = "20260919-101500-000";
@@ -62,6 +64,14 @@ const cards: CardSummary[] = [
     tags: ["图书馆", "安静"],
     creator: "化境示例",
     has_hooks: true,
+    degraded: false,
+  },
+  // M5.3 走查配套：阵容第二人有卡可选（会话 mock 阵容是 小雨 × 阿澈）
+  {
+    dir_name: "阿澈",
+    name: "阿澈",
+    tags: ["运动", "直率"],
+    has_hooks: false,
     degraded: false,
   },
 ];
@@ -206,7 +216,7 @@ const cardDetail: CardDetail = {
     avatar: null,
     creator: "化境示例",
     tags: ["图书馆", "安静"],
-    world: null,
+    world: "default",
     scenario: "闭馆前的图书馆自习区",
     personality: "安静、克制、观察细",
     first_mes: messages[0].content,
@@ -216,6 +226,24 @@ const cardDetail: CardDetail = {
   hook_names: ["on_context", "on_message"],
   degraded: false,
   degrade_reason: null,
+};
+
+/** M5.3/M5.1 走查配套：get_card 按目录名出形——阵容第二人不再回落成小雨 */
+const cardDetails: Record<string, CardDetail> = {
+  小雨: cardDetail,
+  阿澈: {
+    ...cardDetail,
+    dir_name: "阿澈",
+    card: {
+      ...cardDetail.card,
+      name: "阿澈",
+      tags: ["运动", "直率"],
+      world: null,
+      personality: "爽朗、行动派",
+    },
+    default_state: { energy: 80 },
+    hook_names: [],
+  },
 };
 
 function assembly(source: Message[], userContent?: string): PromptAssembly {
@@ -498,8 +526,60 @@ export function setupMock() {
         return personas;
       case "list_cards":
         return cards;
+      // 世界浏览（M5.2）：示意两个世界，default 带世界线
+      case "list_worlds":
+        return [
+          {
+            name: "default",
+            entities: 3,
+            by_type: { char: 1, place: 1, item: 1 },
+            day: 3,
+            has_worldline: true,
+          },
+          {
+            name: "魔女之城",
+            entities: 6,
+            by_type: { char: 3, place: 2, org: 1 },
+            day: 12,
+            has_worldline: false,
+          },
+        ] satisfies WorldSummary[];
+      case "codex_world_entities": {
+        const world = (args as { world?: string }).world;
+        if (world && world !== "default") return [];
+        return [
+          {
+            id: "char.小雨",
+            name: "小雨",
+            type: "char",
+            status: "canon",
+            oneLiner: "大学图书馆夜班管理员。",
+            anchors: ["左眼角一颗泪痣", "母亲留下的旧胸牌"],
+            missing: ["speech.by_affect", "tells", "motivation"],
+          },
+          {
+            id: "place.图书馆",
+            name: "图书馆",
+            type: "place",
+            status: "canon",
+            oneLiner: "闭馆前一小时会亮起暖黄的灯。",
+            anchors: [],
+            missing: [],
+          },
+          {
+            id: "item.便签",
+            name: "便签",
+            type: "item",
+            status: "draft",
+            oneLiner: "画着小动物的便签，来过三张。",
+            anchors: [],
+            missing: ["origin"],
+          },
+        ] satisfies InspectorEntity[];
+      }
       case "get_card":
-        return cardDetail;
+        // M5.1 起舞台栏按阵容逐人取卡名：按目录名出形，未知名字回落小雨
+        return cardDetails[(args as { dirName?: string }).dirName ?? ""] ?? cardDetail;
       case "list_sessions":
         // M3.11：mock 会话升级为双角色阵容——群聊 UI（发言权/视角切换/同台徽标）浏览器模式可走查
         return [
@@ -512,12 +592,13 @@ export function setupMock() {
           } satisfies SessionMeta,
         ];
       case "new_session": {
-        const q = args as { characters?: string[] };
+        const q = args as { characters?: string[]; world?: string };
         return {
           id: sessionId,
           created_at: "2026-09-19T10:15:00Z",
           characters: q.characters?.length ? q.characters : ["小雨", "阿澈"],
           persona: "夜读者",
+          world: q.world || "default",
           seed: 42,
         } satisfies SessionMeta;
       }

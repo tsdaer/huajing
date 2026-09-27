@@ -669,6 +669,18 @@ export interface InspectorCodex {
   entities: InspectorEntity[];
 }
 
+/** 世界概览（M5.2：资产页设定集页签的世界卡片数据源，commands.rs · WorldSummary） */
+export interface WorldSummary {
+  name: string;
+  entities: number;
+  /** 类型前缀 → 数量（char/place/item/...） */
+  by_type: Record<string, number>;
+  /** 世界时钟当前天数（world.json；缺省 1） */
+  day: number;
+  /** 有没有世界主线（worldline.lua） */
+  has_worldline: boolean;
+}
+
 /** 设定收件箱的一条提案（propose 落条目，accept/reject 改状态） */
 export interface InspectorProposal {
   id: string;

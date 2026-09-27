@@ -16,18 +16,19 @@ import EmptyState from "../components/EmptyState.vue";
 import NarrationLine from "../components/NarrationLine.vue";
 import Icon from "../components/Icon.vue";
 import SceneDialog from "../components/SceneDialog.vue";
-import SceneBar from "../components/SceneBar.vue";
+import SessionRail from "../components/SessionRail.vue";
 import InspectorDrawer from "../components/InspectorDrawer.vue";
-import { kindLabel } from "../components/inspector/kinds";
 import type { InspTab } from "../components/inspector/tabs";
 import type { SceneSubmit } from "../types";
+import { avatarStyle, initial } from "../avatar";
 import { useChatStream } from "../composables/useChatStream";
 import { useTheater } from "../composables/useTheater";
 
 // M1.5 聊天界面：气泡流 + 流式打字机 + 停止 + 消息编辑/重roll/删除。
 // 黑板与记忆检查器收进右侧抽屉，聊天流为主。界面全部由 daisyUI 组件构成。
 // E1 拆分：生成/流式收尾在 useChatStream，剧场自动轮次在 useTheater，
-// 场景条是 SceneBar，检查器抽屉是 InspectorDrawer（卡内三页签在其内的 CardStatePanel）。
+// 检查器抽屉是 InspectorDrawer（卡内三页签在其内的 CardStatePanel）。
+// M5.1：会话头与场景条并入左侧舞台栏（SessionRail），聊天流拿回全部纵向空间。
 
 const props = defineProps<{ meta: SessionMeta }>();
 
@@ -45,7 +46,51 @@ const blackboard = ref<Blackboard | null>(null);
 const assembly = ref<PromptAssembly | null>(null);
 
 const assemblySource = ref<"last" | "preview">("preview");
-const cardName = ref(props.meta.characters[0] ?? "角色");
+/** 阵容成员显示名（目录名 → 卡名）：舞台栏逐行展示，气泡署名兜底 */
+const castNames = ref<Record<string, string>>({});
+const cardName = computed(
+  () => castNames.value[props.meta.characters[0] ?? ""] || props.meta.characters[0] || "角色",
+);
+function castName(dir: string): string {
+  return castNames.value[dir] || dir;
+}
+
+/** 全阵容卡名装载（舞台栏逐行显示；读取失败回落目录名） */
+async function loadCastNames() {
+  const entries = await Promise.all(
+    props.meta.characters.map(async (dir) => {
+      try {
+        const d = await api.getCard(dir);
+        return [dir, d.card.name || dir] as const;
+      } catch {
+        return [dir, dir] as const;
+      }
+    }),
+  );
+  castNames.value = Object.fromEntries(entries);
+}
+
+// ---------- 舞台栏（M5.1）：宽屏可折叠（偏好持久化），窄屏浮层抽屉 ----------
+const RAIL_COLLAPSED_KEY = "huajing.railCollapsed";
+const railCollapsed = ref(localStorage.getItem(RAIL_COLLAPSED_KEY) === "1");
+const railNarrowOpen = ref(false);
+/** 唯一收合钮：窄屏先关浮层，宽屏切折叠 */
+function toggleRail() {
+  if (railNarrowOpen.value) {
+    railNarrowOpen.value = false;
+    return;
+  }
+  railCollapsed.value = !railCollapsed.value;
+  try {
+    localStorage.setItem(RAIL_COLLAPSED_KEY, railCollapsed.value ? "1" : "0");
+  } catch {
+    /* 存不进偏好就算了，仅影响下次开局的展开态 */
+  }
+}
+/** 舞台栏点名（多角色才有发言权概念；单角色点击无副作用） */
+function railSpeak(dir: string) {
+  if (speakers.value.length > 1) speaker.value = dir;
+}
 
 const panel = ref<"" | "board" | "inspector">("");
 const bbForm = reactive({ day: 1, clock: "", place: "", actors: "" });
@@ -246,11 +291,14 @@ const placeholder = computed(() => {
   return speaker.value ? `点名${speaker.value}：对她说点什么…` : "说点什么，导演安排谁接话…";
 });
 
-/** 最近一次表情事件：会话头部的徽标（表情位的 M1 占位显示） */
+/** 最近一次表情事件：舞台栏的会话级徽标（表情位的 M1 占位显示） */
 const mood = computed(() => {
   const hit = hookEvents.value.find((e) => e.kind === "emotion");
   return hit ? hit.value : "";
 });
+
+/** 正在生成中的署名（舞台栏行内「生成中」状态的依据） */
+const activeNames = computed(() => streams.value.map((s) => s.name));
 
 const lastIndex = computed(() => messages.value.length - 1);
 /** 视图末条消息的全量下标：重roll 只对整条流的末尾有效（后端语义如此），
@@ -404,24 +452,9 @@ function whoFor(m: Message): string {
   return "系统";
 }
 
-function initial(name: string): string {
-  return name.trim().slice(0, 1) || "?";
-}
-
+/** 气泡头像底色：用户 vs 角色（角色再叠 avatarStyle 的稳定取色） */
 function avatarClass(m: Message): string {
   return m.role === "user" ? "bg-primary text-primary-content" : "bg-neutral text-neutral-content";
-}
-
-/** 角色气泡的稳定颜色（M3.4 群聊：按署名取色，同一角色恒同色——多人同台一眼可分）。
- *  色相由名字哈希决定，底色/字色与主题令牌 color-mix——明暗与 33 预设下都协调，不裸写白字 */
-function avatarStyle(name: string): string {
-  let h = 0;
-  for (const ch of name) h = (h * 31 + (ch.codePointAt(0) ?? 0)) % 360;
-  const hue = `hsl(${h} 70% 55%)`;
-  return (
-    `background: color-mix(in oklab, ${hue} 26%, var(--color-base-200));` +
-    ` color: color-mix(in oklab, ${hue} 58%, var(--color-base-content))`
-  );
 }
 
 /** 消息时间戳（秒）→ HH:MM；乐观上屏的消息没有时间戳，返回空串 */
@@ -497,13 +530,8 @@ async function loadAll() {
     void refreshCard();
     void theaterCtl.refreshTheater(props.meta.id);
     void scrollToBottom();
-    // 气泡署名用卡片显示名；读取失败退回目录名
-    api
-      .getCard(props.meta.characters[0])
-      .then((d) => {
-        if (d.card.name) cardName.value = d.card.name;
-      })
-      .catch(() => {});
+    // 舞台栏/署名用卡名；读取失败回落目录名
+    void loadCastNames();
   } catch (e) {
     error.value = String(e);
   }
@@ -653,12 +681,7 @@ watch(inspView, () => {
 watch(cardGeneration, () => {
   if (generating.value) return; // 生成中不动面板，避免读到半截状态
   void refreshCard();
-  api
-    .getCard(props.meta.characters[0])
-    .then((d) => {
-      if (d.card.name) cardName.value = d.card.name;
-    })
-    .catch(() => {});
+  void loadCastNames();
 });
 // 消息增删改变剧场进度（used = 当前轮 − 开场轮）：视图跟着重读。预算耗尽后
 // 删档回退也能让自动轮次恢复——调度器的缓存预检靠这次重读纠偏，否则永不解封
@@ -674,93 +697,68 @@ watch(
   <div class="flex h-full min-h-0 flex-col gap-4">
     <ErrorToast :message="error" @dismiss="error = ''" />
 
-    <!-- 会话头：角色 + 状态 + 面板开关 -->
-    <header class="card card-border flex-none bg-base-100">
-      <div class="card-body flex-row items-center gap-3 p-3">
-        <div class="avatar avatar-placeholder">
-          <div class="w-10 rounded-full bg-primary/15 text-primary">
-            <span class="text-sm">{{ initial(cardName) }}</span>
+    <!-- 窄屏细条（M5.1）：舞台栏信息收进浮层后的最小可见集——唤出钮 + 阵容头像 + 时间地点 + 面板开关 -->
+    <div class="card card-border hidden flex-none items-center gap-2 bg-base-100 px-2 py-1.5 max-[900px]:flex">
+      <button class="btn btn-square btn-sm btn-ghost" aria-label="打开舞台栏" @click="railNarrowOpen = true">
+        <Icon name="menu" :size="16" />
+      </button>
+      <div class="flex -space-x-2">
+        <div v-for="dir in speakers" :key="dir" class="avatar avatar-placeholder">
+          <div class="w-7 rounded-full ring-2 ring-base-100" :style="avatarStyle(castName(dir))">
+            <span class="text-[11px]">{{ initial(castName(dir)) }}</span>
           </div>
-        </div>
-
-        <div class="min-w-0 flex-1">
-          <div class="flex items-center gap-2">
-            <h2 class="truncate text-base font-semibold">{{ cardName }}</h2>
-            <!-- 群聊阵容（M3.1）：主角色之外还有谁同台 -->
-            <span
-              v-if="speakers.length > 1"
-              class="badge badge-xs badge-soft tooltip tooltip-bottom"
-              :data-tip="`多角色会话：按角色隔离组装（设计 §10.2），输入框上方选择对谁说话`"
-            >
-              +{{ speakers.length - 1 }} 同台
-            </span>
-            <span class="status status-xs" :class="generating ? 'status-warning animate-pulse' : 'status-success'"></span>
-            <span class="text-xs text-base-content/50">{{ generating ? "生成中" : "在场" }}</span>
-            <!-- 表情位占位（M1.6）：卡片 api.ui.emit("emotion", …) 的结果 -->
-            <span
-              v-if="mood"
-              class="badge badge-xs badge-soft badge-secondary tooltip tooltip-bottom"
-              data-tip="角色表情（卡内 ui.emit，立绘差分留待资产规范落地）"
-            >
-              {{ kindLabel("emotion") }} · {{ mood }}
-            </span>
-          </div>
-          <p class="mt-0.5 mb-0 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-base-content/50">
-            <span class="flex items-center gap-1">
-              <Icon name="clock" :size="13" />
-              第 {{ blackboard?.day ?? 1 }} 天 · {{ blackboard?.clock || "时间未定" }}
-            </span>
-            <span class="flex items-center gap-1">
-              <Icon name="pin" :size="13" />{{ blackboard?.place || "地点未定" }}
-            </span>
-            <span v-if="blackboard && blackboard.actors.length > 0" class="flex items-center gap-1">
-              <Icon name="users" :size="13" />{{ blackboard.actors.join(" · ") }}
-            </span>
-          </p>
-        </div>
-
-        <div class="flex flex-none items-center gap-1">
-          <button
-            class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
-            data-tip="存为剧本包：premise + 初始黑板 + 导演树（不含聊天记录），可分享"
-            @click="openScriptDialog"
-          >
-            <Icon name="download" :size="16" />
-          </button>
-          <button
-            class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
-            data-tip="黑板"
-            :class="{ 'btn-active': panel === 'board' }"
-            @click="togglePanel('board')"
-          >
-            <Icon name="layers" :size="16" />
-          </button>
-          <button
-            class="btn btn-square btn-sm btn-ghost tooltip tooltip-left"
-            data-tip="记忆检查器"
-            :class="{ 'btn-active': panel === 'inspector' }"
-            @click="togglePanel('inspector')"
-          >
-            <Icon name="cpu" :size="16" />
-          </button>
         </div>
       </div>
-    </header>
-
-    <!-- 场景条（M3.2 · 设计 §10.3）：多场景会话的「与此同时」切换 -->
-    <SceneBar
-      v-if="scenes.length > 0"
-      :scenes="scenes"
-      :active-scene="activeScene"
-      :busy="sceneBusy"
-      @switch="switchTo"
-      @edit="openSceneDialog('edit')"
-      @create="openSceneDialog('create')"
-      @split="openSceneDialog('split')"
-      @merge="openSceneDialog('merge')"
-    />
+      <span class="min-w-0 flex-1 truncate text-xs text-base-content/55">
+        第 {{ blackboard?.day ?? 1 }} 天 · {{ blackboard?.clock || "时间未定" }} ·
+        {{ blackboard?.place || "地点未定" }}
+      </span>
+      <button
+        class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+        data-tip="黑板"
+        :class="{ 'btn-active': panel === 'board' }"
+        @click="togglePanel('board')"
+      >
+        <Icon name="layers" :size="16" />
+      </button>
+      <button
+        class="btn btn-square btn-sm btn-ghost tooltip tooltip-bottom"
+        data-tip="记忆检查器"
+        :class="{ 'btn-active': panel === 'inspector' }"
+        @click="togglePanel('inspector')"
+      >
+        <Icon name="cpu" :size="16" />
+      </button>
+    </div>
 
     <div class="relative flex min-h-0 flex-1 gap-4">
+      <!-- 舞台栏（M5.1）：会话头 + 场景条并进左栏（阵容逐行/点名、场景切换、面板开关）；
+           宽屏常驻可折叠，窄屏浮层抽屉 -->
+      <SessionRail
+        class="max-[900px]:absolute max-[900px]:inset-y-0 max-[900px]:left-0 max-[900px]:z-10 max-[900px]:shadow-2xl"
+        :class="railNarrowOpen ? '' : 'max-[900px]:hidden'"
+        :meta="meta"
+        :blackboard="blackboard"
+        :cast-names="castNames"
+        :active-names="activeNames"
+        :scenes="scenes"
+        :active-scene="activeScene"
+        :busy="sceneBusy"
+        :speaker="speaker"
+        :panel="panel"
+        :mood="mood"
+        :collapsed="railCollapsed && !railNarrowOpen"
+        @speak="railSpeak"
+        @switch="switchTo"
+        @edit="openSceneDialog('edit')"
+        @create="openSceneDialog('create')"
+        @split="openSceneDialog('split')"
+        @merge="openSceneDialog('merge')"
+        @toggle-panel="togglePanel"
+        @export-script="openScriptDialog"
+        @toggle-collapse="toggleRail"
+      />
+
       <!-- 聊天流 + 输入区 -->
       <section class="card card-border min-w-0 flex-1 overflow-hidden bg-base-100">
         <ul ref="streamEl" class="m-0 flex min-h-0 flex-1 list-none flex-col gap-5 overflow-y-auto p-5">

@@ -290,6 +290,10 @@ pub struct BuildInputs<'a> {
     /// 小说模式（增强 F1 · 决断 9）：叙事锁小说体 + 段落基调 + 用户输入定位
     /// （走向描述 + 引号直语两用）
     pub novel_mode: bool,
+    /// A3「自身设定」附录（M5.4）：本发言人绑定的设定集 char 实体渲染文本
+    /// （带【自身设定】头）。None = 无绑定，A3 与之前一字不差。
+    /// 拼在身份锚之后进 A3 层，A 组超预算时随 A3 一起被截断（预算纪律不变）。
+    pub identity_extra: Option<&'a str>,
     /// 全量历史（构建器自行取最近 WINDOW_MESSAGES 条作 C3）
     pub history: &'a [Message],
     /// 本轮用户消息；None = 预览（不含用户消息）
@@ -345,11 +349,15 @@ pub fn build(inputs: &BuildInputs<'_>) -> PromptAssembly {
     if let Some(a2) = a2 {
         a_parts.push(("A2", "用户人格", a2));
     }
-    a_parts.push((
-        "A3",
-        "身份锚",
-        identity_anchor(inputs.card, inputs.card_state),
-    ));
+    // M5.4：绑定实体的「自身设定」拼进 A3——身份锚之后、同一层共享预算
+    // （A 组超预算时 A3 先被截断，附录与示例对话一样是可牺牲的末位内容）
+    let a3_text = match inputs.identity_extra {
+        Some(extra) if !extra.trim().is_empty() => {
+            format!("{}\n{}", identity_anchor(inputs.card, inputs.card_state), extra)
+        }
+        _ => identity_anchor(inputs.card, inputs.card_state),
+    };
+    a_parts.push(("A3", "身份锚", a3_text));
 
     let share = a_limit / a_parts.len();
     let wants: Vec<usize> = a_parts
@@ -1391,6 +1399,7 @@ mod tests {
         cast_note: None,
             tools_contract: None,
             novel_mode: false,
+            identity_extra: None,
             settings,
             persona,
             card,

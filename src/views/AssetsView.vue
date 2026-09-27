@@ -4,14 +4,15 @@ import { api } from "../api";
 import { assetTab } from "../assets";
 import { cardGeneration, importOpen } from "../cards";
 import { loadSessions, preferredCard, selectSession, sessions } from "../sessions";
-import type { CardDetail, CardSummary, InspectorData } from "../types";
+import type { CardDetail, CardSummary, InspectorEntity, WorldSummary } from "../types";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorToast from "../components/ErrorToast.vue";
 import Icon from "../components/Icon.vue";
 import { statusClass, statusLabel } from "../components/inspector/util";
 
 // 资产页：角色与设定集的集中查看入口。
-// 角色：卡片墙 + 详情弹窗 + 导入 +「用它开一场」；设定集：选一场会话只读浏览世界实体与揭示集。
+// 角色：卡片墙 + 详情弹窗 + 导入 +「用它开一场」；
+// 设定集（M5.2）：世界卡片网格 → 下钻实体清单，按世界分组、不借道会话；
 // 补全 / 史变等写操作仍在会话检查器里做，这里给出去的指引。
 
 const emit = defineEmits<{ go: [view: "sessions"] }>();
@@ -75,11 +76,6 @@ const exportWorld = (world: string) =>
 const exportWorldbookSt = (world: string) =>
   runExport(`wb:${world}`, () => api.exportWorldbookSt(world));
 
-/** 当前浏览的会话对应的世界名（缺省 default） */
-const codexWorld = computed(
-  () => sessions.value.find((s) => s.id === codexSid.value)?.world || "default",
-);
-
 // 卡片详情弹窗（getCard：完整卡面 + 出场状态 + hooks 清单）
 const detail = ref<CardDetail | null>(null);
 const detailBusy = ref("");
@@ -106,37 +102,49 @@ function stateText(v: unknown): string {
   }
 }
 
-// ---------- 设定集（会话级只读浏览） ----------
-const codexSid = ref("");
-const codexData = ref<InspectorData | null>(null);
-const codexBusy = ref(false);
-const codexError = ref("");
+// ---------- 设定集（M5.2 世界浏览）：世界卡片网格 → 下钻实体清单，不借道会话 ----------
+const worlds = ref<WorldSummary[]>([]);
+const worldsBusy = ref(false);
+/** 空 = 网格视图；非空 = 下钻浏览该世界的实体 */
+const selectedWorld = ref("");
+const worldEntities = ref<InspectorEntity[]>([]);
+const worldBusy = ref(false);
+const worldError = ref("");
 const query = ref("");
 
-async function loadCodex() {
-  if (!codexSid.value) {
-    codexData.value = null;
-    return;
-  }
-  codexBusy.value = true;
-  codexError.value = "";
+async function loadWorlds() {
+  worldsBusy.value = true;
+  worldError.value = "";
   try {
-    codexData.value = await api.inspectorData(codexSid.value);
+    worlds.value = await api.listWorlds();
   } catch (e) {
-    codexData.value = null;
-    codexError.value = String(e);
+    worlds.value = [];
+    worldError.value = String(e);
   } finally {
-    codexBusy.value = false;
+    worldsBusy.value = false;
   }
 }
 
-watch(codexSid, () => void loadCodex());
+/** 下钻某个世界（重按同键 = 刷新） */
+async function openWorld(name: string) {
+  selectedWorld.value = name;
+  worldBusy.value = true;
+  worldError.value = "";
+  query.value = "";
+  try {
+    worldEntities.value = await api.codexWorldEntities(name);
+  } catch (e) {
+    worldEntities.value = [];
+    worldError.value = String(e);
+  } finally {
+    worldBusy.value = false;
+  }
+}
 
 const filteredEntities = computed(() => {
-  const es = codexData.value?.codex.entities ?? [];
   const q = query.value.trim().toLowerCase();
-  if (!q) return es;
-  return es.filter(
+  if (!q) return worldEntities.value;
+  return worldEntities.value.filter(
     (e) =>
       e.name.toLowerCase().includes(q) ||
       e.id.toLowerCase().includes(q) ||
@@ -145,18 +153,43 @@ const filteredEntities = computed(() => {
   );
 });
 
-/** 去那场会话的检查器做补全 / 史变等写操作 */
+/** 类型徽标中文（与 codex.rs type_cn 同口径） */
+function typeCn(ty: string): string {
+  const map: Record<string, string> = {
+    char: "人",
+    place: "地",
+    item: "物",
+    event: "事",
+    org: "组织",
+    rule: "规则",
+    concept: "概念",
+    note: "笔记",
+  };
+  return map[ty] ?? ty;
+}
+
+/** 世界卡片上类型分布的前三名（chips） */
+function topTypes(w: WorldSummary): [string, number][] {
+  return Object.entries(w.by_type)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+}
+
+/** 去一场同世界会话的检查器做补全 / 史变等写操作（没有同世界会话就落到最近一场） */
 function openInSession() {
-  if (!codexSid.value) return;
-  selectSession(codexSid.value);
+  const hit =
+    sessions.value.find((s) => (s.world || "default") === selectedWorld.value) ??
+    sessions.value[0];
+  if (!hit) return;
+  selectSession(hit.id);
   emit("go", "sessions");
 }
 
 onMounted(async () => {
   void loadCards();
-  await loadSessions();
-  // 缺省浏览最近一场
-  if (!codexSid.value && sessions.value.length > 0) codexSid.value = sessions.value[0].id;
+  // 世界浏览不依赖会话；会话清单只服务「去会话检查器」的落点
+  void loadSessions();
+  void loadWorlds();
 });
 </script>
 
@@ -215,6 +248,7 @@ onMounted(async () => {
             <article
               v-for="c in cards"
               :key="c.dir_name"
+              v-tilt
               class="card card-border bg-base-100 transition-colors hover:border-primary/40"
             >
               <div class="card-body gap-3 p-5">
@@ -284,51 +318,99 @@ onMounted(async () => {
           </EmptyState>
         </section>
 
-        <!-- ============ 设定集 ============ -->
+        <!-- ============ 设定集（M5.2：按世界分组的卡片网格 → 下钻浏览） ============ -->
         <section v-else key="codex" class="flex flex-col gap-4">
-          <EmptyState
-            v-if="sessions.length === 0"
-            icon="book"
-            title="还没有会话"
-            desc="设定集跟着会话走：先开一场戏，世界的实体与揭示集就会在这里可查。"
-          >
-            <button class="btn btn-primary btn-sm" @click="emit('go', 'sessions')">
-              <Icon name="chat" :size="15" />去开一场
-            </button>
-          </EmptyState>
+          <div v-if="worldError" role="alert" class="alert alert-error alert-soft text-xs break-words">
+            {{ worldError }}
+          </div>
 
+          <!-- 世界网格 -->
+          <template v-if="!selectedWorld">
+            <div v-if="worldsBusy" class="card card-border bg-base-100">
+              <div class="card-body flex flex-col gap-3 p-5">
+                <div class="skeleton h-4 w-44"></div>
+                <div class="skeleton h-3 w-full"></div>
+                <div class="skeleton h-3 w-4/5"></div>
+              </div>
+            </div>
+            <EmptyState
+              v-else-if="worlds.length === 0"
+              icon="globe"
+              title="还没有世界"
+              desc="导入 SillyTavern 世界书，或让总结管线提案之后，世界就会在这里出现。"
+            />
+            <div v-else class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              <article
+                v-for="w in worlds"
+                :key="w.name"
+                v-tilt
+                class="card card-border cursor-pointer bg-base-100 transition-colors hover:border-primary/40"
+                @click="openWorld(w.name)"
+              >
+                <div class="card-body flex flex-col gap-3 p-5">
+                  <div class="flex items-center gap-2">
+                    <Icon name="globe" :size="18" class="flex-none text-primary/70" />
+                    <span class="min-w-0 flex-1 truncate text-base font-semibold">{{ w.name }}</span>
+                    <span
+                      v-if="w.has_worldline"
+                      class="badge badge-xs badge-soft badge-secondary tooltip tooltip-left"
+                      data-tip="这个世界配置了世界主线（worldline.lua）"
+                    >
+                      <Icon name="film" :size="10" />主线
+                    </span>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <span class="badge badge-sm badge-soft font-mono">{{ w.entities }} 实体</span>
+                    <span class="badge badge-sm badge-ghost">第 {{ w.day }} 天</span>
+                    <span v-for="[ty, n] in topTypes(w)" :key="ty" class="badge badge-sm badge-ghost">
+                      {{ typeCn(ty) }}×{{ n }}
+                    </span>
+                  </div>
+                  <p class="m-0 text-xs text-base-content/45">点开浏览实体；补全 / 史变等写操作在会话检查器。</p>
+                </div>
+              </article>
+            </div>
+          </template>
+
+          <!-- 下钻：单世界实体浏览 -->
           <template v-else>
             <div class="flex flex-wrap items-center gap-2">
-              <select v-model="codexSid" class="select select-sm min-w-52" aria-label="选择要浏览的会话">
-                <option v-for="s in sessions" :key="s.id" :value="s.id">
-                  {{ s.characters.join(" × ") }}
-                </option>
-              </select>
-              <button class="btn btn-ghost btn-sm" :disabled="codexBusy" @click="loadCodex">
-                <span v-if="codexBusy" class="loading loading-spinner loading-xs"></span>
+              <button class="btn btn-ghost btn-sm" @click="selectedWorld = ''">
+                <Icon name="chevron" :size="14" class="rotate-180" />全部世界
+              </button>
+              <Icon name="globe" :size="16" class="flex-none text-base-content/45" />
+              <span class="text-sm font-semibold">{{ selectedWorld }}</span>
+              <span class="badge badge-sm badge-soft font-mono">{{ worldEntities.length }} 个实体</span>
+              <label class="input input-sm ml-auto flex w-full max-w-60 items-center gap-2">
+                <Icon name="search" :size="14" class="text-base-content/40" />
+                <input v-model="query" type="text" class="grow" placeholder="搜名称 / id / 一句话" />
+              </label>
+              <button class="btn btn-ghost btn-sm" :disabled="worldBusy" @click="openWorld(selectedWorld)">
+                <span v-if="worldBusy" class="loading loading-spinner loading-xs"></span>
                 <Icon v-else name="refresh" :size="15" />刷新
               </button>
-              <!-- 世界包与 ST 世界书导出（M4.1）：按当前浏览的会话解析世界名 -->
+              <!-- 世界包与 ST 世界书导出（M4.1）：按当前下钻的世界名 -->
               <button
                 class="btn btn-ghost btn-sm tooltip tooltip-left"
                 data-tip="整包导出这个世界（实体 + 正史增量 + 世界时钟 + 世界线），可导入其他化境"
-                :disabled="!codexSid || exporting === `world:${codexWorld}`"
-                @click="exportWorld(codexWorld)"
+                :disabled="exporting === `world:${selectedWorld}`"
+                @click="exportWorld(selectedWorld)"
               >
-                <span v-if="exporting === `world:${codexWorld}`" class="loading loading-spinner loading-xs"></span>
+                <span v-if="exporting === `world:${selectedWorld}`" class="loading loading-spinner loading-xs"></span>
                 <Icon v-else name="download" :size="15" />世界包
               </button>
               <button
                 class="btn btn-ghost btn-sm tooltip tooltip-left"
                 data-tip="反向导出为 SillyTavern 世界书 JSON（仅静态字段，§6.10）"
-                :disabled="!codexSid || exporting === `wb:${codexWorld}`"
-                @click="exportWorldbookSt(codexWorld)"
+                :disabled="exporting === `wb:${selectedWorld}`"
+                @click="exportWorldbookSt(selectedWorld)"
               >
-                <span v-if="exporting === `wb:${codexWorld}`" class="loading loading-spinner loading-xs"></span>
+                <span v-if="exporting === `wb:${selectedWorld}`" class="loading loading-spinner loading-xs"></span>
                 <Icon v-else name="download" :size="15" />ST 世界书
               </button>
               <button
-                class="btn btn-ghost btn-sm ml-auto tooltip tooltip-left"
+                v-if="sessions.length > 0"
+                class="btn btn-ghost btn-sm tooltip tooltip-left"
                 data-tip="补全 / 史变预览等写操作在那场会话的检查器里"
                 @click="openInSession"
               >
@@ -336,12 +418,8 @@ onMounted(async () => {
               </button>
             </div>
 
-            <div v-if="codexError" role="alert" class="alert alert-error alert-soft text-xs break-words">
-              {{ codexError }}
-            </div>
-
             <!-- 读取中：骨架占位 -->
-            <div v-else-if="codexBusy" class="card card-border bg-base-100">
+            <div v-if="worldBusy" class="card card-border bg-base-100">
               <div class="card-body flex flex-col gap-3 p-5">
                 <div class="skeleton h-4 w-44"></div>
                 <div class="skeleton h-3 w-full"></div>
@@ -350,75 +428,44 @@ onMounted(async () => {
               </div>
             </div>
 
-            <template v-else-if="codexData">
-              <div class="card card-border bg-base-100">
-                <div class="card-body flex flex-col gap-3 p-5">
-                  <div class="flex flex-wrap items-center gap-2">
-                    <Icon name="globe" :size="16" class="flex-none text-base-content/45" />
-                    <span class="text-sm font-semibold">{{ codexData.codex.world || "默认世界" }}</span>
-                    <span class="badge badge-sm badge-soft font-mono">{{ codexData.codex.count }} 个实体</span>
-                    <label class="input input-sm ml-auto flex w-full max-w-60 items-center gap-2">
-                      <Icon name="search" :size="14" class="text-base-content/40" />
-                      <input v-model="query" type="text" class="grow" placeholder="搜名称 / id / 一句话" />
-                    </label>
-                  </div>
+            <div v-else class="card card-border bg-base-100">
+              <div class="card-body flex flex-col gap-3 p-5">
+                <p v-if="worldEntities.length > 0" class="m-0 text-xs text-base-content/45">
+                  草稿不进注入，只有正史参与激活；retired 留档可查。
+                </p>
 
-                  <p v-if="codexData.codex.count > 0" class="m-0 text-xs text-base-content/45">
-                    草稿不进注入，只有正史参与激活；retired 留档可查。
+                <div
+                  v-for="e in filteredEntities"
+                  :key="e.id"
+                  class="rounded-box flex flex-col gap-1 bg-base-200 p-3"
+                >
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ e.name }}</span>
+                    <span class="badge badge-xs badge-soft badge-neutral">{{ typeCn(e.type) }}</span>
+                    <span class="badge badge-xs" :class="statusClass(e.status)">{{ statusLabel(e.status) }}</span>
+                  </div>
+                  <p v-if="e.oneLiner" class="m-0 text-xs break-words text-base-content/60">{{ e.oneLiner }}</p>
+                  <p v-if="e.anchors.length" class="m-0 text-[11px] break-words text-base-content/40">
+                    anchors：{{ e.anchors.join(" · ") }}
                   </p>
-
-                  <div
-                    v-for="e in filteredEntities"
-                    :key="e.id"
-                    class="rounded-box flex flex-col gap-1 bg-base-200 p-3"
-                  >
-                    <div class="flex flex-wrap items-center gap-1.5">
-                      <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ e.name }}</span>
-                      <span class="badge badge-xs badge-soft badge-neutral">{{ e.type }}</span>
-                      <span class="badge badge-xs" :class="statusClass(e.status)">{{ statusLabel(e.status) }}</span>
-                    </div>
-                    <p v-if="e.oneLiner" class="m-0 text-xs break-words text-base-content/60">{{ e.oneLiner }}</p>
-                    <p v-if="e.anchors.length" class="m-0 text-[11px] break-words text-base-content/40">
-                      anchors：{{ e.anchors.join(" · ") }}
-                    </p>
-                    <p class="m-0 font-mono text-[10px] text-base-content/35">{{ e.id }}</p>
-                  </div>
-
-                  <p
-                    v-if="codexData.codex.count > 0 && filteredEntities.length === 0"
-                    class="m-0 text-xs text-base-content/45"
-                  >
-                    没有匹配「{{ query }}」的实体。
-                  </p>
-
-                  <EmptyState
-                    v-if="codexData.codex.count === 0"
-                    icon="globe"
-                    title="这个世界还没有实体"
-                    desc="导入世界书，或让总结管线提案之后就有了。"
-                  />
+                  <p class="m-0 font-mono text-[10px] text-base-content/35">{{ e.id }}</p>
                 </div>
-              </div>
 
-              <div class="card card-border bg-base-100">
-                <div class="card-body flex flex-col gap-2 p-5">
-                  <h3 class="m-0 flex items-center gap-2 text-sm font-medium">
-                    <Icon name="eye" :size="15" class="text-base-content/45" />
-                    揭示集
-                    <span class="text-xs font-normal text-base-content/40">角色已经知道的秘密</span>
-                  </h3>
-                  <div v-if="codexData.known.length" class="flex flex-wrap gap-1">
-                    <span
-                      v-for="k in codexData.known"
-                      :key="k"
-                      class="badge badge-sm badge-soft badge-secondary font-mono"
-                      >{{ k }}</span
-                    >
-                  </div>
-                  <p v-else class="m-0 text-xs text-base-content/45">还没有揭示的秘密。</p>
-                </div>
+                <p
+                  v-if="worldEntities.length > 0 && filteredEntities.length === 0"
+                  class="m-0 text-xs text-base-content/45"
+                >
+                  没有匹配「{{ query }}」的实体。
+                </p>
+
+                <EmptyState
+                  v-if="worldEntities.length === 0"
+                  icon="globe"
+                  title="这个世界还没有实体"
+                  desc="导入世界书，或让总结管线提案之后就有了。"
+                />
               </div>
-            </template>
+            </div>
           </template>
         </section>
       </Transition>

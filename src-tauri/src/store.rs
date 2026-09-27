@@ -764,6 +764,8 @@ pub struct NewSessionRequest {
     /// 剧本模板（M4.1 · 决断 3）：给出时初始 premise 与黑板从 `scripts/<名>/`
     /// 取——向导显式填写的字段覆盖剧本值，阵容永远用本会话的
     pub script: Option<String>,
+    /// 启用的设定集（世界）名（M5.3）：空/缺省 = default；命令层已校验目录存在
+    pub world: Option<String>,
 }
 
 pub fn session_dir(root: &Path, id: &str) -> PathBuf {
@@ -816,7 +818,8 @@ pub fn new_session(root: &Path, req: &NewSessionRequest) -> StoreResult<SessionM
         novel_mode: false,
         characters: cast.clone(),
         persona: req.persona.clone(),
-        world: None,
+        // 启用的设定集（M5.3）：命令层已校验目录存在，这里只管落盘；None → 读侧回落 default
+        world: req.world.clone(),
         seed: seed_now(),
         premise,
         max_speakers: None,
@@ -1570,6 +1573,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -1649,6 +1653,7 @@ mod tests {
                 place: Some("图书馆自习区".into()),
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -1714,6 +1719,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -1738,6 +1744,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -1808,6 +1815,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -1874,6 +1882,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -1923,6 +1932,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -1972,6 +1982,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -2069,6 +2080,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -2131,6 +2143,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -2196,6 +2209,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -2264,6 +2278,7 @@ mod tests {
                 place: None,
                 premise: None,
                 script: None,
+                world: None,
             },
         )
         .unwrap();
@@ -2458,5 +2473,53 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.name, "custom");
         assert_eq!(parsed.color_scheme, "light");
+    }
+
+    /// M5.3：new_session 落盘启用的世界——给了且读得到就用（round-trip 回读一致），
+    /// 没给就 None（读侧回落 default，老会话语义不变）
+    #[test]
+    fn new_session_persists_world_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        ensure_layout(root).unwrap();
+        std::fs::create_dir_all(root.join("codex/魔女之城/entities")).unwrap();
+
+        let meta = new_session(
+            root,
+            &NewSessionRequest {
+                character: "小雨".into(),
+                characters: Vec::new(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+                script: None,
+                world: Some("魔女之城".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(meta.world.as_deref(), Some("魔女之城"));
+        // round-trip：重新读回 session.json 仍是 Some
+        let mut metas = list_sessions(root).unwrap();
+        metas.retain(|m| m.id == meta.id);
+        assert_eq!(metas[0].world.as_deref(), Some("魔女之城"));
+
+        let none = new_session(
+            root,
+            &NewSessionRequest {
+                character: "小雨".into(),
+                characters: Vec::new(),
+                persona: None,
+                day: None,
+                clock: None,
+                place: None,
+                premise: None,
+                script: None,
+                world: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(none.world, None, "不指定 = None，读侧回落 default");
     }
 }
