@@ -44,6 +44,28 @@ function goAssets(tab: AssetTab) {
   go("assets");
 }
 
+// 侧栏可折叠组（会话/资产）的展开状态：只归 Vue 管，不用 <details> 的 :open 绑定——
+// summary 的原生 toggle 与 Vue 补丁同帧双切换会互相抵消，从别的页点「资产」跳转后
+// 子菜单永远展不开（且 vdom 已记 open=true 不再补丁）。跳转目标页时自动展开；
+// 已在页内时 summary 点击才做折叠/展开。
+const subOpen = ref({ sessions: false, assets: false });
+watch(
+  view,
+  (v) => {
+    if (v === "sessions") subOpen.value.sessions = true;
+    if (v === "assets") subOpen.value.assets = true;
+  },
+  { immediate: true },
+);
+
+function toggleGroup(id: "sessions" | "assets") {
+  if (view.value !== id) {
+    go(id); // watch 会展开该组
+  } else {
+    subOpen.value[id] = !subOpen.value[id];
+  }
+}
+
 // 侧栏：大屏默认展开，窄屏默认收起（收起时只留图标栏）
 const drawerOpen = ref(window.matchMedia("(min-width: 1024px)").matches);
 
@@ -276,8 +298,8 @@ onUnmounted(() => {
             <!-- 会话与资产是「可折叠子菜单」，其余是普通入口 -->
             <template v-for="id in NAV" :key="id">
               <li v-if="id === 'sessions' && drawerOpen">
-                <details :open="view === 'sessions'">
-                  <summary :class="{ 'menu-active': view === 'sessions' }" @click="go('sessions')">
+                <details :open="subOpen.sessions">
+                  <summary :class="{ 'menu-active': view === 'sessions' }" @click.prevent="toggleGroup('sessions')">
                     <Icon name="chat" :size="17" />
                     <span class="flex-1">{{ PAGES.sessions.label }}</span>
                     <span class="badge badge-xs badge-ghost">{{ sessions.length }}</span>
@@ -303,8 +325,8 @@ onUnmounted(() => {
               </li>
 
               <li v-else-if="id === 'assets' && drawerOpen">
-                <details :open="view === 'assets'">
-                  <summary :class="{ 'menu-active': view === 'assets' }" @click="go('assets')">
+                <details :open="subOpen.assets">
+                  <summary :class="{ 'menu-active': view === 'assets' }" @click.prevent="toggleGroup('assets')">
                     <Icon name="book" :size="17" />
                     <span class="flex-1">{{ PAGES.assets.label }}</span>
                   </summary>

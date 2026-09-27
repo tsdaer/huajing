@@ -129,6 +129,9 @@ export const api = {
   /** 删除指定下标的消息，返回更新后的全量列表 */
   deleteMessage: (sessionId: string, index: number) =>
     invoke<Message[]>("delete_message", { sessionId, index }),
+  /** 开场白润色（体验修复批）：会话还全新时用 util 档 LLM 把 first_mes 润成自然开场，
+   *  没配接入点/已开演/失败都原样返回现有消息，调用方无感 */
+  polishOpening: (sessionId: string) => invoke<Message[]>("polish_opening", { sessionId }),
 
   /** 发送消息并流式接收（delta/done/director/error 经 onEvent 推送；返回值为终态事件）。
    *  speaker（群聊 · M3.4）：显式点名 = 只他一人接话；缺省 = 导演调度（多角色）

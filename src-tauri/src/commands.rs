@@ -807,6 +807,134 @@ fn delete_message_body(
     Ok(event::messages(&rebuilt))
 }
 
+/// 全新判定：消息流只有 turn 0 的 char 开场白，且内容仍是 `baseline`（卡的
+/// first_mes，或复核时进 LLM 前的那句开场白——被编辑/润色过即不成立）
+fn opening_polishable(msgs: &[Message], baseline: &str) -> bool {
+    msgs.len() == 1
+        && msgs
+            .first()
+            .is_some_and(|m| m.turn == 0 && m.role == "char" && m.content == baseline)
+}
+
+/// 开场白润色（体验修复批）：first_mes 是卡片作者的静态问候，直接当第一句往往
+/// 干瘪机械。会话还**全新**时（消息流只有 turn 0 开场白、内容与卡的 first_mes
+/// 一致——用户没动过）用 util 档 LLM 把它润成贴合场景/人设/世界的自然开场，
+/// 写回走与 [`edit_message_body`] 同一条重放管线。
+/// 任何一步不满足（没配接入点 / 已开演 / 被编辑过 / 生成失败或为空 / 写入闸门
+/// 被占）都原样返回现有消息：润色是增强，first_mes 永远是兜底，本命令零阻塞。
+#[tauri::command]
+pub async fn polish_opening(
+    session_id: String,
+    log: State<'_, store::EventLog>,
+) -> Result<Vec<Message>, String> {
+    let root = root();
+    let meta = store::load_session(&root, &session_id).map_err(|e| e.to_string())?;
+    let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
+    let msgs = event::messages(&records);
+    let Some(opening) = msgs.first() else {
+        return Ok(msgs);
+    };
+    // 结构先短路：只有单条消息才可能还是全新会话（已开演的免读卡）
+    if msgs.len() != 1 || opening.turn != 0 || opening.role != "char" {
+        return Ok(msgs);
+    }
+    let Some(main_dir) = meta.characters.first().cloned() else {
+        return Ok(msgs);
+    };
+    let Ok(loaded) = card::load_card(&root, &main_dir) else {
+        return Ok(msgs);
+    };
+    // 内容再验证：仍是卡的 first_mes（没被润过/改过）
+    if !opening_polishable(&msgs, loaded.card.first_mes.trim()) {
+        return Ok(msgs);
+    }
+    // 没配 util 档接入点：静默保留 first_mes（浏览器 mock / 离线主路径）
+    let Ok(provider) = pick_util_provider(&root) else {
+        return Ok(msgs);
+    };
+
+    let board = store::load_blackboard(&root, &session_id)
+        .unwrap_or_else(|_| store::Blackboard::default_board());
+    let cast = meta
+        .characters
+        .iter()
+        .map(|dir| {
+            card::load_card(&root, dir)
+                .map(|l| display_name_of(&l))
+                .unwrap_or_else(|_| dir.clone())
+        })
+        .collect::<Vec<_>>()
+        .join("、");
+    let prompt = format!(
+        "你是一部互动短剧的开场编剧。请以「{name}」的身份写一段开场：动作、神态与台词自然交织，\
+用「你」称呼对手戏的人，让对话有自然的接缝。\n\n\
+场景：第 {day} 天 {clock}，在{place}。\n\
+阵容：{cast}。\n\
+起因：{premise}\n\
+{name}的设定：{scenario}\n\
+{name}的性格：{personality}\n\
+卡片原开场白（只取其情境与基调，不要照抄）：{first_mes}\n\n\
+要求：60~160 字；从情境或动作切入，不要自我介绍模板，不要旁白解说腔；直接输出开场正文。",
+        name = display_name_of(&loaded),
+        day = board.day,
+        clock = board.clock,
+        place = board.place,
+        cast = cast,
+        premise = meta.premise.as_deref().unwrap_or("（未指定）"),
+        scenario = loaded.card.scenario.trim(),
+        personality = loaded.card.personality.trim(),
+        first_mes = opening.content,
+    );
+
+    let proxy = proxy_of(&root);
+    let Ok(raw) = llm::chat_complete(
+        &provider,
+        &[llm::ChatMessage::text("user", &prompt)],
+        512,
+        0.8,
+        proxy.as_deref(),
+    )
+    .await
+    else {
+        return Ok(msgs);
+    };
+    let text = raw.trim();
+    if text.is_empty() || text == opening.content {
+        return Ok(msgs);
+    }
+
+    // 写回：拿写入闸门（被占就放弃这次润色，不排队）→ 复核全新态 → turn 0 重放
+    let Some(_guard) = gate().acquire(&session_id) else {
+        return Ok(msgs);
+    };
+    let records = log.read(&root, &session_id).map_err(|e| e.to_string())?;
+    let fresh = event::messages(&records);
+    if !opening_polishable(&fresh, &opening.content) {
+        return Ok(fresh);
+    }
+    let Some((pos, turn)) = locate_message(&records, 0) else {
+        return Ok(fresh);
+    };
+    let mut edited = records.as_ref().clone();
+    if let LogBody::Message(m) = &mut edited[pos].body {
+        m.content = text.to_string();
+    }
+    let cast = match Cast::load(&root, &meta) {
+        Ok(c) => c,
+        Err(_) => return Ok(fresh),
+    };
+    let rebuilt = match rebuild_from(&log, &root, &meta, &cast, &edited, turn) {
+        Ok(r) => r,
+        Err(_) => return Ok(fresh),
+    };
+    log.rewrite(&root, &session_id, &rebuilt)
+        .map_err(|e| e.to_string())?;
+    sync_now(&log, &root, &meta)?;
+    drop(_guard);
+    flush_parked_summaries(&root, &session_id);
+    Ok(event::messages(&rebuilt))
+}
+
 /// 重放：丢弃 from_turn 起的派生事件，按卡重新跑这些轮的钩子（设计 §7.3-5）。
 ///
 /// - **M2 会话**（事件流带 genesis）：先折叠 from_turn 之前的事件得到起点，再从该轮重放；
@@ -12540,5 +12668,60 @@ return {
             "NPC char 实体照旧普通激活（提及）：{}",
             b3b.content
         );
+    }
+
+    // ---------- 开场白润色的全新判定（体验修复批） ----------
+
+    fn opening_msg(content: &str) -> Message {
+        Message {
+            turn: 0,
+            role: "char".into(),
+            content: content.into(),
+            ts: 0,
+            scene_id: None,
+            name: None,
+            tool_calls: None,
+        }
+    }
+
+    #[test]
+    fn opening_polishable_only_when_pristine() {
+        // 全新：单条 turn 0 char 开场白，且与卡的 first_mes 一致
+        assert!(opening_polishable(&[opening_msg("（开场）")], "（开场）"));
+
+        // 用户已接话（已开演）→ 不润
+        let played = vec![
+            opening_msg("（开场）"),
+            Message {
+                turn: 1,
+                role: "user".into(),
+                content: "你好".into(),
+                ..opening_msg("")
+            },
+        ];
+        assert!(!opening_polishable(&played, "（开场）"));
+
+        // 开场白被用户编辑过 / 已润过 → 不润（保留手笔，不覆写）
+        assert!(!opening_polishable(
+            &[opening_msg("改过的开场")],
+            "（开场）"
+        ));
+
+        // turn 非 0 / role 非 char / 空消息流 → 都不润
+        assert!(!opening_polishable(
+            &[Message {
+                turn: 2,
+                ..opening_msg("（开场）")
+            }],
+            "（开场）"
+        ));
+        assert!(!opening_polishable(
+            &[Message {
+                role: "user".into(),
+                ..opening_msg("（开场）")
+            }],
+            "（开场）"
+        ));
+        assert!(!opening_polishable(&[], "（开场）"));
     }
 }

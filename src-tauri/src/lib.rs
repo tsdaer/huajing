@@ -66,6 +66,7 @@ pub fn run() {
             commands::read_messages,
             commands::edit_message,
             commands::delete_message,
+            commands::polish_opening,
             commands::send_message,
             commands::regenerate,
             commands::stop_generation,

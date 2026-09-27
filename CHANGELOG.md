@@ -4,6 +4,63 @@
 
 ## [Unreleased]
 
+### Fixed · 体验修复三连：hover-3d 观感对齐 / 侧栏设定集打不开 / 开场白润色
+
+- **hover-3d 观感升级到 daisyUI 同款**（问题：角色卡的 tilt 效果弱到感知不到，不像
+  [hover-3d](https://daisyui.com/components/hover-3d/)）：`.tilt-card` 对照官方组件 CSS
+  重调——倾角 7°→**10°**、hover 抬升 **scale 1.05**、**方向性多层 drop-shadow**（随光标
+  反侧偏移，悬浮感）、**linear() 弹簧缓动**（取官方曲线，hover/离场各一条）、高光从
+  8% base-content 换成更亮的白；v-tilt 指令同步改「光标侧抬起」方向语义（官方分区
+  rotate3d 同号）并新增 `--shadow-x/y` 变量。**悬浮发糊二修**：投影弃用官方同款
+  `filter: drop-shadow`——filter 会把卡片连同文字烘成一张纹理、再被 scale(1.05) 当作
+  普通贴图拉伸，叠加 `will-change: transform` 把栅格化锁死在原始尺寸上，悬浮即糊
+  （本机 reduced-motion 把过渡钳成瞬时，糊是静止可见的）；改用不产生渲染面的
+  `box-shadow` 双层投影并去掉 will-change，Chromium 在变换落定后按实际尺寸重栅格化，
+  悬浮文字恢复锐利。**不换 daisyUI 纯 CSS 类的原因**：其 8 个
+  透明分区 div 会盖住卡片内按钮（官方文档也要求内容不可交互），角色卡上恰有三枚按钮；
+  transition 列表顺带补回 border-color 等（本规则不分层会盖过 utilities，此前 hover
+  描边过渡被 tilt 吃掉）。
+- **v-tilt 的 reduced-motion 自禁用撤岗**（真机走查 temp/m51 实锤：本机 WebView2 即报
+  `prefers-reduced-motion: reduce`——Windows「动画效果」关闭时 tilt 整体缺席，等于功能
+  从未上线）：自禁用条件收窄为仅 `pointer: coarse`（触屏无 hover 语义）；reduced-motion
+  下的动效降级交由 style.css 既有全局 transition 钳制承担——动效敏感用户看到的是无
+  动画的指针空间反馈（倾斜/高光即时跟随，无弹簧无过渡），而非效果消失。
+- **设定集页签真机整片空白（渲染崩溃）**：后端 `WorldSummary` 挂了
+  `serde(rename_all = "camelCase")`，`by_type`/`has_worldline` 上线即 `byType`/
+  `hasWorldline`，而前端类型与模板按 snake_case 读——`Object.entries(w.by_type)` 拿到
+  undefined 直接抛 TypeError，世界网格整棵不渲染（用户所见「点设定集没反应」的主体）。
+  前端三处（类型/资产页/新建会话向导下拉）+ mock 数据键名一并对齐 camelCase。
+  **m51 教训入档：mock 数据必须与真机线格式逐字段同形，否则浏览器走查对序列化错位
+  全盲**——M5.2 当轮只有 mock 走查没有真机走查，正是这次漏网的缝隙。
+- **侧栏「资产/会话」子菜单展不开的竞态**：`<details :open>` 的原生 toggle 与 Vue 补丁
+  同帧**双切换互相抵消**，且 vdom 记为已开后不再补丁。改为 Vue 受控状态 `subOpen`
+  （`@click.prevent` 屏蔽原生 toggle）：跳转目标页自动展开，页内 summary 点击才
+  折叠/展开。
+- **舞台栏注释被侧边栏挡住**（用户反馈：左侧组件的注释容易被侧栏盖住）：三重机制叠加——
+  ①舞台栏展开态容器 `overflow-hidden` 把长注释气泡（场景操作钮，实测 284px 宽）整段
+  裁死在栏内；②区头按钮住在 `overflow-y-auto` 滚动容器里，气泡向左伸出即被滚动裁切
+  （LTR 下左向溢出直接剪掉）；③daisyUI 气泡 z-index 仅 2，即便伸出也会被 DOM 更晚的
+  聊天流与 z-30 的主侧栏盖住。修复：舞台栏去 `overflow-hidden`、区头提出滚动容器
+  （区头不再随列表滚走）、场景操作钮气泡方向翻转向右（伸进聊天区；左侧是外壳
+  `overflow-x-clip` 的裁切边界，向左必被截——外壳裁切保留，它防的是右侧注释撑出
+  横向滚动条）、style.css 全局把注释气泡抬到 z-50（盖过主侧栏与聊天流）。
+  真机取证（temp/m51 · w55-56，CDP 真实鼠标 + `tooltip-open` 强制显示双通道）：
+  收起钮/场景四钮注释完整可见、盖在聊天流之上。
+- **开场白润色**（问题：第一句永远照念 first_mes，太机械）：新命令 `polish_opening`——
+  会话还**全新**时（单条 turn 0 char 消息且与卡 first_mes 一致）用 util 档 LLM 把它润成
+  贴合场景/人设/世界/阵容的自然开场（叙述+台词交织，60~160 字），写回走 edit_message
+  同一条重放管线；进会话页即触发、润好无感替换。**任何一步不满足都原样返回**：没配
+  接入点/已开演/被编辑过/生成失败/写入闸门被占——first_mes 永远是兜底，离线零副作用；
+  写入闸门内复核全新态，迟到润色不会覆盖用户的编辑或并发写。
+- **验证**：`cargo test` 532 全绿（+1：`opening_polishable` 全新判定六断言）+
+  `pnpm build` 双绿；**真机走查（temp/m51，CDP 驱动用户 23:37 构建的 release exe，
+  隔离 DataHub + 全新 WebView2 user data folder）4/4 全过**：环境判定（reduce=true,
+  coarse=false）下 tilt 正常挂载、pointermove 写变量 + matrix3d + 投影、侧栏
+  一次点击「资产」子菜单即展开、设定集世界卡片（崩坏3 · 1 实体）经真实 list_worlds
+  渲染；悬浮发糊二修经真实鼠标悬浮复验（w52：hover 态 filter=none + box-shadow
+  方向投影 + 截图目检文字锐利）；浏览器走查（mock + stub reduced-motion）：hover
+  观感截图目检、已开演会话进页 polish_opening 静默返回、消息流与开场白原样。
+
 ### Added · 体验四连：舞台栏 / hover-3d 世界卡片 / 新建会话向导 / char 绑定身份层（M5.1–M5.4）
 
 - **M5.1 舞台栏**：会话头与场景条并进左侧可折叠竖栏（新组件 `SessionRail`，`SceneBar`

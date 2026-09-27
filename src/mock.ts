@@ -526,22 +526,23 @@ export function setupMock() {
         return personas;
       case "list_cards":
         return cards;
-      // 世界浏览（M5.2）：示意两个世界，default 带世界线
+      // 世界浏览（M5.2）：示意两个世界，default 带世界线（键名与真机 camelCase 对齐——
+      // 此前 mock 用 by_type/has_worldline 掩住了真机渲染崩溃，m51 教训）
       case "list_worlds":
         return [
           {
             name: "default",
             entities: 3,
-            by_type: { char: 1, place: 1, item: 1 },
+            byType: { char: 1, place: 1, item: 1 },
             day: 3,
-            has_worldline: true,
+            hasWorldline: true,
           },
           {
             name: "魔女之城",
             entities: 6,
-            by_type: { char: 3, place: 2, org: 1 },
+            byType: { char: 3, place: 2, org: 1 },
             day: 12,
-            has_worldline: false,
+            hasWorldline: false,
           },
         ] satisfies WorldSummary[];
       case "codex_world_entities": {
@@ -610,6 +611,15 @@ export function setupMock() {
       }
       case "delete_message": {
         messages.splice(a.index!, 1);
+        return messages;
+      }
+      case "polish_opening": {
+        // 浏览器 mock：会话还全新（只有 turn 0 开场白）时给一段罐头润色，
+        // 让「润好了无感替换」的前端链路可走查；其余情况与真机口径一致——原样返回
+        const m0 = messages[0];
+        if (messages.length === 1 && m0?.turn === 0 && m0?.role === "char") {
+          m0.content = "（她把还冒着热气的马克杯推过桌面，指了指窗边）来得正好——闭馆前这一小时，雨总算停了。";
+        }
         return messages;
       }
       case "send_message": {

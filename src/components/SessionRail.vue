@@ -115,8 +115,9 @@ function sceneTip(sc: Scene): string {
     </div>
   </div>
 
-  <!-- 展开态：完整舞台栏 -->
-  <div v-else class="card card-border flex w-56 flex-none flex-col overflow-hidden bg-base-100">
+  <!-- 展开态：完整舞台栏。不设 overflow-hidden——它会把操作钮的长注释气泡
+       整段裁死在栏内，注释就"消失"了 -->
+  <div v-else class="card card-border flex w-56 flex-none flex-col bg-base-100">
     <!-- 会话信息 -->
     <header class="flex-none border-b border-base-300 px-3 py-2.5">
       <div class="flex items-center gap-1.5">
@@ -124,7 +125,7 @@ function sceneTip(sc: Scene): string {
         <h2 class="m-0 min-w-0 flex-1 truncate text-sm font-semibold">舞台</h2>
         <!-- 唯一的收合钮：窄屏关浮层、宽屏切折叠，语义由父层裁决 -->
         <button
-          class="btn btn-square btn-ghost btn-xs tooltip tooltip-left max-[900px]:tooltip-bottom"
+          class="btn btn-square btn-ghost btn-xs tooltip tooltip-right max-[900px]:tooltip-bottom"
           data-tip="收起舞台栏"
           aria-label="收起舞台栏"
           @click="emit('toggle-collapse')"
@@ -184,16 +185,17 @@ function sceneTip(sc: Scene): string {
       </button>
     </section>
 
-    <!-- 场景：垂直列表 + 区头操作 -->
-    <section class="flex min-h-0 flex-1 flex-col overflow-y-auto py-1.5">
-      <div class="flex items-center gap-0.5 px-2 pb-1">
+    <!-- 场景：区头操作固定，行列表独立滚动（按钮的注释气泡不能住进滚动容器——
+         溢出方向会被滚动裁切，注释就只剩半截了） -->
+    <div class="flex min-h-0 flex-1 flex-col">
+      <div class="flex flex-none items-center gap-0.5 px-2 pb-1 pt-1.5">
         <h3 class="m-0 flex items-center gap-1 px-1 text-[11px] font-medium tracking-wide text-base-content/45">
           <Icon name="film" :size="12" />场景
           <span class="ml-1 tabular-nums">{{ scenes.length }}</span>
         </h3>
         <div class="ml-auto flex items-center">
           <button
-            class="btn btn-square btn-ghost btn-xs tooltip tooltip-left"
+            class="btn btn-square btn-ghost btn-xs tooltip tooltip-right"
             data-tip="编辑当前场景：标题/地点/在场者/局部时钟"
             :disabled="busy || !activeScene"
             @click="emit('edit')"
@@ -201,7 +203,7 @@ function sceneTip(sc: Scene): string {
             <Icon name="edit" :size="13" />
           </button>
           <button
-            class="btn btn-square btn-ghost btn-xs tooltip tooltip-left"
+            class="btn btn-square btn-ghost btn-xs tooltip tooltip-right"
             data-tip="新场景：另起一个舞台（视角随即切过去）"
             :disabled="busy"
             @click="emit('create')"
@@ -209,7 +211,7 @@ function sceneTip(sc: Scene): string {
             <Icon name="plus" :size="13" />
           </button>
           <button
-            class="btn btn-square btn-ghost btn-xs tooltip tooltip-left"
+            class="btn btn-square btn-ghost btn-xs tooltip tooltip-right"
             data-tip="分场：挑人离场另立场景（「与此同时」）"
             :disabled="busy"
             @click="emit('split')"
@@ -217,7 +219,7 @@ function sceneTip(sc: Scene): string {
             <Icon name="split" :size="13" />
           </button>
           <button
-            class="btn btn-square btn-ghost btn-xs tooltip tooltip-left"
+            class="btn btn-square btn-ghost btn-xs tooltip tooltip-right"
             data-tip="合场：把另一路场景并进当前场景（对话框里讲清对齐后果）"
             :disabled="busy"
             @click="emit('merge')"
@@ -226,6 +228,7 @@ function sceneTip(sc: Scene): string {
           </button>
         </div>
       </div>
+      <section class="flex min-h-0 flex-1 flex-col overflow-y-auto py-1.5">
       <button
         v-for="sc in scenes"
         :key="sc.id"
@@ -251,7 +254,8 @@ function sceneTip(sc: Scene): string {
           {{ sc.clock ? `第${sc.day}天 ${sc.clock}` : `第${sc.day}天` }} · {{ sc.place || "地点未定" }}
         </span>
       </button>
-    </section>
+      </section>
+    </div>
 
     <!-- 底部工具 -->
     <footer class="flex flex-none items-center gap-1 border-t border-base-300 px-2 py-1.5">

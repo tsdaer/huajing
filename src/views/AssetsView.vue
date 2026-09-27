@@ -170,7 +170,7 @@ function typeCn(ty: string): string {
 
 /** 世界卡片上类型分布的前三名（chips） */
 function topTypes(w: WorldSummary): [string, number][] {
-  return Object.entries(w.by_type)
+  return Object.entries(w.byType)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 3);
 }
@@ -352,7 +352,7 @@ onMounted(async () => {
                     <Icon name="globe" :size="18" class="flex-none text-primary/70" />
                     <span class="min-w-0 flex-1 truncate text-base font-semibold">{{ w.name }}</span>
                     <span
-                      v-if="w.has_worldline"
+                      v-if="w.hasWorldline"
                       class="badge badge-xs badge-soft badge-secondary tooltip tooltip-left"
                       data-tip="这个世界配置了世界主线（worldline.lua）"
                     >

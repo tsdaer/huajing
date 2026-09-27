@@ -297,7 +297,7 @@ async function create() {
               <select id="new-world" class="select select-sm w-full" v-model="form.world">
                 <option value="">（缺省：default）</option>
                 <option v-for="w in worlds" :key="w.name" :value="w.name">
-                  {{ w.name }} · {{ w.entities }} 实体 · 第{{ w.day }}天{{ w.has_worldline ? " · 有主线" : "" }}
+                  {{ w.name }} · {{ w.entities }} 实体 · 第{{ w.day }}天{{ w.hasWorldline ? " · 有主线" : "" }}
                 </option>
               </select>
             </div>

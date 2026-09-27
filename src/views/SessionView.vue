@@ -499,8 +499,22 @@ async function jumpToTurn(turn: number) {
   await goPage(Math.floor(pos / PAGE_SIZE) + 1);
 }
 
-async function loadAll() {
-  error.value = "";
+/** 开场白润色（体验修复批）：first_mes 直接当第一句太机械——会话还全新时后端用
+ *  util 档 LLM 把它润成贴合场景的自然开场；没配接入点/已开演/失败都原样保留。
+ *  fire-and-forget：先进来先看 first_mes，润好了无感替换（迟到响应由世代守卫丢弃）。 */
+async function polishOpening(id: string) {
+  try {
+    const msgs = await api.polishOpening(id);
+    if (id !== props.meta.id || disposed) return; // B4：快速切换会话时迟到响应不得覆盖
+    if (msgs.length > 0 && msgs[0].content !== messages.value[0]?.content) {
+      messages.value = msgs;
+    }
+  } catch {
+    /* 润色失败保留 first_mes，不打扰 */
+  }
+}
+
+async function loadAll() {  error.value = "";
   generating.value = false;
   streams.value = [];
   scheduleNote.value = "";
@@ -522,6 +536,7 @@ async function loadAll() {
       actors: bb.actors.join(", "),
     });
     messages.value = [...msgs];
+    void polishOpening(id);
     scenes.value = [];
     activeScene.value = "";
     await loadScenes();

@@ -118,13 +118,35 @@
   animation: pop-in 0.18s ease-out;
 }
 
-/* hover-3d（M5.2）：v-tilt 指令写 CSS 变量，本类承接视觉——倾斜 + 跟手高光。
+/* hover-3d（M5.2，体验修复批升级）：v-tilt 指令写 CSS 变量，本类承接视觉。
+   观感对齐 daisyUI hover-3d 组件：光标侧抬起（10° 倾斜 + 1.05 抬升）+
+   方向性多层投影 + 跟手高光 + 弹簧缓动（linear() 弹性曲线取自 daisyUI 原值）。
+   不用 daisyUI 纯 CSS 类的原因：其 8 个透明分区会挡住卡片内按钮。
    变量缺席（未 hover / 指令未挂 / 触屏）时回落 0deg，纯类名也安全 */
 .tilt-card {
   position: relative;
-  transform: perspective(900px) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg)) translateZ(0);
-  transition: transform 0.12s ease-out;
-  will-change: transform;
+  --tilt-ease: linear(0, 0.931 13.8%, 1.196 21.4%, 1.343 29.8%, 1.378 36%, 1.365 43.2%, 1.059 78%, 1);
+  transform: perspective(75rem) rotateX(var(--tilt-x, 0deg)) rotateY(var(--tilt-y, 0deg))
+    scale(var(--tilt-scale, 1));
+  /* 投影用 box-shadow 而非 filter: drop-shadow（daisyUI 原值是后者）：filter 会把卡片
+     连同文字烘成一张纹理，被 scale 放大时整卡发糊；box-shadow 不产生渲染面。
+     位移随光标方向（--shadow-*），静止时归零成极淡的环境光晕。
+     后三段 transition 保住卡片上 border-color 等工具类过渡（本规则不分层，会盖过 utilities）。
+     不写 will-change: transform——它把栅格化锁在原始尺寸上，scale 后纹理拉伸即模糊；
+     去掉后 Chromium 会在变换结束后按实际尺寸重栅格化，悬浮文字保持锐利 */
+  box-shadow:
+    var(--shadow-x, 0px) var(--shadow-y, 0px) 0.1rem #0000000a,
+    var(--shadow-x, 0px) var(--shadow-y, 0px) 0.3rem #0000000a;
+  transition:
+    transform 0.5s var(--tilt-ease),
+    box-shadow 0.4s ease-out,
+    border-color 0.15s ease-out,
+    background-color 0.15s ease-out,
+    color 0.15s ease-out;
+}
+.tilt-card:hover {
+  --tilt-scale: 1.05;
+  --tilt-ease: linear(0, 0.708 15.2%, 0.927 23.6%, 1.067 33%, 1.12 41%, 1.13 50.2%, 1.019 83.2%, 1);
 }
 .tilt-card::after {
   content: "";
@@ -134,12 +156,21 @@
   pointer-events: none;
   background: radial-gradient(
     circle at var(--glow-x, 50%) var(--glow-y, 50%),
-    color-mix(in oklab, var(--color-base-content) 8%, transparent),
+    rgb(255 255 255 / 0.16),
     transparent 55%
   );
   opacity: 0;
-  transition: opacity 0.25s ease-out;
+  transition: opacity 0.4s ease-out;
 }
 .tilt-card:hover::after {
   opacity: 1;
+}
+
+/* 左侧组件（舞台栏等）的注释气泡：抬到主侧栏（drawer-side z-30）之上——
+   向左伸出的长注释若压不过侧栏，就会出现"注释被侧边栏挡住"。
+   daisyUI 默认 z-index 只有 2，同层内容（聊天流等）都会盖住它 */
+.tooltip::before,
+.tooltip::after,
+.tooltip > .tooltip-content {
+  z-index: 50;
 }
